@@ -78,7 +78,7 @@
                             │  配置驱动
 ┌───────────────────────────▼─────────────────────────────┐
 │                  客户外部资源层                           │
-│  私有 LLM │ Milvus/Qdrant │ Elasticsearch │ NebulaGraph │
+│  私有 LLM │ Milvus │ Elasticsearch │ NebulaGraph │
 │  MinIO │ PostgreSQL │ Redis │ SSO/LDAP │ 业务系统        │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -433,7 +433,15 @@
 
 **结构化日志**：使用 structlog 输出 JSON 格式日志，每条日志携带 session_id、tenant_id、step_name 等上下文字段，便于在日志平台（ELK、Splunk 等）中按维度过滤和分析。
 
-**Prometheus 指标**：定义一套标准指标集，涵盖查询总次数（按意图类型和状态分）、各 Pipeline 步骤延迟分布、召回分数分布、知识库 Chunk 总数、活跃 Session 数。指标推送到 Prometheus Push Gateway，通过 Grafana 可视化。
+**Prometheus 指标**：定义一套标准指标集，指标推送到 Prometheus Push Gateway，通过 Grafana 可视化。涵盖：
+
+- 查询总次数（按意图类型和状态分）、各 Pipeline 步骤延迟分布、召回分数分布、知识库 Chunk 总数、活跃 Session 数。
+- `rag_ingest_tasks_total{status}` — 入库任务总量按状态分类
+- `rag_ingest_duration_seconds{stage}` — 各入库阶段耗时分布
+- `rag_consistency_issues_total` — 一致性巡检发现的问题数量
+- `rag_consistency_repairs_total` — 自动修复的数量
+- `rag_ephemeral_docs_active` — 当前有效的临时文档数量
+- `rag_chunk_quality_score{bucket}` — Chunk 质量分布（高/中/低）
 
 **OpenTelemetry 链路追踪**：每次请求生成一个 Trace，每个 Pipeline 步骤作为一个 Span，包含步骤名称、耗时、召回数量、错误信息等属性。支持导出到 Jaeger 或其他 OTLP 兼容的追踪后端，用于定位延迟瓶颈和排查错误。
 
@@ -455,6 +463,9 @@
 - **同义词热重载**：无需重启服务，即时更新同义词表
 - **入库任务状态查询**：通过 task_id 轮询异步入库任务的处理进度
 - **连接测试**：对指定组件的配置做实时连接验证
+- 最近一次巡检结果：GET /api/v1/admin/consistency-report
+- 手动触发一次巡检：POST /api/v1/admin/consistency-check
+- 系统可用检索路列表：GET /api/v1/admin/retrieval-paths
 
 ---
 
@@ -522,6 +533,18 @@
 | **首 token 到达用户** | **< 1.5s** | 上述优化的综合结果 |
 | **完整答案（P50）** | **< 5s** | 取决于 LLM 生成速度 |
 | **完整答案（P95）** | **< 10s** | 各路超时控制 |
+
+元数据前置过滤步骤（MySQL 查询）增加约 10-50ms 延迟（有过滤条件时），无过滤条件时跳过（0ms）。
+
+#### 入库性能
+
+| 场景                        | 吞吐目标      | 说明                     |
+| --------------------------- | ------------- | ------------------------ |
+| 纯文字 PDF（100页）         | < 2 分钟      | 不含图片理解             |
+| 含图片 PDF（100页，20张图） | < 8 分钟      | 含 VLM 图片理解（4并发） |
+| 扫描型 PDF（100页）         | < 5 分钟      | OCR 处理                 |
+| Excel（1万行）              | < 1 分钟      | 行列转文字描述           |
+| 批量入库（100个文档）       | > 50文档/分钟 | 4并发，无 VLM            |
 
 ### 12.2 质量基准
 
