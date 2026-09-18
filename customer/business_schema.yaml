@@ -1,0 +1,41 @@
+# 业务数据 Schema（customer/business_schema.yaml）
+#
+# structured 检索路（NL2SQL）使用：
+# - 表描述与字段类型供 LLM 生成 SQL
+# - allowed_tables（customer_config.yaml）可进一步收窄可查范围
+# - sensitive_fields 中的字段禁止出现在 SELECT 中
+
+tables:
+  employee:
+    description: 员工信息表
+    columns:
+      emp_id: VARCHAR(20)       # 工号
+      name: VARCHAR(50)         # 姓名
+      department: VARCHAR(50)   # 部门
+      title: VARCHAR(50)        # 职位
+      hire_date: DATE           # 入职日期
+      annual_leave_left: INT    # 年假剩余天数
+      email: VARCHAR(100)       # 邮箱
+
+  it_ticket:
+    description: IT 服务工单表
+    columns:
+      ticket_id: VARCHAR(30)    # 工单号
+      emp_id: VARCHAR(20)       # 申请人工号
+      category: VARCHAR(50)     # 分类（网络/硬件/账号/软件）
+      priority: VARCHAR(10)     # 优先级（P1-P4）
+      status: VARCHAR(20)       # 状态（待处理/处理中/已解决/已关闭）
+      created_at: DATETIME      # 创建时间
+      resolved_at: DATETIME     # 解决时间
+      description: TEXT         # 问题描述
+
+  asset:
+    description: 固定资产台账表
+    columns:
+      asset_id: VARCHAR(30)     # 资产编号
+      asset_type: VARCHAR(50)   # 类型（笔记本/台式机/显示器/手机）
+      emp_id: VARCHAR(20)       # 领用人
+      model: VARCHAR(100)       # 型号
+      purchase_date: DATE       # 采购日期
+      warranty_end: DATE        # 保修截止
+      status: VARCHAR(20)       # 状态（在用/闲置/报废）

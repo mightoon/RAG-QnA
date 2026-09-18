@@ -1,0 +1,14 @@
+{% from "partials/doc_detail/_macros.jinja2" import dd_status_badge %}
+{% set d = data if data is defined else none %}
+{% set doc = d.doc if d and d.doc is defined else (doc if doc is defined else none) %}
+{% if doc %}
+<div class="doc-title-row">
+  <h1>{{ doc.filename }}</h1>
+  {{ dd_status_badge(doc.status) }}
+  {% if doc.status == 'deleted' %}<span class="trash-badge">🗑 回收站中</span>{% endif %}
+</div>
+<div class="doc-meta">
+  {{ doc.file_type or '' }} · v{{ doc.version or 1 }} · {{ doc.collection }}
+  {% if doc.created_at %} · {{ doc.created_at[:16].replace('T', ' ') }}{% endif %}
+</div>
+{% endif %}

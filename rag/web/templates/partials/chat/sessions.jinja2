@@ -1,0 +1,15 @@
+{% set d = data if data is defined else none %}
+{% if d is none %}
+  <div class="table-empty">加载中…</div>
+{% elif not d.sessions %}
+  <div class="table-empty">暂无会话</div>
+{% else %}
+  {% for s in d.sessions %}
+  <div class="session-item {% if s.session_id == d.activeSessionId %}active{% endif %}"
+       data-session-id="{{ s.session_id }}">
+    <div class="session-title" title="{{ s.title }}">{{ s.title }}</div>
+    <div class="session-meta">{{ s.message_count }} 条消息</div>
+    <button class="icon-btn session-del" data-del-session="{{ s.session_id }}" aria-label="删除会话">✕</button>
+  </div>
+  {% endfor %}
+{% endif %}

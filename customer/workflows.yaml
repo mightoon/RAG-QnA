@@ -1,0 +1,131 @@
+# ═══════════════════════════════════════════════════════════
+# Pipeline 步骤序列注册表（customer/workflows.yaml）
+#
+# V2 文档类型路由：不同格式走不同入库流水线。
+# 客户可在此增删步骤（步骤实现见 rag/pipeline/steps/），
+# 修改后重启服务生效。
+#
+# 可用入库步骤：
+#   detect_format  格式自检（magic bytes/解码验证，防伪装扩展名）
+#   parse          文档解析（按扩展名路由，PDF 内含 OCR）
+#   quality_parse  解析质量报告汇总（扫描件 OCR 置信度/空页率/乱码率/文档系数）
+#   reorder_columns 双栏版面重排（bbox 驱动的顺序校正）
+#   outline        OutlineBuilder：标题层级 → section_path（TOC先行校验）
+#   chunk          父子分块（文本/表格/图片题注/代码 分派）
+#   table_extract  表格原始数据入 MySQL table_data
+#   vlm_caption    图片 VLM 描述生成（多模态）
+#   enrich         LLM 批量生成摘要/关键词/实体
+#   embed          向量化（bge-m3）
+#   write          两阶段写入（MySQL→ES→Milvus→Graph，检查点断点续写）
+#   verify         入库后抽样验证（各库可检索性）
+#   finalize       状态落库 + 质量报告 + 通知
+#
+# 可用查询步骤：
+#   security       安全校验（长度/敏感词/注入）
+#   memory_load    加载会话记忆（短期/工作/长期画像+历史摘要注入）
+#   understand     查询理解（QueryPlan 五层次）
+#   retrieve       五路召回（并行 + 独立超时 + 降级）
+#   merge          加权 RRF 合并 + 语义去重 + 质量降权
+#   self_eval      检索质量自评（低分触发改写+HyDE 二轮召回）
+#   rerank         Cross-Encoder 精排（尊重 rerank_enabled）
+#   generate       流式生成（SSE token 推送；token 预算分配）
+#   faithfulness   忠实度校验（低分触发二轮重生成 + 免责声明）
+#   memory_update  记忆更新（摘要压缩/实体槽位/话题链）
+# ═══════════════════════════════════════════════════════════
+
+version: 2
+
+ingest_workflows:
+  default: &default_ingest
+    - detect_format
+    - parse
+    - outline
+    - chunk
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
+
+  # PDF 三型（解析器预检 scan_type 后路由）
+  pdf_text:
+    - detect_format
+    - parse
+    - reorder_columns   # 双栏版面重排（有 bbox 时生效）
+    - outline
+    - chunk
+    - vlm_caption       # PDF 内嵌图片 VLM 描述（enable_vlm 开关）
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
+  pdf_scanned:
+    - detect_format
+    - parse
+    - quality_parse      # OCR 置信度/空页率检查
+    - reorder_columns
+    - outline
+    - chunk
+    - vlm_caption
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
+  pdf_hybrid:
+    - detect_format
+    - parse
+    - quality_parse
+    - reorder_columns
+    - outline
+    - chunk
+    - vlm_caption
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
+
+  docx: *default_ingest
+
+  # Excel：表格原始数据单独入库（供精确数值查询）
+  xlsx:
+    - detect_format
+    - parse
+    - table_extract
+    - chunk
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
+
+  pptx: *default_ingest
+  md: *default_ingest
+  txt: *default_ingest
+  html: *default_ingest
+
+  # 图片：OCR + VLM 描述
+  image:
+    - detect_format
+    - parse
+    - vlm_caption
+    - chunk
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
+
+query_workflow:
+  - security
+  - memory_load
+  - understand
+  - retrieve
+  - merge
+  - self_eval
+  - rerank
+  - generate
+  - faithfulness
+  - memory_update

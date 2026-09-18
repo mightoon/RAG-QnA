@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - IQA 知识库平台</title>
+  <link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <h1>IQA 知识库平台</h1>
+      <p class="page-subtitle">登录以使用智能问答与知识库管理</p>
+      <form id="login-form">
+        <div class="form-group">
+          <label class="form-label">用户 ID <span class="required">*</span></label>
+          <input class="form-input" id="login-user-id" required placeholder="例如 u01">
+        </div>
+        <div class="form-group">
+          <label class="form-label">显示名称</label>
+          <input class="form-input" id="login-username" placeholder="可选">
+        </div>
+        <div class="form-group">
+          <label class="form-label">角色（逗号分隔）</label>
+          <input class="form-input" id="login-roles" value="admin" placeholder="例如 admin, tech">
+          <p class="page-subtitle" style="margin-top:4px">填 admin 可见「运行配置」页（配置 LLM / 数据库等）</p>
+        </div>
+        <div class="form-error hidden" id="login-error"></div>
+        <button class="btn btn-primary btn-lg" style="width:100%" type="submit">进入平台</button>
+      </form>
+    </div>
+  </div>
+  <script src="/static/js/state.js"></script>
+  <script src="/static/js/api.js"></script>
+  <script>
+  (function () {
+    var form = document.getElementById('login-form');
+    var err = document.getElementById('login-error');
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      err.classList.add('hidden');
+      var body = {
+        user_id: document.getElementById('login-user-id').value.trim(),
+        username: document.getElementById('login-username').value.trim() || undefined,
+        roles: document.getElementById('login-roles').value.split(',')
+          .map(function (r) { return r.trim(); }).filter(Boolean)
+      };
+      fetch('/api/auth/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('HTTP ' + r.status)); });
+        return r.json();
+      }).then(function (data) {
+        var token = data.access_token || data.token;
+        if (!token) throw new Error('响应中无 token');
+        window.API.setToken(token);   // 写 localStorage + Cookie（页面导航鉴权用）
+        location.replace('/chat');
+      }).catch(function (e2) {
+        err.textContent = '登录失败：' + e2.message;
+        err.classList.remove('hidden');
+      });
+    });
+  })();
+  </script>
+</body>
+</html>

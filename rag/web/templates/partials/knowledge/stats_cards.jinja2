@@ -1,0 +1,11 @@
+{% set d = data if data is defined else none %}
+{%- if d and d.stats is defined -%}
+<div class="stat-card"><div class="stat-value">{{ d.stats.totalDocs }}</div><div class="stat-label">文档总数</div></div>
+<div class="stat-card"><div class="stat-value">{{ d.stats.doneDocs }}</div><div class="stat-label">已完成</div></div>
+<div class="stat-card"><div class="stat-value">{{ d.stats.failedDocs }}</div><div class="stat-label">失败/部分</div></div>
+<div class="stat-card"><div class="stat-value">{{ d.stats.activeTasks }}</div><div class="stat-label">进行中任务</div></div>
+<div class="stat-card"><div class="stat-value">{{ d.stats.trashDocs }}</div><div class="stat-label">回收站</div></div>
+{%- else -%}
+<div class="stat-card skeleton"></div><div class="stat-card skeleton"></div>
+<div class="stat-card skeleton"></div><div class="stat-card skeleton"></div>
+{%- endif -%}

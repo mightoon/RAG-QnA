@@ -1,0 +1,20 @@
+{% set d = data if data is defined else none %}
+{% if d and d.messages %}
+  {% for m in d.messages %}
+    {% if m.role == 'user' %}
+    <div class="msg-user" data-msg-id="{{ m.id }}">
+      <div class="msg-bubble">{{ m.content }}</div>
+    </div>
+    {% else %}
+    <div class="msg-assistant" data-msg-id="{{ m.id }}">
+      <div class="assistant-avatar">AI</div>
+      <div class="msg-content-col">
+        <div class="msg-block prose" data-md="{{ m.content }}"></div>
+        {% if m.sources %}
+        <div class="sources-strip" data-sources="{{ m.sources | tojson }}">📚 {{ m.sources | length }} 个来源</div>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  {% endfor %}
+{% endif %}

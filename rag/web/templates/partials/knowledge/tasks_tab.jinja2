@@ -1,0 +1,30 @@
+{% from "partials/knowledge/_macros.jinja2" import status_badge %}
+{% set d = data if data is defined else none %}
+{%- if d -%}
+  {%- if not d.tasks -%}<div class="table-empty">暂无任务</div>
+  {%- else -%}
+  <table class="data-table">
+    <thead><tr><th>任务</th><th>集合</th><th>状态</th><th>阶段</th><th>时间</th><th style="width:120px">操作</th></tr></thead>
+    <tbody>
+      {% for t in d.tasks %}
+      <tr data-task-id="{{ t.task_id }}">
+        <td><div class="doc-title-main">{{ t.filename or t.task_id }}</div>
+            <div class="doc-title-sub">{% if t.error %}<span class="text-error">{{ t.error[:80] }}</span>{% endif %}</div></td>
+        <td>{{ t.collection }}</td>
+        <td>{{ status_badge(t.status) }}</td>
+        <td>{{ t.stage or '—' }}</td>
+        <td>{{ (t.created_at or '')[:16].replace('T', ' ') }}</td>
+        <td>{% if t.status in ('failed', 'partial') %}
+          <button class="btn btn-ghost btn-xs" data-task-action="retry" data-task-id="{{ t.task_id }}">重试</button>
+        {% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="table-pagination">
+    <button class="btn btn-secondary btn-xs js-task-page" data-page="{{ d.page - 1 }}" {% if d.page <= 1 %}disabled{% endif %}>上一页</button>
+    <span class="page-info">第 {{ d.page }} 页 · 共 {{ d.total }} 条</span>
+    <button class="btn btn-secondary btn-xs js-task-page" data-page="{{ d.page + 1 }}" {% if not d.hasMore %}disabled{% endif %}>下一页</button>
+  </div>
+  {%- endif -%}
+{%- else -%}<div class="table-empty">加载中…</div>{%- endif -%}

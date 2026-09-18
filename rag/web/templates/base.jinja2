@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex">
+  <title>{% block title %}IQA 知识库平台{% endblock %}</title>
+  <meta name="description" content="本地 RAG 智能知识库平台">
+  <link rel="stylesheet" href="/static/css/main.css">
+  <script id="bootstrap-manifest">
+    window.__PAGE_NAME__ = "{{ page }}";
+    window.__CURRENT_USER__ = {{ current_user | tojson }};
+    window.__SERVER_TIME__ = "{{ now if now is defined else '' }}";
+    window.__COLLECTIONS__ = {{ (collections if collections is defined else []) | tojson }};
+    window.__ENABLED_PATHS__ = {{ (retrievalPaths if retrievalPaths is defined else []) | tojson }};
+  </script>
+  {% block head_extra %}{% endblock %}
+  <script src="/static/js/marked.min.js"></script>
+  <script src="/static/js/dompurify.min.js"></script>
+  {% block content_templates %}{% endblock %}
+</head>
+<body data-page="{{ page }}" data-user-name="{{ current_user.name }}"
+      data-user-admin="{{ '1' if current_user.isAdmin else '0' }}">
+  <div class="app-shell">
+    <nav class="topo-nav" aria-label="产品导航">
+      <div class="topo-brand">IQA</div>
+      <div class="topo-icons">
+        <a href="/chat" data-page="chat" role="menuitem"
+           class="topo-icon icon-chat {% if page == 'chat' %}active{% endif %}"
+           data-tip="智能问答&#10;RAG 多路检索 · 流式生成"
+           aria-label="智能问答" {% if page == 'chat' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </a>
+        <a href="/knowledge" data-page="knowledge" role="menuitem"
+           class="topo-icon icon-knowledge {% if page == 'knowledge' %}active{% endif %}"
+           data-tip="知识库管理&#10;多格式文档 · 批量导入 · 质量巡检"
+           aria-label="知识库管理" {% if page == 'knowledge' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+          </svg>
+        </a>
+        {% if current_user.isAdmin %}
+        <a href="/config" data-page="config" role="menuitem"
+           class="topo-icon icon-config {% if page == 'config' %}active{% endif %}"
+           data-tip="运行配置&#10;自描述可视化配置 · 权限映射 · 连接健康"
+           aria-label="配置" {% if page == 'config' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </a>
+        <a href="/monitor" data-page="monitor" role="menuitem"
+           class="topo-icon icon-monitor {% if page == 'monitor' %}active{% endif %}"
+           data-tip="运行监控&#10;支撑服务健康 · 检索路就绪度 · 入库队列"
+           aria-label="运行监控" {% if page == 'monitor' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+        </a>
+        {% endif %}
+      </div>
+      <div class="topo-spacer"></div>
+      <div class="topo-user {% if current_user.isAdmin %}admin{% endif %}"
+           id="topo-user" role="button" tabindex="0"
+           title="{{ current_user.name }}{% if current_user.isAdmin %}（管理员）{% endif %}&#10;角色：{{ current_user.roles | join(', ') if current_user.roles else '—' }}&#10;点击退出登录"
+           data-tip="退出登录">
+        {{ current_user.name[:1].upper() }}
+      </div>
+    </nav>
+    <main class="main-content">
+      {% block content %}{% endblock %}
+    </main>
+    <div class="toast-container" aria-live="polite"></div>
+  </div>
+  <script src="/static/js/state.js"></script>
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/sse.js"></script>
+  <script src="/static/js/partials.js"></script>
+  <script>
+  (function () {
+    var u = document.getElementById('topo-user');
+    if (!u) return;
+    function logout() {
+      if (!confirm('确定退出登录？')) return;
+      window.API.setToken(null);          // 清 localStorage + Cookie
+      location.replace('/login');
+    }
+    u.addEventListener('click', logout);
+    u.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); logout(); }
+    });
+  })();
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

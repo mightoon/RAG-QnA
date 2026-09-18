@@ -1,0 +1,68 @@
+# ═══ Web 框架 ═══
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+jinja2>=3.1
+sse-starlette>=2.0
+
+# ═══ 数据模型与配置 ═══
+pydantic>=2.6
+pydantic-settings>=2.2
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# ═══ 数据库 ═══
+sqlalchemy[asyncio]>=2.0
+aiomysql>=0.2
+redis>=5.0
+
+# ═══ 向量库与全文检索 ═══
+# 必须 ≥3：向量适配器已从 ORM 式 API（connections / Collection / utility /
+# FieldSchema）迁到 MilvusClient，3.1 起前者将被移除；2.x 上 dedicated 参数与
+# create_collection(schema=...) 的语义不同，会静默换一套连接/建集合行为。
+# 上界同理卡大版本：客户端大版本需与服务端一致（见 TS-016）。
+pymilvus>=3.0,<4.0
+# 必须 <9：客户端 9.x 默认发 `Accept: ...compatible-with=9`，而 ES 8.x 服务端
+# 只认 8 / 7，对**每个**请求（含 GET /）回 400 media_type_header_exception。
+# 大版本需与服务端一致：ES 8.x 服务端 → 客户端 8.x（见 TS-016）。
+elasticsearch[async]>=8.13,<9
+
+# ═══ 对象存储 ═══
+minio>=7.2
+
+# ═══ 知识图谱（可选，未启用可不装） ═══
+neo4j>=5.20
+
+# ═══ LLM / Embedding / HTTP ═══
+httpx>=0.27
+# requests 不是直接调用方（经 pymilvus / tiktoken 间接引入），但它会在 **import 时**
+# 自查依赖区间：安装有 chardet 就要求 3.0.2 ≤ chardet < 6（≤2.32.5）/ < 8（≥2.33），
+# 不满足就打一条 RequestsDependencyWarning 到 stderr（见 TS-020）。
+# 因此：≥2.33 才能配上本仓的 chardet 7.x，<3 是通用库的大版本上界。
+requests>=2.33,<3
+tiktoken>=0.7
+sentence-transformers>=3.0   # Cross-Encoder 精排（BGE-Reranker，含 torch）
+
+# ═══ 文档解析 ═══
+pdfplumber>=0.11
+pypdf>=4.2
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6.23
+beautifulsoup4>=4.12
+lxml>=5.2
+pillow>=10.3
+chardet>=5.2,<8
+
+# ═══ 可观测性 ═══
+structlog>=24.1
+prometheus-client>=0.20
+opentelemetry-api>=1.24
+opentelemetry-sdk>=1.24
+
+# ═══ 工具 ═══
+tenacity>=8.3
+
+# ═══ 可选重依赖（按需安装） ═══
+# paddleocr>=2.7          # 扫描型 PDF OCR
+# paddlepaddle>=2.6

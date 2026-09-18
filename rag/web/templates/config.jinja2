@@ -1,0 +1,42 @@
+{% extends "base.jinja2" %}
+{% block title %}运行配置 - IQA{% endblock %}
+{% block head_extra %}
+<script>
+  window.__CONFIG_INIT__ = {{ config_json | safe }};
+  window.__PERM_CONFIG__ = {{ perm_config | tojson }};
+  window.__RUNTIME_META__ = {{ runtime_meta | tojson }};
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="page-content" id="config-page">
+  <div class="page-header">
+    <h1>运行配置</h1>
+    <p class="page-subtitle">可视化配置管理 · 每个模块各自保存、写入配置文件并热应用（无需重启）；未配置的依赖自动降级运行</p>
+  </div>
+
+  <div class="config-tabs-bar">
+    <div class="config-tabs" id="config-tabs" role="tablist">
+      <button class="tab active" data-ctab="model" role="tab" aria-selected="true">模型</button>
+      <button class="tab" data-ctab="service" role="tab" aria-selected="false">服务</button>
+      <button class="tab" data-ctab="special" role="tab" aria-selected="false">高级</button>
+      <button class="tab" data-ctab="permissions" role="tab" aria-selected="false">权限映射</button>
+      <button class="tab" data-ctab="system" role="tab" aria-selected="false">系统</button>
+    </div>
+  </div>
+
+  <div class="config-panels">
+    <div data-ctab-panel="model" data-piece="panel_model"></div>
+    <div data-ctab-panel="service" data-piece="panel_service" class="hidden"></div>
+    <div data-ctab-panel="special" data-piece="panel_special" class="hidden"></div>
+    <div data-ctab-panel="permissions" data-piece="panel_permissions" class="hidden"></div>
+    <div data-ctab-panel="system" data-piece="panel_system" class="hidden"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/config-data.js"></script>
+<script src="/static/js/config-ui.js"></script>
+<script src="/static/js/config.js"></script>
+{% endblock %}

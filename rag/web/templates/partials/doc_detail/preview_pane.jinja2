@@ -1,0 +1,43 @@
+{% set d = data if data is defined else none %}
+{% set doc = d.doc if d and d.doc is defined else (doc if doc is defined else none) %}
+{% set elements = d.elements if d and d.elements is defined else none %}
+{% set outline = d.outline if d and d.outline is defined else none %}
+{% if not doc %}
+  <div class="preview-empty">加载中…</div>
+{% elif doc.status in ('queued','parsing','embedding','uploading','indexing') %}
+  <div class="preview-empty">文档处理中（{{ doc.status }}），稍后刷新查看</div>
+{% elif not elements %}
+  <div class="preview-empty">暂无可预览内容</div>
+{% else %}
+  {% if outline %}
+  <div class="pv-outline">
+    <div class="pv-outline-title">大纲</div>
+    <ul>
+      {% for o in outline[:30] %}<li class="toc-l{{ o.level }}">{{ o.title }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  {% set ns = namespace(last_page=0) %}
+  {% for el in elements[:300] %}
+    {% if el.page and el.page != ns.last_page %}
+      {% set ns.last_page = el.page %}
+      <div class="pv-page-mark">— 第 {{ el.page }} 页 —</div>
+    {% endif %}
+    {% if el.type == 'heading' %}
+      <div class="pv-element pv-title t2">{{ el.text }}</div>
+    {% elif el.type == 'table' and el.raw_data %}
+      <div class="pv-table-wrap"><table class="pv-table">
+        {% if el.raw_data.headers %}<thead><tr>
+          {% for h in el.raw_data.headers %}<th>{{ h }}</th>{% endfor %}
+        </tr></thead>{% endif %}
+        <tbody>
+          {% for row in el.raw_data.rows[:30] %}<tr>
+            {% for c in row %}<td>{{ c }}</td>{% endfor %}
+          </tr>{% endfor %}
+        </tbody>
+      </table></div>
+    {% else %}
+      <div class="pv-element">{{ el.text[:500] }}</div>
+    {% endif %}
+  {% endfor %}
+{% endif %}

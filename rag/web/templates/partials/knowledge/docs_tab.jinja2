@@ -1,0 +1,3 @@
+{% from "partials/knowledge/_macros.jinja2" import docs_table %}
+{% set d = data if data is defined else none %}
+{{ docs_table(d, false) }}

@@ -1,0 +1,67 @@
+{% extends "base.jinja2" %}
+{% block title %}运行监控 - IQA{% endblock %}
+
+{% block content %}
+<div id="monitor-page" class="page-content">
+  <div class="page-header">
+    <h1>运行监控</h1>
+    <p class="page-subtitle">
+      {{ runtime_meta.appName }} v{{ runtime_meta.version }} ·
+      支撑服务健康 · 检索路就绪度 · 入库队列
+    </p>
+  </div>
+
+  <div class="monitor-toolbar">
+    <div class="monitor-toolbar-left">
+      <button class="btn btn-primary" type="button" id="monitor-refresh">立即刷新</button>
+      <label class="monitor-auto">
+        <input type="checkbox" id="monitor-auto" checked>
+        <span>自动刷新</span>
+      </label>
+      <select class="form-select" id="monitor-interval" aria-label="刷新间隔">
+        <option value="5">5 秒</option>
+        <option value="10" selected>10 秒</option>
+        <option value="30">30 秒</option>
+        <option value="60">60 秒</option>
+      </select>
+    </div>
+    <div class="monitor-toolbar-right">
+      <span class="monitor-stamp" id="monitor-stamp"></span>
+    </div>
+  </div>
+
+  <div class="monitor-banner hidden" id="monitor-banner" role="status"></div>
+
+  {# 概览方块是三个 tab 的公共内容，始终置顶 #}
+  <section data-piece="monitor_summary" class="stat-cards" aria-label="总览"></section>
+
+  <div class="tabs monitor-tabs" id="monitor-tabs" role="tablist" aria-label="监控视图">
+    <button class="tab-btn active" type="button" role="tab" data-mtab="service"
+            aria-selected="true">基础服务</button>
+    <button class="tab-btn" type="button" role="tab" data-mtab="task"
+            aria-selected="false">任务状态</button>
+    <button class="tab-btn" type="button" role="tab" data-mtab="metrics"
+            aria-selected="false">指标图表</button>
+  </div>
+
+  <div class="monitor-panel" data-mtab-panel="service">
+    <section data-piece="monitor_services" class="monitor-block" aria-label="基础服务"></section>
+  </div>
+
+  <div class="monitor-panel hidden" data-mtab-panel="task">
+    <section data-piece="monitor_readiness" class="monitor-block" aria-label="任务状态"></section>
+  </div>
+
+  <div class="monitor-panel hidden" data-mtab-panel="metrics">
+    <section data-piece="monitor_metrics" class="monitor-block" aria-label="指标图表"></section>
+  </div>
+</div>
+
+{# 首屏快照由服务端下发：JSON 走 script 承载，Jinja 的 tojson 会把 < > & 转义成
+   \u003c 等，配置值里出现 "</script>" 也无法提前闭合标签 #}
+<script type="application/json" id="monitor-initial">{{ initial_snapshot | tojson }}</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/monitor.js"></script>
+{% endblock %}

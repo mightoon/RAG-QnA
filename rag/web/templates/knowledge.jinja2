@@ -1,0 +1,84 @@
+{% extends "base.jinja2" %}
+{% block title %}知识库管理 - IQA{% endblock %}
+{% block head_extra %}
+<script>window.__ROLES__ = {{ (roleOptions if roleOptions is defined else []) | tojson }};</script>
+{% endblock %}
+
+{% block content %}
+<div id="knowledge-page" class="page-content"
+     data-active-tab="{{ activeTab | default('docs') }}"
+     data-focus-doc-id="{{ focusDocId | default('') }}"
+     data-queue="{{ (queue if queue is defined else {}) | tojson }}">
+  <div class="page-header">
+    <h1>知识库管理</h1>
+    <p class="page-subtitle">多格式文档导入 · 任务追踪 · 回收站</p>
+  </div>
+
+  <section data-piece="stats_cards" class="stat-cards">
+    {% include "partials/knowledge/stats_cards.jinja2" %}
+  </section>
+
+  <div class="upload-actions">
+    <button class="btn btn-primary" id="btn-upload">上传文档</button>
+    <span class="upload-hint">支持 PDF / Word / TXT / MD / CSV / 图片，可拖拽批量上传</span>
+    <span class="upload-hint" id="queue-hint"></span>
+  </div>
+  <div class="drop-zone hidden" id="drop-zone">拖拽文件到此处上传</div>
+  <div class="staging-list" id="staging-list"></div>
+  <div class="roles-field hidden" id="roles-field"></div>
+
+  <div class="knowledge-tabs tabs">
+    <button class="tab" data-tab="docs">文档</button>
+    <button class="tab" data-tab="tasks">任务 <span class="badge badge-info hidden" id="active-tasks-badge"></span></button>
+    <button class="tab" data-tab="trash">回收站</button>
+  </div>
+
+  <div data-tab-panel="docs">
+    <div class="doc-filters">
+      <select class="form-select collection-select" id="doc-collection-filter" style="width:180px">
+        <option value="">全部集合</option>
+        {% for c in collections | default([]) %}<option value="{{ c.name }}">{{ c.displayName }}</option>{% endfor %}
+      </select>
+      <select class="form-select" id="doc-status-filter" style="width:150px">
+        <option value="">全部状态</option>
+        <option value="done">已完成</option>
+        <option value="failed">失败</option>
+        <option value="partial">部分完成</option>
+        <option value="queued">排队中</option>
+        <option value="parsing">解析中</option>
+        <option value="indexing">索引中</option>
+      </select>
+      <input class="form-input" id="doc-search" placeholder="搜索文件名…" style="width:220px">
+    </div>
+    <div data-piece="docs_tab">{% include "partials/knowledge/docs_tab.jinja2" %}</div>
+  </div>
+
+  <div data-tab-panel="tasks" class="hidden">
+    <div class="doc-filters">
+      <select class="form-select" id="task-status-filter" style="width:150px">
+        <option value="">全部状态</option>
+        <option value="active">进行中</option>
+        <option value="done">已完成</option>
+        <option value="failed">失败</option>
+        <option value="partial">部分完成</option>
+      </select>
+      <select class="form-select" id="task-collection-filter" style="width:180px">
+        <option value="">全部集合</option>
+        {% for c in collections | default([]) %}<option value="{{ c.name }}">{{ c.displayName }}</option>{% endfor %}
+      </select>
+    </div>
+    <div data-piece="tasks_tab">{% include "partials/knowledge/tasks_tab.jinja2" %}</div>
+  </div>
+
+  <div data-tab-panel="trash" class="hidden">
+    <div class="trash-banner">回收站中的文档不参与检索；可恢复或永久删除。</div>
+    <div data-piece="trash_tab">{% include "partials/knowledge/trash_tab.jinja2" %}</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/knowledge.js"></script>
+<script src="/static/js/knowledge-upload.js"></script>
+<script src="/static/js/knowledge-tasks.js"></script>
+{% endblock %}

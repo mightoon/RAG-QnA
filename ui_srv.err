@@ -1,0 +1,4 @@
+D:\Python\Python310\lib\site-packages\requests\__init__.py:109: RequestsDependencyWarning: urllib3 (2.7.0) or chardet (7.6.0)/charset_normalizer (2.1.1) doesn't match a supported version!
+  warnings.warn(
+D:\cuda\cb_IQA_platform\rag\adapters\vector_store.py:26: PyMilvusDeprecationWarning: `connections.connect` is an ORM-style PyMilvus API and will be removed in PyMilvus 3.1. Use `MilvusClient` instead.
+  connections.connect(

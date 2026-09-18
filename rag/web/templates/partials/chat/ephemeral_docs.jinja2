@@ -1,0 +1,9 @@
+{% set d = data if data is defined else none %}
+{% if d and d.docs %}
+  {% for x in d.docs %}
+  <span class="ep-doc-tag" data-doc-id="{{ x.docId }}">
+    <span class="ep-doc-name" title="{{ x.filename }}">{{ x.filename }}</span>
+    <button class="tag-action" data-ep-remove="{{ x.docId }}" title="移除">✕</button>
+  </span>
+  {% endfor %}
+{% endif %}

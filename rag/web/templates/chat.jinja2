@@ -1,0 +1,72 @@
+{% extends "base.jinja2" %}
+{% block title %}智能问答 - IQA{% endblock %}
+
+{% block content %}
+<div class="chat-layout" id="chat-page"
+     data-session-id="{{ initialSessionId | default('') }}">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <button class="btn btn-primary btn-sm" id="btn-new-session" style="width:100%">＋ 新会话</button>
+    </div>
+    <div class="sidebar-list" data-piece="sessions">
+      {% include "partials/chat/sessions.jinja2" %}
+    </div>
+  </aside>
+
+  <div class="chat-main">
+    <div class="chat-header">
+      <div class="chat-title" id="chat-title">新对话</div>
+      <div class="chat-header-actions">
+        <div class="paths-selector" id="paths-selector">
+          <span>检索路:</span>
+          <div class="paths-toggles">
+            {% for p in retrievalPaths | default([]) %}
+            <label class="path-toggle on" data-path="{{ p.name }}" title="{{ p.description }}">
+              <input type="checkbox" checked>{{ p.name }}
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chat-scroll" id="chat-scroll">
+      <div class="chat-empty" id="chat-empty">
+        <h2>向知识库提问</h2>
+        <p>支持多路检索与来源追溯</p>
+        <div class="welcome-hints">
+          <span class="hint-chip">总结一下平台的核心功能</span>
+          <span class="hint-chip">最近上传的文档讲了什么？</span>
+        </div>
+      </div>
+      <div data-piece="messages" id="messages-container" style="display:contents">
+        {% include "partials/chat/messages.jinja2" %}
+      </div>
+    </div>
+
+    <div class="chat-error-strip hidden" id="chat-error">
+      <span id="chat-error-text"></span>
+      <button id="chat-error-close">✕</button>
+    </div>
+
+    <div class="chat-input-area">
+      <div class="ep-docs-bar" data-piece="ephemeral_docs" id="ep-docs-bar">
+        {% include "partials/chat/ephemeral_docs.jinja2" %}
+      </div>
+      <div class="input-row">
+        <button class="attach-btn" id="btn-attach" title="上传临时文档（仅本会话有效）">📎</button>
+        <textarea id="chat-input" placeholder="输入问题，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+        <div class="input-actions">
+          <button class="btn btn-primary send-btn" id="btn-send">发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/chat-sources.js"></script>
+<script src="/static/js/chat-ui.js"></script>
+<script src="/static/js/chat.js"></script>
+{% endblock %}

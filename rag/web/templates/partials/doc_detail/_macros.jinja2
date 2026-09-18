@@ -1,0 +1,5 @@
+{% macro dd_status_badge(status) %}
+  {% set cls = {'done':'success','failed':'error','partial':'warning','deleted':'muted'} %}
+  {% set label = {'done':'已完成','failed':'失败','partial':'部分完成','deleted':'回收站'} %}
+  <span class="badge badge-{{ cls.get(status, 'info') }}">{{ label.get(status, status) }}</span>
+{% endmacro %}

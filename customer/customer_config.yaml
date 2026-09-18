@@ -1,0 +1,192 @@
+app_name: 企业智能问答平台
+version: 3.0.0
+auth:
+  adapter: jwt
+  jwt_secret: ${JWT_SECRET:-change-me-in-production}
+  jwt_algorithm: HS256
+  token_expire_hours: 24
+llm:
+  adapter: openai_compatible
+  base_url: http://192.168.100.242:29138/v1
+  api_key: ''
+  model: qwen38-27b
+  rewrite_model: ''
+  temperature: 5.0
+  max_tokens: 2048
+  timeout: 60
+  max_concurrency: 8
+embedding:
+  adapter: http_embedding
+  base_url: ''
+  api_key: ''
+  model: ''
+  dim: 1024
+  batch_size: 32
+  query_prefix: ''
+vector_store:
+  adapter: milvus
+  enabled: true
+  host: 192.168.100.239
+  port: 19530
+  user: ''
+  password: ''
+  collection_prefix: rag_
+  timeout: 10.0
+fulltext:
+  adapter: elasticsearch
+  enabled: true
+  hosts:
+  - http://192.168.100.239:9200
+  username: ''
+  password: ''
+  index_prefix: rag_
+  verify_certs: false
+mysql_meta:
+  adapter: mysql_meta
+  enabled: true
+  host: 192.168.100.239
+  port: 3306
+  user: rag
+  password: ''
+  database: rag_meta
+  auto_create_tables: true
+  charset: utf8mb4
+redis:
+  host: 192.168.100.239
+  port: 6379
+  password: Aa123456
+  db: 0
+  session_ttl_hours: 48
+  prefix: 'rag:'
+storage:
+  adapter: minio
+  enabled: true
+  endpoint: 192.168.100.239:9000
+  access_key: admin
+  secret_key: Aa123456
+  bucket: rag-docs
+  secure: false
+  local_root: ./data/files
+  preview_url_ttl: 3600
+knowledge_graph:
+  adapter: neo4j
+  enabled: false
+  uri: bolt://localhost:7687
+  user: neo4j
+  password: ''
+  max_hops: 3
+business_data:
+  adapter: sqlalchemy
+  enabled: false
+  dsn: mysql+pymysql://user:pass@localhost:3306/business
+  schema_file: customer/business_schema.yaml
+  allowed_tables: []
+  max_rows: 100
+  sensitive_fields: []
+synonym:
+  adapter: file_based
+  file: customer/synonyms.yaml
+  auto_reload_minutes: 30
+  url: ''
+  api_key: ''
+retrieval:
+  enable_kw_exact: true
+  enable_vector: true
+  enable_bm25: true
+  enable_graph: false
+  enable_structured: false
+  enable_ephemeral: true
+  top_k_per_path: 20
+  kw_exact_top_k: 8
+  vector_top_k: 10
+  bm25_top_k: 10
+  ephemeral_top_k: 8
+  graph_hops: 2
+  graph_max_nodes: 50
+  rrf_k: 60
+  rerank_enabled: true
+  rerank_model: models/bge-reranker-base
+  rerank_device: cpu
+  rerank_threshold: 0.3
+  final_top_n: 6
+  dedup_similarity: 0.92
+  route_timeout_seconds: 5
+  self_eval_threshold: 0.5
+  self_eval_max_iterations: 2
+  ephemeral_score_boost: 1.2
+  default_route_weights: {}
+pipeline:
+  enable_vlm: true
+  enable_summary: true
+  enable_keywords: true
+  enable_entities: true
+  enable_faithfulness: true
+  faithfulness_threshold: 0.6
+  enable_query_rewrite: true
+  enable_sub_query: true
+  total_timeout_seconds: 30
+  chunk_parent_max_tokens: 2000
+  chunk_child_max_tokens: 512
+  min_chunk_tokens: 20
+  security_max_query_length: 2000
+  security_blocked_words: []
+memory:
+  short_term_max_turns: 10
+  short_term_token_budget: 1500
+  working_summary_max_tokens: 400
+  session_archive_after_minutes: 120
+  long_term_enabled: true
+  topic_switch_threshold: 0.45
+ephemeral:
+  enabled: true
+  ttl_hours: 2
+  max_file_size_mb: 50
+  max_files_per_session: 5
+  target_seconds: 30
+ingest:
+  concurrency: 4
+  retry_backoff_seconds:
+  - 60
+  - 300
+  - 900
+  max_retries: 3
+  verify_sample_size: 6
+  batch_upsert_size: 500
+notification:
+  email_enabled: false
+  webhook_enabled: false
+  smtp_host: ''
+  smtp_port: 465
+  smtp_user: ''
+  smtp_password: ''
+  smtp_from: ''
+  webhook_url: ''
+  webhook_secret: ''
+consistency_check:
+  enabled: true
+  interval_hours: 1
+  sample_docs: 100
+  alert_threshold: 10
+observability:
+  log_level: INFO
+  log_json: true
+  metrics_enabled: true
+  pushgateway_url: ''
+  tracing_enabled: false
+  otlp_endpoint: ''
+permissions:
+- role: admin
+  collections:
+  - '*'
+  is_admin: true
+prompts:
+  system_prompt: 你是企业知识库问答助手。严格依据提供的参考文档回答问题， 在关键陈述后用 [文档N] 标注来源；若参考文档不足以回答， 明确说明知识库中没有相关信息，不要编造。
+  enable_cot: false
+  temperature: 0.3
+  max_answer_tokens: 2048
+  intent_few_shots: []
+  rerank_fallback_prompt: ''
+workflows_file: customer/workflows.yaml
+default_collection: default
+max_upload_mb: 500
+server_ingest_root: null

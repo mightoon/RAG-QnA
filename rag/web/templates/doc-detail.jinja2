@@ -1,0 +1,51 @@
+{% extends "base.jinja2" %}
+{% block title %}文档详情 - IQA{% endblock %}
+
+{% block content %}
+<div class="page-content" id="doc-detail-page" data-doc-id="{{ doc.doc_id if doc else '' }}">
+  <div class="doc-header">
+    <a class="back-link" href="/knowledge{% if backCollection %}?collection={{ backCollection }}{% endif %}">← 返回知识库</a>
+    <div class="doc-header-main" data-piece="doc_header">
+      {% include "partials/doc_detail/doc_header.jinja2" %}
+    </div>
+    <div class="doc-header-actions">
+      {% if doc and doc.status != 'deleted' %}
+      <button class="btn btn-secondary btn-sm" data-doc-op="reingest">重建索引</button>
+      <button class="btn btn-secondary btn-sm" data-doc-op="download">下载</button>
+      <button class="btn btn-danger btn-sm" data-doc-op="delete">删除</button>
+      {% elif doc %}
+      <button class="btn btn-secondary btn-sm" data-doc-op="restore">恢复</button>
+      <button class="btn btn-danger btn-sm" data-doc-op="permanent">永久删除</button>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="doc-layout">
+    <aside class="doc-side-panel">
+      <div class="card"><div class="card-body" data-piece="doc_attrs">
+        {% include "partials/doc_detail/doc_attrs.jinja2" %}
+      </div></div>
+    </aside>
+    <div>
+      <div class="tabs knowledge-tabs" style="margin-bottom:12px">
+        <button class="tab active" data-dtab="preview">内容预览</button>
+        <button class="tab" data-dtab="chunks">分块</button>
+      </div>
+      <div data-dtab-panel="preview">
+        <div class="preview-pane" data-piece="preview_pane">
+          {% include "partials/doc_detail/preview_pane.jinja2" %}
+        </div>
+      </div>
+      <div data-dtab-panel="chunks" class="hidden">
+        <div data-piece="chunks_container">
+          {% include "partials/doc_detail/chunks_container.jinja2" %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/doc-detail.js"></script>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% set d = data if data is defined else none %}
+{% if d is none %}
+  <div class="table-empty">加载中…</div>
+{% elif not d.items %}
+  <div class="table-empty">暂无分块</div>
+{% else %}
+<div class="chunk-list">
+  {% for c in d.items %}
+  <div class="chunk-item" data-chunk-id="{{ c.chunk_id }}">
+    <div class="chunk-head">
+      <span class="chunk-index">#{{ c.n }}</span>
+      <span class="badge badge-info">{{ c.chunk_type }}</span>
+      <span class="chunk-loc">
+        {% if c.page %}P{{ c.page }}{% endif %}
+        {% if c.section_path %} · {{ c.section_path }}{% endif %}
+      </span>
+      <span class="chunk-qscore">{{ c.tokens }} tok{% if c.quality_score is not none %} · q{{ '%.2f' | format(c.quality_score) }}{% endif %}</span>
+    </div>
+    <div class="chunk-text">{{ c.text }}</div>
+    {% if c.text and c.text | length > 220 %}
+    <button class="chunk-expand-btn" type="button">展开</button>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+<div class="table-pagination">
+  <button class="btn btn-secondary btn-xs js-chunk-page" data-page="{{ d.page - 1 }}" {% if d.page <= 1 %}disabled{% endif %}>上一页</button>
+  <span class="page-info">第 {{ d.page }} 页 · 共 {{ d.total }} 块</span>
+  <button class="btn btn-secondary btn-xs js-chunk-page" data-page="{{ d.page + 1 }}" {% if not d.hasMore %}disabled{% endif %}>下一页</button>
+</div>
+{% endif %}

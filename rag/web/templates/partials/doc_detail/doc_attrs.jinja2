@@ -1,0 +1,27 @@
+{% set d = data if data is defined else none %}
+{% set doc = d.doc if d and d.doc is defined else (doc if doc is defined else none) %}
+{% if doc %}
+<ul class="doc-attrs">
+  <li><span class="attr-key">文档 ID</span><span class="attr-val">{{ doc.doc_id }}</span></li>
+  <li><span class="attr-key">集合</span><span class="attr-val plain">{{ doc.collection }}</span></li>
+  <li><span class="attr-key">类型</span><span class="attr-val plain">{{ doc.file_type or '—' }}</span></li>
+  <li><span class="attr-key">大小</span><span class="attr-val plain">
+    {%- if doc.file_size is none -%}—
+    {%- elif doc.file_size < 1048576 -%}{{ '%.1f' | format(doc.file_size / 1024) }} KB
+    {%- else -%}{{ '%.1f' | format(doc.file_size / 1048576) }} MB{%- endif -%}</span></li>
+  <li><span class="attr-key">页数</span><span class="attr-val plain">{{ doc.page_count if doc.page_count is not none else '—' }}</span></li>
+  <li><span class="attr-key">分块数</span><span class="attr-val plain">{{ doc.chunk_count if doc.chunk_count is not none else '—' }}</span></li>
+  <li><span class="attr-key">版本</span><span class="attr-val plain">v{{ doc.version or 1 }}</span></li>
+  <li><span class="attr-key">上传者</span><span class="attr-val plain">{{ doc.created_by or '—' }}</span></li>
+  <li><span class="attr-key">上传时间</span><span class="attr-val plain">{{ (doc.created_at or '')[:16].replace('T', ' ') or '—' }}</span></li>
+</ul>
+<div class="doc-section">可见角色</div>
+<div class="doc-roles-list">
+  {% for r in doc.allowed_roles or [] %}<span class="tag-chip">{{ r }}</span>
+  {% else %}<span class="text-tertiary" style="font-size:var(--fs-xs)">全部角色</span>{% endfor %}
+</div>
+{% if doc.error %}
+<div class="doc-section">错误信息</div>
+<div class="task-detail">{{ doc.error }}</div>
+{% endif %}
+{% endif %}

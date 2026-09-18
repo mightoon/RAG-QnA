@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.log
+logs/
+data/
+models_cache/
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+customer/customer_config.local.yaml
+models/bge-reranker-base/
+models/bge-reranker-v2-m3/
