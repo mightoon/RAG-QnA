@@ -4,6 +4,7 @@
 - YAML → AppConfig，支持 ${ENV_VAR} 环境变量插值
 - 热重载：mtime 变化时重新加载（同义词表等运行时热更新）
 - 敏感字段保留：保存配置时未修改的密钥不回写空值
+- 凭据加密落盘：api_key/password/secret_key 以 enc:v1:... 形式存 YAML（见 secrets.py）
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from typing import Any
 import yaml
 
 from .models import LEGACY_SECTION_ALIASES, AppConfig
+from .secrets import SENSITIVE_KEYS, decrypt_tree, encrypt_tree, is_untouched
 
 _ENV_PATTERN = re.compile(r"\$\{([^}^{]+)\}")
 
@@ -37,11 +39,10 @@ def _migrate_legacy_sections(raw: dict) -> dict:
                 raw[new] = block
     return raw
 
-_SENSITIVE_FIELDS = {
-    "api_key", "password", "secret_key", "jwt_secret",
-    "smtp_password", "webhook_secret", "oidc_client_secret",
-    "access_key",
-}
+# "留空不覆盖原值"的字段集：在凭据集合（= 加密集合）基础上再加 access_key。
+# access_key 不在加密集合里（那是身份标识，加密只会让配置难读），但它是账号凭据的
+# 一半，界面留空同样不该把它抹掉。
+_SENSITIVE_FIELDS = SENSITIVE_KEYS | {"access_key"}
 
 
 def _interpolate_env(value: Any) -> Any:
@@ -73,7 +74,9 @@ def load_config(path: str | Path = "customer/customer_config.yaml") -> AppConfig
         return cfg
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
-    raw = _migrate_legacy_sections(_interpolate_env(raw))
+    # 顺序：环境变量插值 → 老段名迁移 → 凭据解密。解密放最后是因为 ${VAR} 里塞的
+    # 也可能是密文，而密文本身不含 ${}，两者互不干扰
+    raw = decrypt_tree(_migrate_legacy_sections(_interpolate_env(raw)), path.parent)
     cfg = AppConfig(**raw)
     cfg._config_path = str(path)
     return cfg
@@ -119,30 +122,51 @@ class ConfigLoader:
     def save(self, updates: dict, preserve_sensitive: bool = True) -> AppConfig:
         """
         保存配置变更回 YAML。
-        preserve_sensitive=True 时，若更新中敏感字段为空字符串，
+        preserve_sensitive=True 时，若更新中敏感字段为空字符串（界面留空），
         则保留文件中的原值（避免界面操作清空密钥）。
         """
-        raw: dict = {}
-        if self._path.exists():
-            with open(self._path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-
-        # 旧段名迁移：文件里的旧键与本次更新都先归一到新键，否则写回的文件
-        # 会同时留着 mysql_meta 与 meta 两段，下一次加载以 meta 为准、
-        # 旧段却一直在文件里误导读者
-        raw = _migrate_legacy_sections(raw)
-        merged = _deep_merge(raw, _migrate_legacy_sections(dict(updates)))
-        if preserve_sensitive:
-            _restore_sensitive(raw, updates, merged)
-
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
-
+        merged = merge_config_file(self._path, updates, preserve_sensitive)
         self._config = AppConfig(**_interpolate_env(merged))
         self._config._config_path = str(self._path)
         self._mtime = self._file_mtime()
         return self._config
+
+
+def merge_config_file(path: str | Path, updates: dict,
+                      preserve_sensitive: bool = True) -> dict:
+    """读盘 → 解密 → 归一段名 → 合并 → 加密写盘，返回内存用的明文配置字典
+
+    这是配置写盘的**唯一**入口：配置页保存（routes.save_config）与 ConfigLoader.save
+    都走这里。曾经配置页自己 `yaml.safe_dump` 直接写盘，跳过了"先解密再合并"和
+    "写盘前加密"两步，结果是凭据明文落盘、且未修改的凭据会被界面回传的空值抹掉
+    （TS-023）。把三条不变量（解密读 / 保留原值 / 加密写）收在一个函数里，才不会
+    再被某一条链路漏掉。
+    """
+    path = Path(path)
+    raw: dict = {}
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+
+    # 磁盘上的凭据是密文：先解密再合并。否则 preserve_sensitive 分支会把密文当作
+    # "原值"塞回内存配置，运行中的模型立刻变成拿一串 enc:v1:... 去请求接口
+    raw = decrypt_tree(raw, path.parent)
+
+    # 旧段名迁移：文件里的旧键与本次更新都先归一到新键，否则写回的文件
+    # 会同时留着 mysql_meta 与 meta 两段，下一次加载以 meta 为准、
+    # 旧段却一直在文件里误导读者
+    raw = _migrate_legacy_sections(raw)
+    updates = _migrate_legacy_sections(dict(updates))
+    merged = _deep_merge(raw, updates)
+    if preserve_sensitive:
+        _restore_sensitive(raw, updates, merged)
+
+    # 写盘前加密凭据；内存里的 merged 保持明文，热应用可以直接用
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(encrypt_tree(merged, path.parent), f,
+                       allow_unicode=True, sort_keys=False)
+    return merged
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -156,10 +180,15 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _restore_sensitive(old: dict, new: dict, merged: dict) -> None:
-    """merged 中敏感字段若来自 new 的空值，恢复 old 的原值"""
+    """merged 中敏感字段若来自 new 的空值，恢复 old 的原值
+
+    "空值"要同时涵盖两种：真·空串（界面留空）与 UI 回传的掩码 "******"。
+    后者必须一起兜住 —— 特殊配置域是整块 JSON 编辑框，掩码会原样出现在文本里，
+    一次保存就把真凭据覆盖成 6 个星号（不可逆）。
+    """
     for k, v in merged.items():
         if isinstance(v, dict) and k in old and isinstance(old[k], dict):
             _restore_sensitive(old[k], new.get(k, {}), v)
-        elif k in _SENSITIVE_FIELDS and v in ("", None):
+        elif k in _SENSITIVE_FIELDS and is_untouched(v):
             if old.get(k):
                 merged[k] = old[k]

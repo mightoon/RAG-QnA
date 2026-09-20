@@ -1,12 +1,23 @@
 /* 运行监控页（/monitor）
    数据源：GET /api/admin/monitor/overview（管理员）
-   首屏：服务端随模板下发的快照（#monitor-initial），免一次往返闪烁
+
+   首屏：**页面不等采样**。服务端只回放最近一次采样（#monitor-initial，可能为空）；
+   没有再自己去取 —— 采样最慢的一项按它自己的预算走，让 HTML 等它等于"打开页面
+   耗时 = 最慢依赖的探测预算"。没有数据时先渲染「采集中」占位：它是无结论的，
+   不会把"还没采到"画成"服务不可用"。
 
    刷新策略：
    - 手动「立即刷新」+ 可选定时轮询；
+   - 用户主动动作（立即刷新 / 改间隔 / 重开自动刷新）带 live=1 强制现采 ——
+     不复用缓存，否则按钮点了没反应、也确认不了新间隔是否生效；
+   - 定时轮询与切回前台走服务端 TTL 缓存：同一瞬间的重复请求（打开页面 + 前端
+     紧接着取一次、多个标签页）合并成一次探测，不为看板把依赖多探几遍；
    - 页面不可见（document.hidden）时**暂停**轮询 —— 用户切到别的标签页后
      还在后台反复探测外部服务，只会白白给 MySQL/ES/Milvus 加压；
    - 连续失败 3 次自动停表，避免对已经挂掉的服务持续打点刷屏。
+
+   时间口径：快照自带 checkedAt（采样时刻），另有 sampledAgoSec（服务端算的
+   "离现在多久"）—— 复用了缓存时必须说出来，否则用户会把上一轮的结果当成此刻。
 */
 (function () {
   'use strict';
@@ -91,14 +102,28 @@
     return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   }
 
+  /* "多久以前采的"：小于 5 秒不显示 —— 刚采完就标一句"3 秒前"只是噪声，
+     用户会以为每次刷新都拿到旧数据。5 秒起才说明"这份不是此刻的"。 */
+  function fmtAgo(sec) {
+    var s = Math.round(Number(sec) || 0);
+    if (!isFinite(s) || s < 5) return '';
+    if (s < 60) return s + ' 秒前';
+    if (s < 3600) return Math.round(s / 60) + ' 分钟前';
+    return Math.round(s / 3600) + ' 小时前';
+  }
+
   function fmtLimit(v) {
     return (v === null || v === undefined) ? '不限' : String(v);
   }
 
-  /* 单个服务的状态口径（与后端 enabled / probe / online / degraded 一一对应） */
+  /* 单个服务的状态口径（与后端 enabled / probe / online / timedOut / degraded 一一对应） */
   function statusOf(s) {
     if (!s.enabled) return { cls: 'dot-unknown', text: '未启用' };
     if (s.probe === 'static') return { cls: 'dot-unknown', text: '无探针' };
+    // 本页显示预算内没等到回应：此刻确实用不了，但**不等于对端失联** ——
+    // 探测还在后台按该服务自己的预算继续跑。报"超时"而不是"不可用"，因为
+    // 两者要用户做的事不同：一个可以等结论落地，另一个才需要去查那个服务。
+    if (s.timedOut) return { cls: 'dot-warn', text: '探测超时' };
     if (!s.online) return { cls: 'dot-error', text: '不可用' };
     if (s.degraded) return { cls: 'dot-warn', text: '降级运行' };
     if (s.localImpl) return { cls: 'dot-warn', text: '本地实现' };
@@ -288,19 +313,25 @@
     var row = el('div', 'monitor-svc');
 
     // 说明文字一律收进 ⓘ（以前是常驻的黄字：只要有两三条不健康，版面就被
-    // "为什么"占满，反而看不出"到底哪几条不健康"）。三种情况必须分清，
+    // "为什么"占满，反而看不出"到底哪几条不健康"）。四种情况必须分清，
     // 否则用户会觉得监控页和配置页互相打脸（TS-015 口径一致）：
     // ① 静态实现：没有独立探针；
-    // ② 真的连不上：把降级原因说清楚，并交代后台正在自动重连（见下）；
-    // ③ 探测已通过但容器还挂着降级：自愈循环重装该段之前的过渡态。
+    // ② 本页显示预算内没等到回应：不等于对端失联，探测还在后台跑（见下）；
+    // ③ 真的连不上：把降级原因说清楚，并交代后台正在自动重连（见下）；
+    // ④ 探测已通过但容器还挂着降级：自愈循环重装该段之前的过渡态。
     //
-    // 黄 ⓘ 只留给"需要你处理"的那两种：该启用却连不上、探测通过但容器仍记着
-    // 降级。用户主动关掉的段、演示模式下按设计跳过的段都只是既定状态，刷成黄
-    // 色会让真正的故障淹在黄点里（以前黄字常驻时没人分得清，现在一眼可辨）。
+    // 黄 ⓘ 只留给"需要你处理"的那几种：探测超时、该启用却连不上、探测通过但容器
+    // 仍记着降级。用户主动关掉的段、演示模式下按设计跳过的段都只是既定状态，刷成
+    // 黄色会让真正的故障淹在黄点里（以前黄字常驻时没人分得清，现在一眼可辨）。
     var note = '', warn = false;
     if (s.probe === 'static') {
       // 进程内实现（同义词表 / 认证 / mock）：没有可探测的对端，不是故障
       note = s.message || '进程内实现，无独立健康探针';
+    } else if (s.timedOut) {
+      warn = !!s.enabled && !demo;
+      // 只报本行的探测文案，**不叠 degradedReason**：那是容器里启动自检/上一次
+      // 的结论，挂在"本轮没等到"上就是张冠李戴（用户会以为容器又记了一笔）。
+      note = s.message || '未在显示预算内返回';
     } else if (!s.online) {
       warn = !!s.enabled && !demo;
       note = s.degradedReason || s.message || '';
@@ -798,6 +829,10 @@
     // 只报「最后更新」时刻：刷新间隔在工具栏的下拉里明摆着，重复一遍没意义。
     // 但「停了」必须说 —— 否则用户会以为页面还在更新，实际它已经不探了。
     var head = '最后更新 ' + (fmtClock((data || {}).checkedAt) || '—');
+    // 命中了服务端缓存也要说：那一刻显示的是**上一轮**的采样结果，不标注的话，
+    // "最后更新"会被读成"此刻的状态"，而这正是监控页最不能有的误导。
+    var ago = fmtAgo((data || {}).sampledAgoSec);
+    if (ago) head += ' · 采样于 ' + ago;
     if (document.hidden) {
       st.textContent = head + ' · 页面在后台，已暂停刷新';
     } else if (!state.auto) {
@@ -805,6 +840,34 @@
     } else {
       st.textContent = head;
     }
+  }
+
+  /* ── 首屏占位 ──
+     页面不再等采样，所以在数据到达前必须有一块**无结论**的占位：只说"在采"，
+     不画任何状态色。若改成先渲染一份空快照（全灰/全红），用户第一眼看到的就是
+     "全线故障"——监控页最贵的一次误报，恰恰发生在它最可能被打开的那一刻。 */
+  function skeletonCard(text) {
+    var card = el('div', 'card');
+    var body = el('div', 'card-body monitor-skeleton');
+    body.appendChild(el('span', 'monitor-spinner'));
+    body.appendChild(el('span', null, text));
+    card.appendChild(body);
+    return card;
+  }
+
+  function renderSkeleton() {
+    var st = qs('#monitor-stamp');
+    if (st) st.textContent = '正在采集…（逐项探测依赖，结果到齐后自动填入）';
+    [['monitor_summary', '总览指标采集中'],
+     ['monitor_services', '支撑服务探测中'],
+     ['monitor_readiness', '就绪度采集中'],
+     ['monitor_metrics', '指标采集中']
+    ].forEach(function (it) {
+      var root = document.querySelector('[data-piece="' + it[0] + '"]');
+      if (!root) return;
+      while (root.firstChild) root.removeChild(root.firstChild);
+      root.appendChild(skeletonCard(it[1]));
+    });
   }
 
   function applySnapshot(data) {
@@ -828,13 +891,17 @@
     state.timer = setInterval(refresh, state.intervalMs);
   }
 
-  async function refresh() {
+  async function refresh(opts) {
+    opts = opts || {};
     if (state.busy) return;
     state.busy = true;
     var st = qs('#monitor-stamp');
     if (st) st.classList.add('busy');
     try {
-      var data = await window.API.getData('/api/admin/monitor/overview',
+      // live=1：用户主动要一次现采（点了按钮却拿到 15 秒内的缓存，按钮就成了
+      // "点了没反应"）。默认不带，让同一瞬间的重复请求在服务端合并成一次探测。
+      var data = await window.API.getData(
+        '/api/admin/monitor/overview' + (opts.live ? '?live=1' : ''),
         { timeout: 25000 });
       state.failStreak = 0;
       applySnapshot(data);
@@ -864,6 +931,9 @@
   }
 
   /* ── 初始化 ── */
+  /* 服务端回放的最近一次采样（可能为 null —— 那说明没有够新的可复用结果，
+     页面不等它，交给下面的 refresh()）。解析失败同样按"没有"处理：
+     占位 + 自己取一次，总好过空白页。 */
   function bootstrapSnapshot() {
     var node = document.getElementById('monitor-initial');
     if (!node) return null;
@@ -877,7 +947,8 @@
 
   function bindToolbar() {
     var btn = qs('#monitor-refresh');
-    if (btn) btn.addEventListener('click', function () { refresh(); });
+    // 用户主动要一次真实探测，不走缓存
+    if (btn) btn.addEventListener('click', function () { refresh({ live: true }); });
 
     var auto = qs('#monitor-auto');
     if (auto) {
@@ -886,7 +957,7 @@
         state.auto = !!auto.checked;
         state.failStreak = 0;
         S.persist(PREF_AUTO, state.auto);
-        if (state.auto) { refresh(); }
+        if (state.auto) { refresh({ live: true }); }
         else if (state.snapshot) { renderStamp(state.snapshot); }
         schedule();
       });
@@ -902,8 +973,10 @@
           S.persist(PREF_INTERVAL, state.intervalMs);
         }
         // 立即刷新一次：否则用户改完间隔后要干等一个周期才看得到反馈，
-        // 无法确认新频率是否生效（顺带把时间戳文案一起更新）。
-        if (state.auto) { refresh(); } else if (state.snapshot) { renderStamp(state.snapshot); }
+        // 无法确认新频率是否生效（顺带把时间戳文案一起更新）。现采 —— 若命中
+        // 缓存，采样时刻不变，用户照样确认不了"刚才那次到底跑没跑"。
+        if (state.auto) { refresh({ live: true }); }
+        else if (state.snapshot) { renderStamp(state.snapshot); }
         schedule();
       });
     }
@@ -915,6 +988,8 @@
         return;
       }
       renderStamp(state.snapshot || {});
+      // 切回前台：隐藏期间定时器是停的，回来先补一次。允许命中缓存（通常也命中
+      // 不了：隐藏久了早就过了 TTL），命中的话时间戳会写明"采样于 N 分钟前"。
       if (state.auto) { refresh(); schedule(); }
     });
 
@@ -935,6 +1010,9 @@
   if (initial) {
     applySnapshot(initial);
   } else {
+    // 没有可回放的采样：先摆无结论的占位，立刻自己去取。这一次请求通常会命中
+    // 服务端正在跑的那一轮探测（单飞），而不是再探一遍。
+    renderSkeleton();
     refresh();
   }
   schedule();

@@ -9,6 +9,9 @@ sse-starlette>=2.0
 pydantic>=2.6
 pydantic-settings>=2.2
 pyyaml>=6.0
+# 凭据加密落盘（rag/config/secrets.py）：Fernet 需要它。它本来就作为 pymilvus 的间接
+# 依赖躺在环境里，但我们是直接调用方，必须显式声明 —— 否则换一套精简安装就 ImportError
+cryptography>=42.0
 python-dotenv>=1.0
 
 # ═══ 数据库 ═══

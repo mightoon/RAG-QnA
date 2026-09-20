@@ -127,6 +127,16 @@ class ServiceContainer:
         # 既给后台循环做退避，也给监控页显示「已经自动重连过几次」——否则用户
         # 看到"还是不可用"只会以为程序没在管，又会来问同一个问题。
         self.recovery_stats: dict[str, dict] = {}
+        # 运行监控快照：最近一次采样结果 + 采样时刻 + 单飞锁（懒建）。
+        # 采样要逐个探真实依赖（最慢那项按它自己的预算走，可能是十几秒），
+        # 属于"贵且结论对同一时刻的所有请求都一样"的东西 → 缓存 + 单飞：
+        # 页面打开时前端紧接着取的那一次、以及多个标签页/连续刷新，共用一个结果，
+        # 而不是各探一遍。TTL 很短（见 web/routes._MONITOR_SNAPSHOT_TTL_SEC），
+        # 过期就重采，所以这里不是"拿旧数据糊弄"，只是不让同一瞬间重复探测。
+        # 由 web 层读写（routes._monitor_snapshot_cached）。
+        self.monitor_snapshot: dict | None = None
+        self.monitor_snapshot_at: float = 0.0
+        self._monitor_lock = None
         # 单段热应用互斥锁（懒建，理由见 _apply_lock_for）
         self._apply_lock = None
         # 向量空间指纹：collection → (写入是否允许, 检索是否可用, 原因)。由
@@ -459,6 +469,21 @@ class ServiceContainer:
         return not (keys & set(self.degraded))
 
     # ── 运行期自愈 ──────────────────────────────────────────
+
+    def monitor_lock(self):
+        """监控快照单飞锁（懒建：容器可能在无事件循环的上下文构造，同 _apply_lock_for）
+
+        作用不是"防止并发读"，而是防止并发**采**：同一时刻只允许一轮全量探测，
+        后来者等这一轮的结果（见 routes._monitor_snapshot_cached 的二次判 TTL）。
+        没有它的话，"打开监控页 + 前端立刻拉一次 /overview"就会把每个依赖连探两遍，
+        而探测本身就是被监控对象的负载 —— 对一个已经掉线的 MySQL 连打两轮，
+        正是这个页面最不该干的事。
+        """
+        import asyncio
+
+        if self._monitor_lock is None:
+            self._monitor_lock = asyncio.Lock()
+        return self._monitor_lock
 
     def _apply_lock_for(self):
         """懒建单段热应用互斥锁

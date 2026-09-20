@@ -53,8 +53,13 @@
   </div>
 </div>
 
-{# 首屏快照由服务端下发：JSON 走 script 承载，Jinja 的 tojson 会把 < > & 转义成
-   \u003c 等，配置值里出现 "</script>" 也无法提前闭合标签 #}
+{# 服务端只回放**最近一次采样**，不在这里现采：采样要逐个探真实依赖（最慢那项按
+   自己的预算走，可能十几秒），放在渲染前等于"打开页面耗时 = 最慢依赖的探测预算"，
+   而这个页面恰恰是在依赖出问题时才被打开。
+   null = 没有够新的结果可回放（首次访问、或上次采样已太旧）→ 前端先显示「采集中」
+   占位，再自己拉一次（见 monitor.js renderSkeleton / refresh）。
+   JSON 走 script 承载：Jinja 的 tojson 会把 < > & 转义成 \u003c 等，配置值里出现
+   "</script>" 也无法提前闭合标签 #}
 <script type="application/json" id="monitor-initial">{{ initial_snapshot | tojson }}</script>
 {% endblock %}
 

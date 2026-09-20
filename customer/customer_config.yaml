@@ -7,14 +7,15 @@ auth:
   token_expire_hours: 24
 llm:
   adapter: openai_compatible
-  base_url: http://192.168.100.242:29138/v1
-  api_key: ''
-  model: qwen38-27b
+  base_url: https://api.deepseek.com
+  api_key: enc:v1:gAAAAABqr_vG84m9j4uHHLjYmAmx46p4em81WIqIVghoUJJRcFebiW4QjCRgoo9FGn3AxOwlETh7Rd94neu8zGzzVac-6V--nIDlpgDay_rGOmASiFRRRPA-mT2pJlqAe7gsu1AfSkjw
+  model: deepseek-flash
   rewrite_model: ''
   temperature: 5.0
-  max_tokens: 2048
+  max_tokens: 4096
   timeout: 60
   max_concurrency: 8
+  display_name: int-deepseek01
 embedding:
   adapter: http_embedding
   base_url: http://192.168.100.237:8000/v1
@@ -54,7 +55,7 @@ meta:
 redis:
   host: 192.168.100.239
   port: 6379
-  password: Aa123456
+  password: enc:v1:gAAAAABqr_vGuNhMDRtpjq4ybvPoLrxEfQkvaNqBok-ddzBkHeTHws0qyIL1XaWXM_FQ9tNW-GzgtezKRRdw1NFb2htybINkVg==
   db: 0
   session_ttl_hours: 48
   prefix: 'rag:'
@@ -63,7 +64,7 @@ storage:
   enabled: true
   endpoint: 192.168.100.239:9000
   access_key: admin
-  secret_key: Aa123456
+  secret_key: enc:v1:gAAAAABqr_vGZPNXBV-E6APbU7jH_7iKqewNUC5bzCwyoyO1bGEqAuRLUb4AkNsR3AEUQzgnhXE2wSYgUeDKnRrp-4COz33heg==
   bucket: rag-docs
   secure: false
   local_root: ./data/files
@@ -78,7 +79,7 @@ knowledge_graph:
 business_data:
   adapter: sqlalchemy
   enabled: false
-  dsn: mysql+pymysql://user:pass@localhost:3306/business
+  dsn: enc:v1:gAAAAABqr_vGP_K7-xTA-1nyOSmNGgYY3RkCQQS1-T6oINMhov-cr0xe2Vq28kHgsZYYMT7vaqljBC0rvYNDkFnauq5px7OwxvUKv-ns8_DXK17dDyq8FTwLNnN-CqWQMkOP1af-q-C8SxPFyNquDEXHUJgRJVYKjA==
   schema_file: customer/business_schema.yaml
   allowed_tables: []
   max_rows: 100

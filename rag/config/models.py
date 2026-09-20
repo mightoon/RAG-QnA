@@ -33,6 +33,11 @@ LEGACY_ADAPTER_ALIASES: dict[str, str] = {"mysql_meta": "mysql"}
 
 class LLMConfig(BaseModel):
     adapter: str = "openai_compatible"      # openai_compatible / vllm / 自定义注册名
+    # 显示名：用户给这套模型配置起的名字（如 "DeepSeek 线上" / "内网 vLLM"），
+    # 配置页把它显示在卡片标题上 —— 卡片标题原来只有槽位名（LLM 大模型），
+    # 换一套服务后标题照旧，只有翻参数行才看得出配的是谁。
+    # 纯标识，不参与适配器构造：它与 base_url 指向的真实服务无关，改它不该重建连接。
+    display_name: str = ""
     # 任意 OpenAI 兼容服务（vLLM / Ollama / DeepSeek / 通义 / OpenAI…）
     # base_url 留空 = 未配置 → 启动自动降级内置 Mock，可在 UI 配置页填写
     base_url: str = ""
@@ -48,6 +53,9 @@ class LLMConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     adapter: str = "http_embedding"
+    # 显示名：同 LLMConfig.display_name（嵌入模型与 LLM 常指向两套不同服务，
+    # 卡片标题需要各自的标识来区分）
+    display_name: str = ""
     # 向量化服务地址；留空 = 未配置 → 启动自动降级内置 Mock
     base_url: str = ""
     api_key: str = ""

@@ -660,6 +660,15 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
   color:var(--text-secondary)}
 .monitor-banner.error{border-color:var(--error);background:var(--error-light);color:var(--error)}
 .monitor-banner.warning{border-color:var(--warning);background:var(--warning-light);color:var(--warning)}
+/* 首屏占位（页面不再等采样，见 monitor.js renderSkeleton）：只说"在采"。
+   刻意不带任何状态色 —— 用一份空快照渲染出来的红/灰就是一次"全线故障"误报，
+   而它恰好会出现在用户最可能打开这个页面的时刻。 */
+.monitor-skeleton{display:flex;align-items:center;gap:10px;min-height:52px;
+  font-size:var(--fs-sm);color:var(--text-tertiary)}
+.monitor-spinner{flex:none;width:14px;height:14px;border-radius:50%;
+  border:2px solid var(--border-strong);border-top-color:var(--info);
+  animation:monitor-spin .8s linear infinite}
+@keyframes monitor-spin{to{transform:rotate(360deg)}}
 .monitor-block{margin-bottom:var(--space-4)}
 .monitor-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
 .monitor-svc-list{display:flex;flex-direction:column}

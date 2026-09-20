@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.qna_venv
 venv/
 .env
 *.log
@@ -13,5 +14,9 @@ models_cache/
 .idea/
 .vscode/
 customer/customer_config.local.yaml
+# 凭据加密用的本机主密钥（见 rag/config/secrets.py）：绝不入库，
+# 换机器时要么单独安全拷贝，要么改用环境变量 RAG_SECRET_KEY
+.secrets.key
+customer/.secrets.key
 models/bge-reranker-base/
 models/bge-reranker-v2-m3/

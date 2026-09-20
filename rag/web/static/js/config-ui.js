@@ -44,6 +44,13 @@
     return row;
   }
 
+  /* 行下方的补充说明（另起一行）：.perm-row 是横向 flex，塞进去会挤在输入框右侧 */
+  function hintLine(text) {
+    const h = el('div', 'form-hint', text);
+    h.style.marginLeft = '138px';     // 对齐输入列（label 固定 130px + gap 8px）
+    return h;
+  }
+
   /* 标题旁带圈的 i：鼠标移入（或点击/回车）即展开；鼠标**留在 ⓘ 或提示框里**就一直显示，
      移到这块区域之外就自动收起（也按 Esc 可收起，键盘用户没有「移出」这个机会）。
      为什么不是简单 mouseleave 就收：ⓘ 和提示框之间隔着 8px 空隙，
@@ -254,6 +261,23 @@
     const head = el('header');
     const titleWrap = el('div', 'card-title');
     titleWrap.appendChild(el('span', 'doc-title-main', g.label || g.key));
+    /* 「模型名」的牌子：只有 LLM / 向量模型卡片有这一项（后端 _MODEL_SECTIONS）。
+       名字写在参数行里，身份却必须挂在标题上 —— 否则换了一套模型服务，两张卡片的
+       标题一模一样，只有逐行读参数才认得出配的是谁。这里从 configParams 里取同一份
+       值（不另存一份），改一个字符标题就跟着变，用户才不会怀疑没保存上。 */
+    const nameParam = (g.configParams || []).find(p => p.key === 'display_name');
+    const nameTag = nameParam ? el('span', 'doc-title-sub', '') : null;
+    if (nameTag) {
+      nameTag.title = '模型名（仅用于区分不同配置，不影响连接）';
+      titleWrap.appendChild(nameTag);
+    }
+    const syncNameTag = () => {
+      if (!nameTag) return;
+      const v = String(nameParam.value || '').trim();
+      nameTag.textContent = v ? '· ' + v : '';
+      nameTag.classList.toggle('hidden', !v);
+    };
+    syncNameTag();
     if (g.hint) titleWrap.appendChild(infoTip(g.hint));
     if (g.refresh === 'restart') {
       titleWrap.appendChild(el('span', 'badge badge-warning', '需重启'));
@@ -269,16 +293,26 @@
     /* 保存只提交本卡片所在的这一个分组 */
     const buildPayload = () => {
       if (scope === 'model') {
+        // 模型名必填：卡片标题上显示的就是它，空名字等于两张卡片又分不出来了。
+        // 与 API 地址无关，本机/Mock 模式同样要有名字
+        const nameRow = (g.configParams || []).find(p => p.key === 'display_name');
+        const name = nameRow ? String(nameRow.value || '').trim() : '';
+        if (!name) {
+          const err = new Error((g.label || g.key) +
+            '：模型名必填 —— 它就是卡片标题上那个名字，用来区分不同的模型配置');
+          err.validation = true;
+          throw err;
+        }
         const modelRow = (g.configParams || []).find(p => p.key === 'model');
         const modelName = modelRow ? String(modelRow.value || '').trim() : '';
         const ep = String(g.endpoint || '').trim();
         if (ep && !modelName) {
-          const err = new Error((g.label || g.key) + '：已填 API 地址，模型名称也必填');
+          const err = new Error((g.label || g.key) + '：已填 API 地址，模型ID也必填');
           err.validation = true;
           throw err;
         }
         if (!ep && modelName) {
-          const err = new Error((g.label || g.key) + '：已填模型名称，API 地址也必填');
+          const err = new Error((g.label || g.key) + '：已填模型ID，API 地址也必填');
           err.validation = true;
           throw err;
         }
@@ -295,7 +329,7 @@
       save.refresh();
     };
 
-    let modelInput = null;   // 「模型名称」输入框引用，chips 选用时同步
+    let modelInput = null;   // 「模型ID」输入框引用，chips 选用时同步
     if (g.showTestButton) {
       const t = el('button', 'btn btn-ghost btn-sm', '测试连接');
       t.addEventListener('click', async () => {
@@ -330,8 +364,9 @@
                 }
               });
           } else if (Array.isArray(r.models) && r.online && g.endpoint !== undefined) {
-            // 只对模型服务提示"可手填模型名"；数据库/中间件本来就没有模型列表
-            showToast('端点未返回模型列表，可手填模型名', 'info');
+            // 只对模型服务提示"可手填"；数据库/中间件本来就没有模型列表。
+            // 这里说的是"模型ID"（发给服务端的那个标识），别和卡片上的"模型名"混
+            showToast('端点未返回模型列表，可手填模型ID', 'info');
           }
         } catch (e) {
           t.textContent = '✗ 失败';
@@ -350,13 +385,21 @@
     card.appendChild(head);
 
     const rows = el('div', 'perm-rows');
-    if (g.endpoint !== undefined) {
+    // 字段顺序 = 用户填写的顺序：模型名 → API 地址 → 模型ID → 其余参数。
+    // API 地址不是 configParams 里的一行（它是 g.endpoint 这个独立控件），所以只能
+    // 按位置插进去：跟在"模型名"之后、模型ID之前。没有模型名的卡片（各服务卡片）
+    // 由循环末尾那次调用补上，等于退回原来的"地址行在最前"。
+    let endpointDone = false;
+    const injectEndpoint = () => {
+      if (endpointDone || g.endpoint === undefined) return;
+      endpointDone = true;
       rows.appendChild(kvRow('API 地址', textInput(g.endpoint, v => {
         g.endpoint = v; touch();
       }, { placeholder: 'http://host:port/v1（留空则降级为内置 Mock）' }), true));
-    }
+    };
     // configParams（扁平键值，按类型渲染输入框）
     (g.configParams || []).forEach(p => {
+      if (p.key !== 'display_name') injectEndpoint();
       // bool 型一律给单选，不让人手填 true/false：
       // 后端按字符串判真值（"1 / true / yes / on" 之外都算 false），填错只会静默变 false
       if (p.type === 'bool') {
@@ -367,27 +410,51 @@
           [{ v: 'true', label: pair[0] }, { v: 'false', label: pair[1] }],
           on ? 'true' : 'false',
           v => { p.value = v; touch(); }));
-        // 字段级说明另起一行：.perm-row 是横向 flex，塞进去会挤在单选右侧
+        // 字段级说明另起一行
         if (BOOL_FIELD_HINTS[p.key]) {
-          const hint = el('div', 'form-hint', BOOL_FIELD_HINTS[p.key]);
-          hint.style.marginLeft = '138px';   // 对齐输入列（label 固定 130px + gap 8px）
-          rows.appendChild(hint);
+          rows.appendChild(hintLine(BOOL_FIELD_HINTS[p.key]));
         }
         return;
       }
       const opts = {};
+      let hintBelow = '';        // 该行的补充说明：放到输入框**下方**，框里只放值
       if (p.type === 'int' || p.type === 'float') {
         opts.type = 'number';
         if (p.type === 'float') opts.placeholder = '小数';
       }
-      if (p.secret) opts.type = 'password';
+      if (p.secret) {
+        // 凭据一律不回填真值，后端只给 hasValue（存过没有）与 valueLen（存了多长），
+        // 见 routes._param_row。框里**只允许出现圆点**，不写任何文字：
+        //  - 已保存 → 圆点，个数 = 后端下发的真实位数。圆点也不能当值塞进输入框 ——
+        //    那会作为非空字符串回传，要么写进 YAML，要么被"测试连接"当钥匙发出去
+        //    （TS-023）。占位是纯显示，输入框的值始终是空串，"留空 = 不改动"不破。
+        //  - 没保存 → 框里留白，"未配置"这类提示挪到框下方，免得被当成框里的内容。
+        opts.type = 'password';
+        if (p.hasValue) {
+          opts.placeholder = typeof p.valueLen === 'number' ? '•'.repeat(p.valueLen) : '';
+        } else if (!p.optional && (g.endpoint === undefined
+                                  || String(g.endpoint || '').trim() !== '')) {
+          // 必填却没值才算"未配置"：
+          //  - 模型组还要看 API 地址 —— 地址为空是**本机/Mock 模式**，本来就不需要 key
+          //  - password 这类可选凭据（MySQL 免密、ES 未开认证）留空即为有效配置
+          // 不写这段提示，用户就只能靠后端降级文案反推自己漏了什么
+          hintBelow = '未配置，需填写';
+        }
+        // 其余情况（本机模式、可选凭据）留空即可，不加文案
+      }
       if (p.key === 'model') opts.placeholder = '如 qwen2.5-14b-instruct / bge-m3';
+      if (p.key === 'display_name') opts.placeholder = '如：DeepSeek 线上 / 内网 vLLM';
       const input = textInput(p.value, v => {
         p.value = v; touch();
+        // 标题上的牌子与输入框是同一份值，必须同帧刷新
+        if (p.key === 'display_name') syncNameTag();
       }, opts);
-      rows.appendChild(kvRow(p.label || p.key, input, p.key === 'model', p.optional));
+      rows.appendChild(kvRow(p.label || p.key, input,
+        p.key === 'model' || p.key === 'display_name', p.optional));
+      if (hintBelow) rows.appendChild(hintLine(hintBelow));
       if (p.key === 'model') modelInput = input;
     });
+    injectEndpoint();   // 没有"模型名"的卡片：地址行退回最前
     // paramsJson → JSON 编辑框
     if (g.paramsJson && Object.keys(g.paramsJson).length) {
       const ta = el('textarea', 'form-input');

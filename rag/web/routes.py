@@ -16,7 +16,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                Response)
@@ -26,6 +25,7 @@ from fastapi.templating import Jinja2Templates
 from rag.adapters.registry import AdapterRegistry
 from rag.api.deps import get_current_user, require_admin
 from rag.config.models import LEGACY_SECTION_ALIASES
+from rag.config.secrets import MASK, SENSITIVE_KEYS, is_untouched
 from rag.container import (
     RECOVER_INTERVAL_SEC, RECOVERABLE_SECTIONS, SECTION_DEGRADED_KEYS,
     ServiceContainer,
@@ -122,8 +122,11 @@ def _redact(obj):
         out = {}
         for k, v in obj.items():
             kl = str(k).lower()
-            if any(s in kl for s in ("password", "secret", "api_key")):
-                out[k] = "******" if v not in (None, "", {}) else v
+            # 子串规则兜住各种方言命名；精确命中 SENSITIVE_KEYS 再补一刀，
+            # 否则 token / dsn 这类不含上述子串的凭据会被明文下发（TS-023）
+            if kl in SENSITIVE_KEYS or any(s in kl for s in
+                                           ("password", "secret", "api_key")):
+                out[k] = MASK if v not in (None, "", {}) else v
             else:
                 out[k] = _redact(v)
         return out
@@ -224,16 +227,24 @@ _DEGRADED_KEY = {
 
 # 模型域：UI 分组键（= YAML 键）→ (中文名, 可编辑扁平参数)
 # 仅展示用户需要关心的参数；timeout/并发/批大小等由代码默认值管理
+# 顺序 = 用户填写顺序：模型名 → API 地址 → 模型ID → 其余。
+# display_name 排在最前：它不连任何东西，只是这张卡片的"名字"，
+# 值会同步显示在标题上（前端按 key 认它，见 config-ui.js 的 syncNameTag）。
+# API 地址（base_url）不在这张表里 —— 它是卡片上的独立控件（见 _normalize_config
+# 的 "endpoint"），由前端插到 display_name 与 model 之间。
+# rewrite_model 不下发到界面：它不是"必配项"，留一个空输入框只会让人以为
+# 不填就改写失效（真实行为是缺省跟随主模型）。YAML 键与字段都保留 —— 老配置里
+# 写了照旧生效，且它不在保存载荷里，保存其他项也不会把它抹掉。
 _MODEL_SECTIONS = (
     ("llm", "LLM 大模型",
-     ("model", "rewrite_model", "api_key", "temperature", "max_tokens")),
+     ("display_name", "model", "api_key", "temperature", "max_tokens")),
     ("embedding", "向量模型 (Embedding)",
-     ("model", "api_key", "dim", "query_prefix")),
+     ("display_name", "model", "api_key", "dim", "query_prefix")),
 )
 
 _PARAM_LABELS = {
-    "base_url": "API 地址", "api_key": "API Key", "model": "模型名称",
-    "rewrite_model": "改写模型（留空用主模型）",
+    "base_url": "API 地址", "api_key": "API Key", "model": "模型ID",
+    "display_name": "模型名",
     "temperature": "温度", "max_tokens": "最大 Token",
     "timeout": "超时(秒)", "max_concurrency": "并发数", "dim": "向量维度",
     "batch_size": "批大小", "query_prefix": "查询前缀",
@@ -252,15 +263,16 @@ _PARAM_LABELS = {
     "collection_prefix": "集合前缀（默认）", "sensitive_fields": "敏感字段",
 }
 
-# 精确匹配的敏感字段名（避免 max_tokens 因含 "token" 被误判为密码）
-# 注：access_key **刻意不在列**。它是身份标识而非密文（MinIO/S3 控制台里也是
-# 明文展示），且 _redact 按 "password/secret/api_key" 子串脱敏，本就不遮它；
-# 标成密码框只会让人看不清自己填的是哪个 AK，还会招来浏览器密码管理器。
-# 真正的凭据是 secret_key。
-_SECRET_PARAM_KEYS = frozenset({
-    "password", "api_key", "secret_key", "secret", "token",
-    "dsn", "sensitive_fields",
-})
+# 精确匹配的凭据字段名（避免 max_tokens 因含 "token" 被误判为密码）：
+# 直接复用落盘加密集合 SENSITIVE_KEYS。三者（加密 / 界面打码 / 保存时留空不覆盖）
+# 必须同源，否则会出现"落了盘的字段界面却明文回显"这类漏洞。
+# 刻意不包含：
+#   - access_key：身份标识而非密文（MinIO/S3 控制台里也明文展示），_redact 的
+#     子串规则本就不遮它；标成密码框只会让人看不清自己填的是哪个 AK，
+#     还会招来浏览器密码管理器。真正的凭据是 secret_key。
+#   - sensitive_fields：它是"哪些列要打码"的名字清单（business_data 的配置），
+#     本身不是凭据；当密码框会让它无法编辑，保存时还会被空值抹掉。
+_SECRET_PARAM_KEYS = SENSITIVE_KEYS
 
 # 允许留空的参数：UI 在输入框右侧标注 optional
 # （MySQL 免密账号；ES 未开启安全认证时用户名/密码都不用填）
@@ -410,10 +422,12 @@ def _service_params(sect: dict, group: str) -> list[tuple[str, object]]:
     return sorted(items, key=lambda kv: rank.get(kv[0], len(rank)))
 
 
-def _param_row(k: str, v, group: str | None = None) -> dict:
+def _param_row(k: str, v, group: str | None = None,
+               plain_value: object = None) -> dict:
     """标量配置项 → 前端行描述（带类型，保存时按类型还原 YAML 标量）
 
     group 用于按分组追加「可留空」标记（见 _OPTIONAL_BY_GROUP）。
+    plain_value：该字段**未脱敏**的原值，只有凭据行用得上（见下方 valueLen）。
     """
     if isinstance(v, bool):
         typ = "bool"
@@ -429,36 +443,75 @@ def _param_row(k: str, v, group: str | None = None) -> dict:
         v = "" if v is None else str(v)
     optional = (k in _OPTIONAL_PARAM_KEYS
                 or k in (_OPTIONAL_BY_GROUP.get(group or "") or ()))
-    return {"key": k, "label": _PARAM_LABELS.get(k, k), "value": v,
-            "type": typ, "editable": True,
-            "optional": optional,
-            "secret": k in _SECRET_PARAM_KEYS}
+    secret = k in _SECRET_PARAM_KEYS
+    # 凭据类字段不回传值 —— 连脱敏后的 "******" 也不回传：把掩码当值回填进密码框，
+    # 用户会以为 key 被改短了；更糟的是这个假值会被"测试连接"当真值发给模型服务端，
+    # 换来一个 401，表现为"地址能访问、却没有模型列表"（TS-023）。
+    # 这里只给两个纯标记：hasValue（存过没有）与 valueLen（存了多长），
+    # 前端据此画等量圆点（占位是纯显示，不作为值回传）；
+    # 保存时留空 → 后端保留原值（见 _yaml_update_from_payload / _restore_sensitive）。
+    raw = "" if v is None else str(v)
+    row = {"key": k, "label": _PARAM_LABELS.get(k, k), "value": v,
+           "type": typ, "editable": True,
+           "optional": optional,
+           "secret": secret}
+    if secret:
+        row["value"] = ""
+        # v 来自 _redact：有值时是 "******"，没值时保持空 —— 两种都能判出"是否已配置"
+        row["hasValue"] = bool(raw.strip())
+        # 位数必须取自**脱敏前**的明文：掩码恒为 6 个星号，用它的长度画点会把
+        # 所有 key 都画成一样长，比不画更误导人（"我明明存了 32 位，怎么只剩 6 个点"）。
+        # 下发的只有长度，一个字符都不出网。
+        if row["hasValue"] and plain_value is not None:
+            row["valueLen"] = len(str(plain_value))
+    return row
+
+
+def _blank_secret_masks(obj):
+    """把脱敏产物 "******" 换成空串（只用于下发给前端的可编辑文本）
+
+    _redact 的掩码一旦出现在可编辑文本里，就有"被当成真值保存"的风险；
+    空串则是明确语义：留空 = 不修改，后端保存时保留原值。
+    """
+    if isinstance(obj, dict):
+        return {k: ("" if v == MASK else _blank_secret_masks(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_blank_secret_masks(v) for v in obj]
+    return obj
 
 
 def _normalize_config(c: ServiceContainer) -> dict:
     """AppConfig → 前端配置统一载荷（含降级状态，指导补齐配置）"""
     cfg = c.config
-    dump = _redact(cfg.model_dump(mode="json"))
+    # plain 只在本函数内用于取凭据长度（_param_row 的 plain_value），绝不下发：
+    # 下发的是 _redact 之后的 dump
+    plain = cfg.model_dump(mode="json")
+    dump = _redact(plain)
     weights = cfg.retrieval.default_route_weights or {}
 
     models = []
     for key, label, params in _MODEL_SECTIONS:
         sect = dump.get(key) or {}
+        plain_sect = plain.get(key) or {}
         models.append({
             "key": key, "label": label, "tab": "model", "refresh": None,
             "editable": True, "showTestButton": True,
             "endpoint": sect.get("base_url", ""),
-            "configParams": [_param_row(k, sect.get(k))
+            "configParams": [_param_row(k, sect.get(k),
+                                        plain_value=plain_sect.get(k))
                              for k in params if k in sect],
         })
 
     services = []
     for key, label, test_kind in _SERVICE_SECTIONS:
         sect = dump.get(key) or {}
+        plain_sect = plain.get(key) or {}
         # 标题方言按配置里的 adapter 取：配置页展示的正是"将保存什么"
         label = _section_label(key, label, sect.get("adapter"))
         fixed = _SERVICE_FIXED_PARAMS.get(key) or {}
-        flat = [_param_row(k, v, key) for k, v in _service_params(sect, key)
+        flat = [_param_row(k, v, key, plain_sect.get(k))
+                for k, v in _service_params(sect, key)
                 if k != "adapter" and not isinstance(v, dict) and k not in fixed]
         services.append({"key": key, "label": label, "tab": "service",
                          "refresh": None, "editable": True,
@@ -467,8 +520,10 @@ def _normalize_config(c: ServiceContainer) -> dict:
                          "saveScope": "service", "saveGate": "test",
                          "configParams": flat, "paramsJson": {}})
 
+    # 特殊配置域是整块 JSON 编辑框，dump 里的掩码会原样出现在文本中；换成空串，
+    # 既不让用户看到假值，也避免"带着星号保存"把真凭据覆盖掉（TS-023）
     special = [{"key": k, "label": k, "tab": "special", "refresh": None,
-                "editable": True, "paramsJson": dump.get(k) or {}}
+                "editable": True, "paramsJson": _blank_secret_masks(dump.get(k) or {})}
                for k in _SPECIAL_KEYS if isinstance(dump.get(k), dict)]
 
     perm = [{"role": p.role, "collections": list(p.collections),
@@ -503,7 +558,8 @@ def _normalize_config(c: ServiceContainer) -> dict:
 def _coerce_param(row: dict):
     """前端行值 → YAML 标量（按 type 还原；非法数值返回 None 表示跳过）"""
     v = row.get("value")
-    if v is None or v == "******":
+    # 掩码是"未修改"的显示占位（见 rag/config/secrets.py），绝不能当值写进 YAML
+    if v is None or v == MASK:
         return None
     typ = row.get("type") or "str"
     s = str(v).strip()
@@ -788,6 +844,44 @@ async def config_page(request: Request, user: UserContext = Depends(_page_user))
 
 _MONITOR_PROBE_BUDGET_SEC = 6.0
 
+# 监控轮询的单行预算：只决定「这一行此刻怎么显示」，不改适配器自己的预算
+# ────────────────────────────────────────────────────────────────────────
+# 适配器的 HEALTH_BUDGET_SEC（MySQL 12s / ES 10s / 向量模型 10s / 向量库 8s …）是与
+# **配置页「测试连接」**共用的口径：那里是用户点一次、等一个明确结论，宽一点是对的。
+# 但监控页是"每 10 秒看一次全局"，同一个宽预算在这里意味着——只要有一个依赖挂起，
+# 整轮快照就得等它十几秒，而"监控页恰好在故障时最慢"是本末倒置：用户正是因为
+# 怀疑出事才打开它，却拿不到任何反馈。
+#
+# 所以另给一个只有本页用的**显示预算**：超了就按「未在预算内返回」显示。对监控而言，
+# "4 秒还没回"本身就是有效结论（此刻用户自己的查询也一样会卡住）。
+# 关键的两点都不改：
+#   · 探测任务**不被取消**（asyncio.shield），它在后台按适配器自己的预算跑完，照常
+#     mark_section_down → 后台自愈接手。于是"慢但健康"的服务不会被误登记成掉线
+#     （登记用的仍是适配器自己的判定，与配置页同口径，TS-015），而真正挂死的也
+#     依然留下痕迹、依然有人来救；
+#   · 只影响本页这一行的显示，不影响任何其它链路。
+_MONITOR_ROW_BUDGET_SEC = 4.0
+
+# 快照缓存 TTL：TTL 内的轮询直接复用上一次采样结果
+# 默认轮询 10 秒，故多数轮询仍会重采；它挡掉的是"同一瞬间的重复请求"——
+# 打开页面 + 前端紧接着拉一次、多个标签页、连点刷新。这些请求若各采一遍，
+# 就是对着同一批依赖重复探测，而探测本身就是被监控对象的负载。
+_MONITOR_SNAPSHOT_TTL_SEC = 15.0
+
+# 首屏可以回放的最近采样最大年龄：超过就不下发，让前端显示「采集中」并自己去取。
+# 回放的价值是"刚看过这一页，再进来不该闪一下"；一小时前的快照回放出来，
+# 第一眼就是过期结论，那比空白更糟（页面上的采样时刻要读到第二眼才看得到）。
+_MONITOR_PAGE_REPLAY_MAX_SEC = 60.0
+
+# 被显示预算切断、但仍在后台按完整预算跑完的探测任务：持强引用防 GC
+# （不持引用会被回收，任务半途消失，还会打一串 "Task was destroyed"）
+_MONITOR_PENDING: set = set()
+
+# 单行在飞的探测（key → Task）：一轮快照被预算切断后，那一行的探测还在后台跑，
+# 下一轮轮询不该对同一个依赖再叠一轮 —— 被叠加的往往正是已经卡住的那个，
+# 而"别给坏服务加压"正是这次改造的目的之一。命中就复用同一个任务。
+_MONITOR_INFLIGHT: dict = {}
+
 # 进程启动时刻：本模块随 create_app 一同导入，近似等于服务启动时间
 _MONITOR_STARTED_AT = time.time()
 
@@ -975,10 +1069,14 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
     """一次性采集：支撑服务探测 + 检索路/入库就绪度 + 工作流编排"""
     cfg = c.config
 
-    async def _row(spec: tuple) -> dict:
-        key, label, category, sec, adapter = spec
+    async def _probe_row(spec: tuple) -> dict:
+        """探一次这一行，并把「运行期掉线」写回容器
+
+        与"这一行怎么显示"分开：显示可以被本页的显示预算切断（见
+        _MONITOR_ROW_BUDGET_SEC），而探测结论与它带来的自愈不能。
+        """
+        key, label, _category, sec, adapter = spec
         enabled = bool(getattr(sec, "enabled", True))
-        retry = None
         if adapter is None:
             if not enabled:
                 message = "已禁用（配置未启用）"
@@ -986,9 +1084,9 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
                 message = "演示模式未连接（--noconnection 下不接外部依赖）"
             else:
                 message = "未初始化（启动自检未通过，已自动关闭）"
-            result = {"online": False, "latencyMs": None, "probe": "skipped",
-                      "message": message}
-        elif key == "redis":
+            return {"online": False, "latencyMs": None, "probe": "skipped",
+                    "message": message}
+        if key == "redis":
             result = await _monitor_probe_redis(c)
         else:
             result = await _monitor_probe(adapter)
@@ -1000,6 +1098,51 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
         if (enabled and not cfg.noconnection and result["probe"] == "live"
                 and not result["online"]):
             c.mark_section_down(key, label, str(result["message"] or ""))
+        return result
+
+    def _spawn_probe(spec: tuple):
+        """起一个探测任务并持强引用：被显示预算切断后它仍要在后台跑完"""
+        key = spec[0]
+        task = _MONITOR_INFLIGHT.get(key)
+        if task is not None and not task.done():
+            return task          # 上一轮那次还在跑，结果就是上一轮要的答案
+        task = asyncio.create_task(_probe_row(spec))
+        _MONITOR_INFLIGHT[key] = task
+        _MONITOR_PENDING.add(task)
+
+        def _done(t):
+            _MONITOR_PENDING.discard(t)
+            if _MONITOR_INFLIGHT.get(key) is t:
+                _MONITOR_INFLIGHT.pop(key, None)
+            if not t.cancelled() and t.exception() is not None:
+                # 后台任务没人 await，异常必须在这里取走：否则 GC 时只会打一句
+                # "Task exception was never retrieved"，日志里看不出是哪一行出的
+                log.warning("monitor_probe_background_failed",
+                            error=str(t.exception())[:200])
+
+        task.add_done_callback(_done)
+        return task
+
+    async def _row(spec: tuple) -> dict:
+        key, label, category, sec, adapter = spec
+        enabled = bool(getattr(sec, "enabled", True))
+        retry = None
+        try:
+            # shield：超预算时放弃的是"等"，不是探测本身（见 _MONITOR_ROW_BUDGET_SEC）
+            result = await asyncio.wait_for(
+                asyncio.shield(_spawn_probe(spec)),
+                timeout=_MONITOR_ROW_BUDGET_SEC)
+        except asyncio.TimeoutError:
+            result = {
+                "online": False, "latencyMs": None, "probe": "live",
+                "timedOut": True,
+                "message": (f"未在 {_MONITOR_ROW_BUDGET_SEC:g}s 内返回，本次按超时计"
+                            "（探测仍在后台按该服务的完整预算继续，结论落地后会自动"
+                            "登记，无需手工重试）"),
+            }
+        except Exception as e:                 # 探测自身异常，不牵连同轮其它行
+            result = {"online": False, "latencyMs": None, "probe": "live",
+                      "message": f"探测异常：{str(e)[:180]}"}
         # 后台自愈的重试进度：失联的段由它接手，把「试了几次、最近一次什么时候」
         # 报出来。否则用户看到状态长时间不变，只会以为程序根本没在管，
         # 又得靠重启/重存配置去猜。
@@ -1058,6 +1201,9 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
             "online": result["online"],
             "latencyMs": result["latencyMs"],
             "message": result["message"],
+            # 本页显示预算切断（≠ 对端失联）：前端要把它与"连不上"分开说，
+            # 否则用户会去重试/重启一个其实只是慢的依赖
+            "timedOut": bool(result.get("timedOut")),
             "localImpl": runtime in _MONITOR_LOCAL_IMPLS,
             "degraded": bool(reason),
             "degradedReason": reason,
@@ -1159,9 +1305,60 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
     }
 
 
+def _monitor_replay(c: ServiceContainer):
+    """最近一次采样：够新就随首屏下发，否则 None（页面不等它）"""
+    snap = c.monitor_snapshot
+    if snap is None:
+        return None
+    age = time.time() - c.monitor_snapshot_at
+    if age > _MONITOR_PAGE_REPLAY_MAX_SEC:
+        return None
+    # 与 /overview 同口径带上"离现在多久"：回放的有可能是几十秒前的采样，
+    # 不标出来的话，首屏那句"最后更新 HH:MM:SS"会被读成此刻的状态。
+    return dict(snap, sampledAgoSec=round(age, 1))
+
+
+async def _monitor_snapshot_cached(c: ServiceContainer, *,
+                                   force: bool = False) -> tuple:
+    """取快照：TTL 内复用最近一次采样，过期则单飞重采一次
+
+    返回 (快照, 该快照的年龄秒数)。年龄由服务端算——快照自带的 checkedAt 说
+    "什么时候采的"，年龄说"离现在多久"，后者不该由浏览器拿本地时钟去减
+    （两端时钟差多少，显示的"多久以前"就错多少）。
+
+    force=True（用户点了「立即刷新」/ 改了刷新间隔）：跳过 TTL 现采一次，但**仍然
+    单飞**——与正在跑的那一轮合并。否则连点几次就是几轮全量探测打在同一批依赖上。
+    """
+    if c.monitor_snapshot is not None and not force:
+        age = time.time() - c.monitor_snapshot_at
+        if age < _MONITOR_SNAPSHOT_TTL_SEC:
+            return c.monitor_snapshot, age
+    async with c.monitor_lock():
+        # 等锁期间别人可能已经采完（"打开页面 + 前端紧接着取一次"正是这个形状），
+        # 二次判 TTL：否则排完队又白采一轮
+        if c.monitor_snapshot is not None and not force:
+            age = time.time() - c.monitor_snapshot_at
+            if age < _MONITOR_SNAPSHOT_TTL_SEC:
+                return c.monitor_snapshot, age
+        snap = await _monitor_snapshot(c)
+        c.monitor_snapshot = snap
+        c.monitor_snapshot_at = time.time()
+        return snap, 0.0
+
+
 @pages_router.get("/monitor", response_class=HTMLResponse)
 async def monitor_page(request: Request, user: UserContext = Depends(_page_user)):
-    """运行监控页（仅管理员）：支撑服务健康与业务就绪度，前端定时刷新"""
+    """运行监控页（仅管理员）：支撑服务健康与业务就绪度，前端定时刷新
+
+    **本路由不采样**：采样里最慢的那一项按它自己的预算走（可能十几秒），放在渲染
+    之前等于"打开页面耗时 = 最慢依赖的探测预算"——而这个页面恰恰是在依赖出问题时
+    才被打开的，把等待堆在最需要它快的时刻是本末倒置。
+
+    页面因此立即返回，数据由前端 /overview 拉（首次请求会命中同一份采样，见
+    _monitor_snapshot_cached 的单飞）；只有最近刚采过（_MONITOR_PAGE_REPLAY_MAX_SEC
+    内）才把结果嵌进 HTML，顺带省掉首屏那一次闪烁，否则下发空值，前端先显示
+    「采集中」——占位态不带任何结论，不会把"数据未到"渲染成"服务不可用"。
+    """
     if not user.is_admin:
         return RedirectResponse("/chat", status_code=302)
     c = _container(request)
@@ -1169,17 +1366,24 @@ async def monitor_page(request: Request, user: UserContext = Depends(_page_user)
     ctx.update({
         "runtime_meta": {"version": c.config.version,
                          "appName": c.config.app_name},
-        # 首次快照走服务端渲染（免一次往返闪烁）；后续轮询走 /api/admin/monitor/overview
-        "initial_snapshot": await _monitor_snapshot(c),
+        # 回放最近一次采样（可能为空）；为空时前端自己去取，TTL 内仍会命中同一份
+        "initial_snapshot": _monitor_replay(c),
     })
     return templates.TemplateResponse("monitor.jinja2", ctx)
 
 
 @admin_ui_router.get("/monitor/overview")
-async def monitor_overview(request: Request,
+async def monitor_overview(request: Request, live: int = 0,
                            user: UserContext = Depends(require_admin)):
-    """运行监控快照（管理员）：供监控页定时轮询，口径同配置页测试连接"""
-    return JSONResponse(await _monitor_snapshot(_container(request)))
+    """运行监控快照（管理员）：供监控页轮询，口径同配置页测试连接
+
+    live=1 强制现采（用户主动刷新时用）；默认 TTL 内复用上一次采样结果。
+    """
+    snap, age = await _monitor_snapshot_cached(_container(request),
+                                              force=bool(live))
+    # 浅拷贝：sampledAgoSec 属于这一次响应，不能写进被缓存的那份快照里
+    payload = dict(snap, sampledAgoSec=round(age, 1))
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 # ───────────────────── UI 补充 API ─────────────────────
@@ -1379,14 +1583,12 @@ async def save_config(request: Request,
             cfg_path = alt
         else:
             raise HTTPException(500, "配置文件不存在")
+    # 读盘 → 解密 → 合并 → 加密写盘，统一走 loader.merge_config_file（TS-023）。
+    # 曾经在这里直接 yaml.safe_dump，既会把凭据明文写回，又会用界面回传的空值
+    # 覆盖掉未修改的真凭据（不可逆），所以这段逻辑只允许有一个实现。
     try:
-        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    except Exception as e:
-        raise HTTPException(500, f"读取配置文件失败: {e}")
-    merged = _deep_merge(raw, update)
-    try:
-        cfg_path.write_text(yaml.safe_dump(merged, allow_unicode=True,
-                                           sort_keys=False), encoding="utf-8")
+        from rag.config.loader import merge_config_file
+        merge_config_file(cfg_path, update)
     except Exception as e:
         raise HTTPException(500, f"写入配置文件失败: {e}")
 
@@ -1420,6 +1622,40 @@ def _local_models_root(request: Request) -> Path:
     return root
 
 
+def _form_scalar_overrides(rows: list, fields) -> tuple[dict, str | None]:
+    """配置页表单行 → 适配器字段覆盖值（不写 YAML、不动运行中容器）
+
+    返回 (overrides, 错误原因)；出错时 overrides 为空。
+
+    两类"看起来有值"的输入必须跳过，否则探测会拿假值去建连：
+    - 掩码 "******"：页面上的显示占位，不是用户填的值（TS-023）；
+    - 凭据字段的空串：页面本就**不回传**已保存的凭据（见 _param_row），留空表示
+      "不修改"而非"清空成空口令"。若当新值用，探测会拿空口令去连，报出来的
+      是一次假的"认证失败/401"，比"根本没测"更容易把人带偏。
+    非凭据字段的空串仍是有效值（例如清空 MySQL 密码 = 改成匿名连接），照常下发。
+    """
+    overrides: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        k = str(row.get("key") or "")
+        if k not in fields:
+            continue
+        raw = row.get("value")
+        if row.get("secret") and is_untouched(raw):
+            continue          # 凭据留空/掩码 → 沿用已保存值
+        v = _coerce_param(row)
+        if v is None:
+            txt = "" if raw is None else str(raw).strip()
+            if txt and txt != MASK:
+                return {}, f"参数 {k} 取值非法：{txt}"
+            continue          # 空值/掩码 → 沿用已保存值
+        overrides[k] = v
+    if not overrides:
+        return {}, "表单未提供可用的连接参数"
+    return overrides, None
+
+
 # 背景（TS-014）：历史上"测试连接"通过而保存后自检报不可达，根因是两条链路的
 # 超时预算不一致（探测无预算、自检 6s），叠加服务端 skip_name_resolve=OFF 导致
 # 每个新连接要等满一次反向 DNS（实测 10s）。现在：
@@ -1446,23 +1682,9 @@ async def _probe_mysql_with_form(c: ServiceContainer,
     base = getattr(c.config, "meta", None)
     if base is None:
         return False, "当前配置缺少 meta 段，无法测试"
-    overrides: dict = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        k = str(row.get("key") or "")
-        if k not in base.model_fields:
-            continue
-        raw = row.get("value")
-        v = _coerce_param(row)
-        if v is None:
-            txt = "" if raw is None else str(raw).strip()
-            if txt and txt != "******":
-                return False, f"参数 {k} 取值非法：{txt}", False
-            continue          # 空值/掩码 → 沿用已保存值
-        overrides[k] = v
-    if not overrides:
-        return False, "表单未提供可用的连接参数", False
+    overrides, err = _form_scalar_overrides(rows, base.model_fields)
+    if err:
+        return False, err
     probe_cfg = base.model_copy(update=overrides)
     store = MySQLMetaStore(probe_cfg)
     # 必须用带预算的 health_probe（而非裸 health_detail）：探测与容器自检
@@ -1499,32 +1721,20 @@ async def _probe_fulltext_with_form(c: ServiceContainer,
     base = getattr(c.config, "fulltext", None)
     if base is None:
         return False, "当前配置缺少 fulltext 段，无法测试"
-    overrides: dict = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        k = str(row.get("key") or "")
-        if k not in base.model_fields:
-            continue
-        raw = row.get("value")
-        v = _coerce_param(row)
-        if v is None:
-            txt = "" if raw is None else str(raw).strip()
-            if txt and txt != "******":
-                return False, f"参数 {k} 取值非法：{txt}"
-            continue          # 空值/掩码 → 沿用已保存值
-        if k == "hosts":
-            if not v:
-                continue
-            bad = [h for h in v if not h.startswith(("http://", "https://"))]
+    overrides, err = _form_scalar_overrides(rows, base.model_fields)
+    if err:
+        return False, err
+    if "hosts" in overrides:
+        hosts = overrides["hosts"]
+        if not hosts:
+            overrides.pop("hosts")      # 留空 = 沿用已保存的地址列表
+        else:
+            bad = [h for h in hosts if not h.startswith(("http://", "https://"))]
             if bad:
                 # 缺协议时客户端会把它当主机名去解析，报出来的是"名称解析失败"，
                 # 与"地址填错"看起来像两码事 —— 在入口直接点明该补什么
                 return False, (f"地址列表每项都要带协议，{'、'.join(bad)} 应为 "
                                f"http://{bad[0]}")
-        overrides[k] = v
-    if not overrides:
-        return False, "表单未提供可用的连接参数"
     adapter = ElasticsearchFTS(base.model_copy(update=overrides))
     # 与容器自检共用同一份预算与口径；原因经 es_failure_reason 语义化
     # （含"客户端/服务端大版本不一致"这类专门分支，TS-015 / TS-016）
@@ -1560,23 +1770,9 @@ async def _probe_vector_with_form(c: ServiceContainer,
     base = getattr(c.config, "vector_store", None)
     if base is None:
         return False, "当前配置缺少 vector_store 段，无法测试"
-    overrides: dict = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        k = str(row.get("key") or "")
-        if k not in base.model_fields:
-            continue
-        raw = row.get("value")
-        v = _coerce_param(row)
-        if v is None:
-            txt = "" if raw is None else str(raw).strip()
-            if txt and txt != "******":
-                return False, f"参数 {k} 取值非法：{txt}"
-            continue          # 空值/掩码 → 沿用已保存值
-        overrides[k] = v
-    if not overrides:
-        return False, "表单未提供可用的连接参数"
+    overrides, err = _form_scalar_overrides(rows, base.model_fields)
+    if err:
+        return False, err
     cfg = base.model_copy(update=overrides)
     name = str(cfg.adapter or "milvus")
     klass = AdapterRegistry.get_class("vector_store", name)
@@ -1648,23 +1844,9 @@ async def _probe_storage_with_form(c: ServiceContainer,
     base = getattr(c.config, "storage", None)
     if base is None:
         return False, "当前配置缺少 storage 段，无法测试"
-    overrides: dict = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        k = str(row.get("key") or "")
-        if k not in base.model_fields:
-            continue
-        raw = row.get("value")
-        v = _coerce_param(row)
-        if v is None:
-            txt = "" if raw is None else str(raw).strip()
-            if txt and txt != "******":
-                return False, f"参数 {k} 取值非法：{txt}"
-            continue          # 空值/掩码 → 沿用已保存值
-        overrides[k] = v
-    if not overrides:
-        return False, "表单未提供可用的连接参数"
+    overrides, err = _form_scalar_overrides(rows, base.model_fields)
+    if err:
+        return False, err
     cfg = base.model_copy(update=overrides)
     endpoint = str(cfg.endpoint or "").strip()
     if not endpoint:
@@ -1734,25 +1916,11 @@ async def _probe_redis_with_form(c: ServiceContainer,
     base = getattr(c.config, "redis", None)
     if base is None:
         return False, "当前配置缺少 redis 段，无法测试"
-    overrides: dict = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        k = str(row.get("key") or "")
-        if k not in base.model_fields:
-            continue
-        raw = row.get("value")
-        v = _coerce_param(row)
-        if v is None:
-            txt = "" if raw is None else str(raw).strip()
-            if txt and txt != "******":
-                return False, f"参数 {k} 取值非法：{txt}"
-            continue          # 掩码 → 沿用已保存值
-        overrides[k] = v
-    if not overrides:
-        return False, "表单未提供可用的连接参数"
-    # 空字符串是**有意填的值**（清空密码 = 改成匿名连接），_coerce_param 会原样返回，
-    # 因此这里不必再区分"留空"与"掩码未改"：只剩掩码一种情况会被跳过。
+    overrides, err = _form_scalar_overrides(rows, base.model_fields)
+    if err:
+        return False, err
+    # 非凭据字段的空字符串是**有意填的值**（清空 = 改成匿名连接），helper 会原样下发；
+    # 只有凭据字段的留空/掩码会被跳过（页面不回传真凭据，见 _form_scalar_overrides）。
     # 这里走一次真正校验（不是 model_copy：它不做类型校验，会把 "abc" 直接塞给
     # 客户端，最后表现成一次莫名其妙的连接超时）
     try:
@@ -1807,9 +1975,15 @@ async def health_test(request: Request,
         try:
             import httpx
             headers = {}
-            api_key = str(body.get("apiKey") or "").strip()
-            if api_key and api_key != "******":
-                headers["Authorization"] = f"Bearer {api_key}"
+            api_key = str(body.get("apiKey") or "")
+            # 页面不会回传已保存的 key（见 _param_row）：留空/掩码时回落到当前配置里
+            # 的凭据，探测才带得上认证。若不回落，探测会拿不到认证 → 401，既把
+            # "端点可达"当成成功，又让模型列表空掉（TS-023）
+            if is_untouched(api_key):
+                sect = getattr(c.config, kind, None)
+                api_key = str(getattr(sect, "api_key", "") or "")
+            if not is_untouched(api_key):
+                headers["Authorization"] = f"Bearer {api_key.strip()}"
             async with httpx.AsyncClient(timeout=6) as hc:
                 r = await hc.get(endpoint.rstrip("/") + "/models",
                                  headers=headers)
