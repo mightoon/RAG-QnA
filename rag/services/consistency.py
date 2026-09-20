@@ -137,8 +137,17 @@ class ConsistencyChecker:
                     doc.collection, chunks, texts, summaries, keywords)
                 repaired = True
             if self.s.vector is not None:
-                child = [(c, t) for c, t in zip(chunks, texts)
-                         if not c.is_parent]
+                # 向量空间门禁：与入库同一个判据。这里若不拦，巡检修复会把伪向量
+                # （或另一套模型的向量）重新灌进一个已经有真向量的集合 —— 危害比
+                # "缺几条片段"大得多，而且它由后台定时任务发起，没人盯着
+                blocked = await self.s.vector_write_blocked(doc.collection)
+                if blocked:
+                    log.warning("repair_vector_skipped_space",
+                                doc_id=doc.doc_id, collection=doc.collection,
+                                reason=blocked[:200])
+                child = [] if blocked else [
+                    (c, t) for c, t in zip(chunks, texts)
+                    if not c.is_parent]
                 if child:
                     vectors = await self.s.embedding.embed(
                         [t for _, t in child])

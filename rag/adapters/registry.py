@@ -11,7 +11,7 @@ from typing import Any, Type
 from .base import (
     AuthAdapter, BusinessDataAdapter, DocParserAdapter, EmbeddingAdapter,
     FullTextSearchAdapter, KnowledgeGraphAdapter, LLMAdapter,
-    MySQLMetaAdapter, StorageAdapter, SynonymAdapter, VectorStoreAdapter,
+    MetaStoreAdapter, StorageAdapter, SynonymAdapter, VectorStoreAdapter,
 )
 
 _ADAPTER_TYPES = {
@@ -19,7 +19,10 @@ _ADAPTER_TYPES = {
     "embedding": EmbeddingAdapter,
     "vector_store": VectorStoreAdapter,
     "fulltext": FullTextSearchAdapter,
-    "mysql_meta": MySQLMetaAdapter,
+    # 元数据库：槽位名 meta（与配置段同名），具体实现由注册名区分
+    # （mysql / memory）；历史上槽位与实现都叫 mysql_meta，监控页因此
+    # 只能显示成 mysql_meta —— 实现名不该复述槽位名。
+    "meta": MetaStoreAdapter,
     "doc_parser": DocParserAdapter,
     "business_data": BusinessDataAdapter,
     "knowledge_graph": KnowledgeGraphAdapter,
@@ -127,7 +130,7 @@ class AdapterRegistry:
 # 触发内置实现注册（import 副作用）
 def _load_builtin_implementations() -> None:
     from . import llm, embedding, auth, storage, synonym  # noqa: F401
-    from . import vector_store, fulltext, mysql_meta       # noqa: F401
+    from . import vector_store, fulltext, meta_mysql       # noqa: F401
     from . import doc_parser, business_data, knowledge_graph  # noqa: F401
 
 

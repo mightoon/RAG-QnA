@@ -16,7 +16,8 @@ from pathlib import Path
 from rag.adapters.registry import AdapterRegistry
 from rag.config.loader import load_config
 from rag.container import (
-    SECTION_ADAPTERS, SECTION_DEGRADED_KEYS, ServiceContainer,
+    RECOVER_INTERVAL_SEC, SECTION_ADAPTERS, SECTION_DEGRADED_KEYS,
+    ServiceContainer,
 )
 from rag.observability.logging import get_logger
 
@@ -25,6 +26,25 @@ log = get_logger("rag.runtime")
 # 可单段热应用的配置段：每个都独占一个适配器（或 Redis 客户端），
 # 保存其中之一不必牵动别的服务
 _SCOPED_SECTIONS = frozenset(SECTION_ADAPTERS) | {"redis"}
+
+
+async def _recovery_loop(container: ServiceContainer) -> None:
+    """后台自愈：周期性重连「配置启用但此刻失联」的段
+
+    没有它，启动自检失败的依赖（Milvus/ES/MySQL/Redis…）会被永久置空，用户把
+    服务修好之后监控页也永远停在「不可用 + 降级」，只能靠重启进程或去配置页
+    再保存一次来解开 —— 而这两招都不是出故障时的第一反应。
+    """
+    while True:
+        await asyncio.sleep(RECOVER_INTERVAL_SEC)
+        try:
+            recovered = await container.recover_lost_sections()
+            if recovered:
+                log.info("sections_recovered", sections=dict(recovered))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:          # 自愈失败绝不能带走后台循环
+            log.warning("recovery_loop_failed", error=str(e))
 
 
 async def _periodic_scheduler(container: ServiceContainer) -> None:
@@ -54,14 +74,19 @@ async def start_background(app, container: ServiceContainer) -> None:
     await container.consistency_checker.start()
     app.state.scheduler_task = asyncio.create_task(
         _periodic_scheduler(container))
+    app.state.recovery_task = asyncio.create_task(
+        _recovery_loop(container))
 
 
 async def stop_background(app, container: ServiceContainer) -> None:
     """停止后台任务并释放容器连接（各步尽力而为，不互相阻断）"""
-    task = getattr(app.state, "scheduler_task", None)
-    if task is not None:
-        task.cancel()
-        app.state.scheduler_task = None
+    # 先取消自愈循环：它在跑的时候会往容器里装适配器，必须早于 shutdown 停下，
+    # 否则会出现「刚 close 的连接又被装回去」
+    for name in ("scheduler_task", "recovery_task"):
+        task = getattr(app.state, name, None)
+        if task is not None:
+            task.cancel()
+            setattr(app.state, name, None)
     for stopper in (getattr(container, "consistency_checker", None),
                     getattr(container, "ingest_coordinator", None)):
         if stopper is None:
@@ -106,7 +131,9 @@ async def apply_config_update(app, update: dict,
     new_config = load_config(path)
     # 只把刚保存的这一段搬到运行中的配置上：其它段保持内存里的现值不动
     setattr(old.config, single, getattr(new_config, single))
-    await old.apply_section(single)
+    # reconfigured=True：这一段是用户刚存进来的新配置，旧降级原因里描述的
+    # 是上一个地址/参数，重建失败时必须重写（不能沿用）
+    await old.apply_section(single, reconfigured=True)
     affected = SECTION_DEGRADED_KEYS.get(single, (single,))
     degraded = {k: v for k, v in old.degraded.items() if k in affected}
     log.info("config_applied", scope=single, degraded=degraded)

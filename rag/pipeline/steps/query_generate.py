@@ -195,6 +195,12 @@ class FaithfulnessStep(PipelineStep):
         s = ctx.services
         plan = ctx.plan
         query = plan.semantic_query or plan.standalone_query
+        # 向量空间不一致时这一路直接不查（连向量都不必算）：多召回一批噪声
+        # 只会让"放宽检索"这一步把答案带偏，而这正是二轮检索的目的
+        if not await s.vector_read_ok("default"):
+            log.warning("second_round_vector_skipped_space",
+                        reason=s.vector_space_reason()[:200])
+            return
         query_vec = await s.embedding.embed_query(query)
         hits = await s.vector.search("default", query_vec,
                                      top_k=s.config.retrieval.vector_top_k * 2,

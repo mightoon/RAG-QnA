@@ -106,6 +106,11 @@ class SelfEvalStep(PipelineStep):
             try:
                 vec = await s.embedding.embed_query(hyde)
                 for col in target_cols:
+                    # 同 RetrieveStep._vector：向量空间不一致的集合不查
+                    if not await s.vector_read_ok(col):
+                        log.warning("hyde_vector_skipped_space", collection=col,
+                                    reason=s.vector_space_reason(col)[:200])
+                        continue
                     top_k = (s.config.retrieval.vector_top_k
                              or s.config.retrieval.top_k_per_path) * 2
                     rs = await s.vector.search(

@@ -1,8 +1,8 @@
 """
-内存元数据适配器（rag/adapters/memory_meta.py）
+内存元数据适配器（rag/adapters/meta_memory.py）
 
---noconnection 演示模式使用：MySQLMetaAdapter 的全内存实现，
-数据存进程字典，重启即失。也可在配置中指定 adapter: memory 使用
+槽位 meta / 注册名 memory：--noconnection 演示模式与 MySQL 降级时使用，
+数据存进程字典，重启即失。也可在配置中显式指定 `meta.adapter: memory`
 （如单元测试、轻量演示）。
 """
 from __future__ import annotations
@@ -14,14 +14,14 @@ from rag.models import (ChunkMeta, DocumentMeta, IngestBatch, IngestStatus,
                         IngestTask, MessageFeedback, TableData, UserProfile)
 from rag.observability.logging import get_logger
 
-from .base import MySQLMetaAdapter
+from .base import MetaStoreAdapter
 from .registry import AdapterRegistry
 
-log = get_logger("rag.adapters.memory_meta")
+log = get_logger("rag.adapters.meta_memory")
 
 
-@AdapterRegistry.register("mysql_meta", "memory")
-class InMemoryMetaAdapter(MySQLMetaAdapter):
+@AdapterRegistry.register("meta", "memory")
+class InMemoryMetaAdapter(MetaStoreAdapter):
     """进程内存版元数据库（演示/测试）"""
 
     def __init__(self, config=None):

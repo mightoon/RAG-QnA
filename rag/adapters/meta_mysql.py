@@ -1,6 +1,7 @@
 """
-MySQL 元数据适配器（rag/adapters/mysql_meta.py）
+MySQL 元数据适配器（rag/adapters/meta_mysql.py）
 
+槽位 meta / 注册名 mysql：元数据库槽位下"真连 MySQL"的实现。
 按规格附录 C 实现：documents / chunks_meta / table_data / ingest_tasks /
 ingest_batches / feedback / user_profiles / entities 八张表，
 首次启动自动建表（DDL 幂等）。SQLAlchemy async + aiomysql。
@@ -18,15 +19,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
                                     create_async_engine)
 
-from rag.config.models import MySQLConfig
+from rag.config.models import MetaStoreConfig
 from rag.models import (ChunkMeta, DocumentMeta, IngestBatch, IngestStatus,
                         IngestTask, MessageFeedback, TableData, UserProfile)
 from rag.observability.logging import get_logger
 
-from .base import MySQLMetaAdapter
+from .base import MetaStoreAdapter
 from .registry import AdapterRegistry
 
-log = get_logger("rag.adapters.mysql_meta")
+log = get_logger("rag.adapters.meta_mysql")
 
 # ── 连接参数（由代码管理，**不作为用户配置项**）─────────────────
 # 这三项只决定"怎么连"，不是需要用户做业务选择的参数；暴露在配置页只会让
@@ -44,7 +45,7 @@ HEALTH_BUDGET_SEC = 12.0
 SLOW_CONNECT_SEC = 3.0
 
 
-def _build_engine(config: MySQLConfig):
+def _build_engine(config: MetaStoreConfig):
     """按配置造引擎（惰性建连：此处不产生任何 TCP 连接）
 
     每次调用都返回**全新引擎**：探测一律真实建连，不复用任何缓存连接，
@@ -103,7 +104,7 @@ def _mysql_failure_reason(exc: Exception) -> str:
     return f"MySQL 连接失败（{prefix}）：{msg}"
 
 
-def mysql_timeout_reason(cfg: MySQLConfig, budget: float, elapsed: float) -> str:
+def mysql_timeout_reason(cfg: MetaStoreConfig, budget: float, elapsed: float) -> str:
     """建连超时的可读原因 —— 与"不可达"区分开
 
     TCP 已通、SQL 也没报错时，耗时几乎全在**服务端的问候包**上：
@@ -270,10 +271,11 @@ DDL_STATEMENTS = [
 ]
 
 
-@AdapterRegistry.register("mysql_meta", "mysql_meta")
-class MySQLMetaStore(MySQLMetaAdapter):
+@AdapterRegistry.register("meta", "mysql")
+class MySQLMetaStore(MetaStoreAdapter):
+    """元数据库槽位的 MySQL 实现（注册名 mysql = 监控页 badge 显示名）"""
 
-    def __init__(self, config: MySQLConfig):
+    def __init__(self, config: MetaStoreConfig):
         self._config = config
         self._initialized = False
         # 每个实例持有自己的引擎：不做跨实例的引擎/连接缓存 ——

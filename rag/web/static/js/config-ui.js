@@ -15,6 +15,15 @@
     return e;
   }
 
+  // 容器 degraded 的键 → 页面显示名（同时用于保存后的 toast 与「降级组件」卡片）。
+  // 未映射的键原样显示：后端新加的记录也会漏出来，不会被前端悄悄吃掉。
+  // 「向量空间」不是某一段依赖，而是一条前提条件，单独给名字免得被读成
+  // "向量库又挂了"（处置方式也完全不同：换库重连没用，要么重跑入库、要么换集合前缀）
+  const DEGRADED_LABELS = {
+    vector_space: '向量空间（库内向量与当前向量模型）',
+  };
+  const degradedName = k => DEGRADED_LABELS[k] || k;
+
   function kvRow(labelText, input, required, optional) {
     const row = el('div', 'perm-row');
     const lab = el('label', 'form-label');
@@ -128,7 +137,8 @@
           showToast(res.message || (who + ' 已保存，但热应用失败（重启后生效）'),
                     'warning');
         } else if (names.length) {
-          showToast(who + ' 已保存；仍处降级：' + names.join('、'), 'warning');
+          showToast(who + ' 已保存；仍处降级：'
+            + names.map(degradedName).join('、'), 'warning');
         } else {
           showToast(scoped ? who + ' 已保存并重连，未影响其它服务'
                            : who + ' 已保存并热应用', 'success');
@@ -622,13 +632,19 @@
       const dbox = el('div', 'card');
       const dbody = el('div', 'card-body');
       dbody.appendChild(el('div', 'doc-title-main', '降级组件（' + degraded.length + '）'));
+      // 两类记录共用这张卡片：构造期的"未配置 → 本地替身"与运行期的"连不上了"。
+      // 旧文案把两者都说成"已降级为本地实现"，对后者是错的：运行期掉线的段
+      // 只是能力暂时关闭，并没有换成替身在跑。
       dbody.appendChild(el('p', 'page-subtitle',
-        '以下组件未配置或连接失败，已自动降级为本地实现，服务仍可运行。' +
-        '在「模型」「服务」页补齐参数并保存后自动重连。'));
+        '以下组件未配置或连接失败：未配置的已自动降级为本地实现，' +
+        '此刻连不上的对应能力暂时关闭（服务本身仍可运行）。' +
+        '在「模型」「服务」页补齐参数并保存后立即重连；运行期掉线的段由后台自动重试，' +
+        '对端恢复即自动恢复，无需重启。' +
+        '与连接无关的记录（如「向量空间」）不会随重连消失，需按其说明处置。'));
       const dul = el('ul', 'doc-attrs');
       degraded.forEach(d => {
         const li = el('li');
-        li.appendChild(el('span', 'attr-key', d.component));
+        li.appendChild(el('span', 'attr-key', degradedName(d.component)));
         li.appendChild(el('span', 'attr-val plain', d.reason || ''));
         dul.appendChild(li);
       });

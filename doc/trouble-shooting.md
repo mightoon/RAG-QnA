@@ -68,7 +68,8 @@
 | TS-019 | 缓存 (Redis) 四处隐蔽缺陷：探测测的是已保存的旧连接 / 降级后保存死锁 / 失败原因被吞成"连接失败" / 会话 TTL 冒充连接参数 | redis_cache（新建） / container / 配置页探测 / 界面口径 |
 | TS-020 | 启动日志里的 RequestsDependencyWarning：requests 自带的依赖版本闸门被"只写下界"的 chardet 撞破 | requirements / pymilvus / tiktoken（间接引入 requests） |
 | TS-021 | 关机时 Milvus / Qdrant / ES 被静默跳过：`shutdown()` 与 `_close_quietly()` 用了两套关闭入口查找规则 | container / 各适配器生命周期 |
-| 附录 | 优化前后指标对比 / 验证脚本 / 经验总结 | — |
+| TS-022 | 换过向量模型后检索静默失准：同维不同源的向量住进同一个集合（服务全绿、不报错、RRF 也淘汰不掉） | vector_store 适配器 / 向量空间指纹（新增） / container / 入库与检索链路 / 监控页 |
+| 附录 | 优化前后指标对比 / 验证脚本 / 经验总结 / 适配器命名体系（组件名 ↔ 槽位 ↔ 注册名） | — |
 
 ---
 
@@ -2267,6 +2268,48 @@ health_test 分支顺序 -> form(4295) < degraded(4541)                       # 
 > - Redis 卡片 ⓘ：前提条件加第 5 项（监听地址要放开给应用所在网段），notes 增加
 >   "已放开 0.0.0.0 仍被拒"时的后续排查顺序（防火墙 → protected-mode）。
 
+> **实测续记（2026-09-20）：监控页「降级」二字时有时无 —— `_apply_redis` 先清记录后探连通留下的空窗**
+>
+> 现象（用户报告）：缓存不可达时，运行监控页那一行"一会儿挂组件名、一会儿挂降级
+> 徽章"，**「降级」二字有时整个消失**；除本条目已修的配置页三处外，这是第五处。
+>
+> 定位：`_apply_redis()` 开头是 `self._clear_degraded("redis")`，此后才 `make_client` +
+> `ping`（预算 `REDIS_HEALTH_BUDGET_SEC`）—— 即"记录已经没了、旧实例还挂在容器上、
+> 探测尚未出结论"的三不像中间态。这段窗口里监控页若刷新，快照里的 `c.degraded` 为空
+> ⇒ 降级徽章与它的原因一起消失，只剩"该启用却没连上"的探测结论挂在**组件名**上；
+> 下一轮 30s 后探测结束、记录重新登记 ⇒ 说明又跳回**徽章**上。事实自始至终没变过，
+> 变的只是状态机的中间态。实测（`10.255.255.1` 触发连接超时）：探测窗口 **3.03~3.05s**，
+> 期间 20ms 采样 95 次，记录缺失 95 次；而监控页默认 10s 刷新一次 ⇒ **约每三次刷新
+> 就撞上一次**，与用户"时有时无"的观测频率一致。
+>
+> 修复（`rag/container.py`）：① 降级记录**探完才动**，成功才 `_clear_degraded`；
+> ② 失败时不再每次重试都改写文案 —— 改为 `setdefault`，保留启动自检/运行期探测
+> 写下的那句（它更早也更具体，如"…重启即失，请在配置页补齐连接信息"）；
+> ③ 但"用户刚保存新配置"必须重写（旧文案里写着旧地址，照着它去查会查到不存在的
+> 配置）⇒ `apply_section(section, reconfigured=False)` 显式传递这一位，配置保存路径
+> （`api/runtime.py`）传 `True`，后台自愈传默认值。**同一段重建，两种来源对"旧原因
+> 还算不算数"的判断不同，应由调用方交代，不该让下层去猜** —— 猜，正是中间态的产地。
+>
+> 验证（离线，走公开入口 `apply_section`）：后台重试 2 次各耗时 3.03s / 3.05s、采样
+> 95 次，降级记录**缺失 0 次**、文案逐字不变；改成新地址后热应用 ⇒ 文案里的地址随之
+> 变成新地址（旧地址不残留）；换回旧地址再热应用 ⇒ 再次跟随。界面侧（真实服务 +
+> 浏览器）复测：15 个 ⓘ 无裁剪祖先、注册名列悬停即展开、移除焦点即收起。
+>
+> ⇒ 判据：**凡是"先清状态、再重建"的代码，都要问一句"清掉之后、重建出结论之前，
+> 这个状态被谁读到了？"** 读它的人（这里是监控页/配置页）只会把中间态如实播出去；
+> 界面出现自相矛盾时，先修状态机的中间态，而不是让界面去容忍它（同 TS-013 的假在线、
+> TS-011 的分支优先级）。
+>
+> 同轮附带一处：**缓存行第二列是全表唯一一格 '—'**。根因不在渲染，在数据来源 ——
+> 其余行都是"实例不在 → 回落到配置里的注册名"，而 Redis 这个槽位只有一个实现、
+> `RedisConfig` 里根本没有 `adapter` 字段，`AdapterRegistry.name_of("redis", …)` 也不认它
+> （redis 不是注册表里的适配器类型），两个来源同时取空。修法：监控快照对这一行固定报
+> `redis`（它确实是外部依赖，不在 `_MONITOR_LOCAL_IMPLS` 里，徽章照常按真实实现上色）。
+> 实测（真实服务 + Chrome，演示/真实两种模式各一遍）：11 行第二列**全部有注册名**、
+> 缓存行与其它行同一套 `badge badge-default`、悬停即展开（内容分别落在
+> "配置端点（当前未使用）：192.168.100.239:6379/0" 与 "端点：192.168.100.239:6379/0"，
+> 后者说明本轮实测时 Redis 已按上面那份处置真的连上了）。
+
 ---
 
 ## TS-020 启动日志里的 RequestsDependencyWarning：requests 自带的依赖版本闸门被"只写下界"的 chardet 撞破
@@ -2396,6 +2439,90 @@ connector: <aiohttp.connector.TCPConnector object at 0x…>
 
 ---
 
+## TS-022 换过向量模型后检索静默失准：同维不同源的向量住进同一个集合
+
+### 现象
+
+- 一台机器先以「无外部依赖」模式跑过（向量模型未配置 → 内置本地替身按哈希出**伪向量**，
+  维度仍是配置里的 1024），之后配好真实向量模型（同为 1024 维）保存并热应用。
+- 表现**完全不像故障**：
+  - 保存成功、监控页全绿、`degraded` 为空、日志无一条 warning；
+  - 问答不报错，向量检索路照常走，top_k 永远有结果；
+  - 但答案开始变差，且**换个问法就不稳定**：同一件事有时答对，有时是一段毫不相关的内容；
+  - 迷惑点在于正确文档其实就在库里（BM25 能检到），只是被向量路的噪声挤下去了。
+- 另一种同样无感的触发：把 1024 维的 A 模型换成 1024 维的 B 模型（维度没变，库侧不报错）。
+- 只在「改过 embedding 配置」的部署里出现；先配模型再入库的全新部署一切正常。
+
+### 定位过程
+
+1. **先按"检索链路配置问题"排查**：`enable_vector` / 各路权重 / top_k / RRF 融合 —— 全部符合预期，
+   `lost` 路径为空。⇒ 不是"路没走对"，而是"路走对了、数据不对"。
+2. **构造对照探针**：向同一个集合先写一批 A 来源的向量、再写一批 B 来源（不同模型、同维度）的向量，
+   然后查询。观察到 ANN **无论数据多脏都一定返回 top_k** —— 检索器没有"这件事我做不了"的表达，
+   失败以"结果很烂"的形式出现，而不是以异常出现。
+3. **核对库侧有没有兜底**：`describe_collection` 的 dimension 与配置一致（1024），
+   所以 Milvus 不会报 dimension mismatch —— **同维不同源在库侧完全无痕**；集合里也没有任何位置
+   记录"这些向量是哪来的"。⇒ 判据的输入（来源）根本不存在，只能主动写进去。
+4. **算一遍融合侧的影响**：RRF 只按名次计票、不看分数，于是"分数不可比"的噪声与正确答案拿到
+   **同票**，靠名次或分数阈值都淘汰不掉。⇒ 只能在入口拦（不查 / 不写），出口没有可用判据。
+5. **反查污染从哪进来**：入库写向量、自评 HyDE、二轮检索、一致性巡检的"自动修复"四处都会写/查向量，
+   而它们都不知道"当前向量模型是什么"；`embedding` 段热应用只重建适配器，
+   **不会回头看库里已有向量的来源**。
+
+### 修复方式
+
+| # | 位置 | 修复 |
+|---|---|---|
+| ① | `rag/vector_space.py`（新增） | 纯函数判据：`space_tag`（`v1\|实现\|模型\|维度\|real/local`）、`parse_tag`、`tag_label`（转人话）、`judge_space` → `(可写, 可检索, 原因)` |
+| ② | `rag/adapters/base.py` | 向量库基类新增可选能力：`space_tag_supported`（默认 `False`）/ `read_space_tag` / `write_space_tag` / `collection_rows` —— 实现不了就如实说"无法校验"，不假装通过 |
+| ③ | `rag/adapters/vector_store.py` | Milvus 实现：指纹落在 **collection properties**（建集合后仍可 `alter` 写入；`description` 只在建集合那一次能写），读取结果按物理集合名缓存，写成功即刷新 |
+| ④ | `rag/container.py` | `sync_vector_space()` 算结论并缓存 + 空集合补打指纹；三个对外口径：`vector_write_blocked()`（`async`，写侧，把原因交回调用方）、`vector_space_ok()` / `vector_space_reason()`（**同步**读缓存 —— `enabled_paths()` 每次问答都会被调用，不能在那里 `await` 向量库）、`degraded["vector_space"]`（界面） |
+| ⑤ | 五处调用点 | 入库写向量、检索 `_vector`、自评 HyDE、二轮检索、一致性巡检修复 —— 动手前**都问同一句** `vector_write_blocked` / `vector_read_ok`，不允许各自判断 |
+| ⑥ | 启动自检 / 热应用后 | 同步重判（`sync_vector_space(stamp=True)`）并刷新 `degraded`；`vector_store` / `embedding` 段一换即作废旧结论（否则会拿上一套模型的结论去拦/去放行） |
+| ⑦ | 监控页 / 配置页 | `readiness.retrieval.lost[].reason` 说明"为什么少查一路"；`degraded` 键名映射出「向量空间（库内向量与当前向量模型）」，并写明**这类记录不会随重连自动消失** |
+
+验证（`tmp_vs_check.py`，34 项断言全通过）：
+
+```text
+[1] 纯函数判据（4 项）   指纹可解析 / 本地替身不记模型名 / 两个 mock 部署不受模型名影响
+                        / 真实模型空模型名 ≠ 本地替身                              PASS
+[2] judge_space 分支（6 项）空集合一律放行 / 同源放行 / 同维不同模型→拦
+                        / 本地替身遇存量无指纹→拦 / 真实模型遇存量无指纹→放行+提示
+                        / 拿不到行数→保守拦                                        PASS
+[3] 载体读写（3 项）     空集合可写 / 空集合补打了当前指纹 / ensure_collection 先于打标  PASS
+[4] 容器编排（7 项）     同源可写·可检索·degraded 干净 / 不同源停写·关向量路·登记
+                        degraded / enabled_paths 不含 vector                       PASS
+[5] 监控页（2 项）       lost 给出原因 / vector_store 自身不算掉线                    PASS
+[6] 存量集合分档（5 项） 本地替身→停写且关路 / 真实模型→放行但提示重跑入库
+                        / 提示不算降级记录 / 存量集合仍可检索 / 无载体实现放行        PASS
+[7] 入库链路（4 项）     不同源时不写向量 / 记下跳过原因 / 不抛异常
+                        / 同源时正常向量化                                        PASS
+```
+
+### 根因分析
+
+1. **"向量可检索"这个判据少了一维：来源。** 一直把"库连着 + 模型能出向量"当成"向量可查"，
+   而真正的前提是**同源**（同实现 + 同模型 + 同维度）。ANN 的契约是"一定返回 top_k"，
+   所以缺这一维不会报错，只会答错。⇒ 判据必须包含"数据来自哪里"，不能只判"通道通不通"。
+2. **出口没有可用的判据，防护只能在入口。** RRF 只按 rank 计票，会把"分数不可比"的噪声
+   洗成与正确答案同票；靠分数阈值、靠重排都救不回来。⇒ 凡"融合阶段已无法辨别真假"的问题，
+   必须在**写入前**判（同 TS-013 的思路：判据前置）。
+3. **污染不可逆，所以宁停勿写。** 伪向量/异源向量一旦进库就与真向量不可区分，
+   事后既检不出也删不干净（只能整集合重建）。⇒ 判据取"保守优先"：拿不准行数按有数据算，
+   拿不准来源按不同源算。
+4. **拦截不能伪装成失败。** 让适配器抛异常会被上层记成"写入失败"→ 文档状态变 PARTIAL、
+   质量报告长期挂一条假故障。⇒ "有意跳过"必须是可区分的状态（`vector_write_blocked` 把原因
+   交回调用方，写入阶段自然不碰向量库），这条链路上"没写"与"写失败"始终分得清（同 TS-017）。
+5. **降级记录的键必须对应"能自动恢复的东西"。** 把"库里的向量不同源"记到 `vector_store` 名下，
+   会触发后台每 30 秒重装一次向量库适配器 —— 永远修不好、永远在白试。⇒ 前提类问题用自己的键
+   （`vector_space`），并在界面上如实说明"这类记录不会自动消失"。
+6. **判据缺失不能算通过。** 载体不支持（Qdrant / pgvector 无 collection properties）时放行，
+   但必须**发声**说明"无法校验"；同理，改造前写入的存量集合没有指纹时不能一刀切停掉
+   （真实模型遇存量按既有行为放行 + 提示重跑入库，本地替身则必须停）。
+   ⇒ **"通过"必须是判据成立，而不是判据查不到**（同 TS-013 的"在线 = 对象存在 且 无降级记录"）。
+
+---
+
 ## 附录
 
 ### 优化前后指标对比
@@ -2442,6 +2569,7 @@ connector: <aiohttp.connector.TCPConnector object at 0x…>
 | （TS-017 无落盘脚本） | — | 向量库改动以**内联 `python -c` 探针**验证：命名/凭据校验行为、配置默认值、三 adapter 接口自省、模块导入 |
 | （TS-018 无落盘脚本） | — | 配置页载荷以**内联 `python -c` 探针**验证（`_service_params` / `_param_row` 直调）：分组顺序、optional 标记的分组粒度、按 adapter 隐藏的 `timeout`、`py_compile` |
 | `tmp_verify_redis.py` | 已删除 | TS-019 验证（26 项断言）：工厂口径（超时/重试/空密码）、八类原因翻译（含 Windows 本地化文本）、`probe` 真实建连与 `aclose`、表单值优先、`model_validate` 校验、分组可见参数与标签、`health_test` 分支顺序 |
+| `tmp_vs_check.py`（仓库根） | 已删除 | TS-022 验证（34 项断言）：指纹纯函数与 `tag_label`、`judge_space` 六个分支、Milvus `collection properties` 读/写/补打、容器三口径与 `degraded` 登记、`enabled_paths` 摘掉向量路、监控页 `lost` 原因、存量集合两档处置、入库步骤"有意跳过" |
 
 ### 经验总结
 
@@ -2581,3 +2709,158 @@ connector: <aiohttp.connector.TCPConnector object at 0x…>
    然后无路可走）。⇒ 判据：**拒绝类文案要覆盖"只绑回环"这一成因，并直接给出
    `ss -lntp | grep <port>` 这个能一眼看穿的动作**；Docker 的 `-p 127.0.0.1:6379:6379`
    与 redis.conf 只绑回环在服务端看起来完全相同，排查时不要按"是不是容器"分流。
+
+### 适配器命名体系：组件名 ↔ 槽位 ↔ 注册名
+
+> 本节是一份**速查参考**（不是故障复盘）。项目里所有"名字对不上"的故障都源于这一层：
+> 注册名一度叫 `mysql_meta`、监控页 badge 显示的是 `openai_compatible`、配置页标题写着
+> `(MySQL)` 而实际连的是别的后端 —— 同一个组件身上有三层名字，混用就会自相矛盾。
+
+#### 1. 三层名字，各回答一个问题
+
+| 名字 | 代码里的存在形式 | 回答的问题 | 谁在用 |
+|---|---|---|---|
+| **组件名** | 界面中文名：配置页 `_MODEL_SECTIONS` / `_SERVICE_SECTIONS`，监控页 `_monitor_service_specs`（`rag/web/routes.py`） | "用户看到的这是什么能力" | 模板 / `monitor.js`，**仅用于展示** |
+| **槽位**（`adapter_type`） | `_ADAPTER_TYPES` 的键，共 11 个（`rag/adapters/registry.py:17-32`） | "实现的是哪一种**能力契约**"（对应 `rag/adapters/base.py` 里的 ABC） | 注册表键；`create` / `get_class` / `drop` / `name_of` 的第一个参数；`_CORE_FALLBACKS`；`SECTION_ADAPTERS` |
+| **注册名**（`name`） | `_classes[槽位][注册名] = 实现类`（`registry.py:42`） | "是这个能力的**哪一份实现**" | YAML 里该段的 `adapter:` 取值、监控页 badge、热重建的 `drop` |
+| *（附加）容器属性* | `c.llm` / `c.vector` / `c.graph` / `c.business` / `c.parsers` … | "上层此刻该读哪个对象" | 所有 routes / pipeline / services |
+| *（附加）配置段名* | YAML 顶层键 | "用户能编辑哪一段" | `AppConfig` 字段名、`SECTION_ADAPTERS`、配置页载荷 |
+
+**为什么三者不能合并**：注册表的数据结构是 `{槽位: {注册名: 类}}`。如果注册名直接复述槽位名
+（槽位 `embedding` → 注册名也叫 `embedding`），这个内层字典就永远只可能有一个 key ——
+一个槽位一份实现，"可插拔"退化成"写死"。而 `vector_store` 下要同时放 `milvus/qdrant/pgvector`、
+`meta` 下要放 `mysql/memory`、`fulltext` 下要放 `elasticsearch/opensearch`，
+这份"多实现"能力**只能由注册名承担**。
+
+历史上确实踩过这个坑：元数据库的**段名、槽位名、注册名一度都叫 `mysql_meta`**，后果是监控页
+badge（显示注册名）只能写出 `mysql_meta` —— 读者既看不出后端是哪个数据库，也看不出它是不是
+本地替身（见 `registry.py:22-24` 与 `rag/config/models.py:19-22`）。现统一为：配置段 `meta`、
+槽位 `meta`、注册名 `mysql`。
+
+> 判据：**槽位名回答"是什么"，注册名回答"是哪一份"，两者都不许复述对方。**
+
+#### 2. 注册：三种方式，合计 32 个注册名
+
+| 方式 | 数量 | 写法 | 位置 |
+|---|---|---|---|
+| 装饰器 | 21 | `@AdapterRegistry.register("槽位", "注册名")` | `registry.py:45-53` |
+| 解析器专用 | 8 | `@AdapterRegistry.register_parser("pdf")`（等价于 `register("doc_parser", ...)`） | `registry.py:55-58` |
+| 别名直写 | 3 | `AdapterRegistry._classes["槽位"]["别名"] = 同一个类` | `llm.py:105`、`embedding.py:79`、`fulltext.py:481` |
+
+装饰器注册点清单（改注册名时按这张表逐个核对）：
+
+| 槽位 | 注册名 → 文件:行 |
+|---|---|
+| `llm` | `openai_compatible` → `llm.py:24`；`mock` → `mocks.py:37` |
+| `embedding` | `http_embedding` → `embedding.py:19`；`mock` → `mocks.py:100` |
+| `meta` | `mysql` → `meta_mysql.py:274`；`memory` → `meta_memory.py:23` |
+| `vector_store` | `milvus` → `vector_store.py:240`；`qdrant` → `549`；`pgvector` → `689` |
+| `fulltext` | `elasticsearch` → `fulltext.py:152` |
+| `knowledge_graph` | `neo4j` → `knowledge_graph.py:17`；`nebula` → `117` |
+| `business_data` | `sqlalchemy` → `business_data.py:23` |
+| `synonym` | `file_based` → `synonym.py:21`；`http_service` → `77`；`none` → `mocks.py:137` |
+| `auth` | `jwt` → `auth.py:35`；`dev` → `87`；`oidc` → `113` |
+| `storage` | `minio` → `storage.py:30`；`local_fs` → `storage.py:97` |
+| `doc_parser` | `pdf` → `doc_parser.py:64`；`docx` → `255`；`xlsx` → `298`；`pptx` → `392`；`markdown` → `448`；`txt` → `500`；`html` → `528`；`image` → `581` |
+
+三个别名都是"协议合并"的产物，与同行的主名**指向同一个类**（不是新实现）：
+
+| 别名 | 主名 | 为什么能合 |
+|---|---|---|
+| `vllm` | `openai_compatible` | 自建 vLLM 也讲 OpenAI `/chat/completions` 方言 |
+| `openai_embedding` | `http_embedding` | 自建向量服务（TEI / vLLM 起的 bge 系列）也讲 OpenAI `/embeddings` 方言 |
+| `opensearch` | `elasticsearch` | OpenSearch 复用 ES 的 `_search` / `_bulk` 协议实现 |
+
+**按需加载**：`_load_builtin_implementations()`（`registry.py:131-137`）预载 11 个模块；
+`mocks.py`（`mock`×2、`none`）与 `meta_memory.py`（`memory`）**不在预载列表**，
+只在容器降级 / `--noconnection` 路径按需 import 时才入库。由此产生一个可观测的副作用：
+健康运行时 `list_implementations("meta") == ["mysql"]`，降级过一次之后才是 `["memory", "mysql"]`。
+这不是缺陷 —— 降级替身本来就是"用过之后才存在"的实现。
+
+#### 3. 实例化与反查：五个入口，用途各不相同
+
+| 入口 | 是否进单例缓存 | 用途与注意点 |
+|---|---|---|
+| `create(type, name, config)` | 是，key=`(type, name)` | 容器构造。**热重建前必须先 `drop`**，否则命中缓存拿到的是带旧配置的旧实例（TS-012） |
+| `drop(type, name)` | 摘掉单个 key | 单段热应用。只动这一段，不牵连别的服务的连接与实例（TS-012 / TS-013） |
+| `get_class(type, name)` | 否 | 配置页「测试连接」用**表单当前值**现建一次性实例（TS-011 / TS-017） |
+| `create_parsers(config)` | 否（每次新建） | 遍历 `doc_parser` 注册项 → `{扩展名: 实例}`；同一实例可占多个扩展名 |
+| `name_of(type, instance)` | 按类反查 | **实例 → 注册名**，监控页 badge 的口径所在 |
+
+`name_of` 是"配置名 ≠ 运行名"的落地点：容器降级后实例类型已经换人（`http_embedding → mock`、
+`mysql → memory`），状态展示若读配置名，就会把本地 mock 当成真实外部服务汇报。
+已知取舍：它按类反查的是**首个**注册名，所以别名会被"纠正"成主名 —— 配置写
+`adapter: vllm` 时 badge 显示 `openai_compatible`（同一个类，信息不算错，但不是用户写下的那个词）。
+
+#### 4. 名字的四套变体（"对不上"的地方都在这里）
+
+1. **段名 ↔ 容器属性**：`vector_store → c.vector`、`knowledge_graph → c.graph`、
+   `business_data → c.business`。`SECTION_ADAPTERS`（`rag/container.py:51-61`）是唯一权威映射。
+2. **degraded 台账两套键**：属性名（`vector`/`graph`/`business`）与段名
+   （`vector_store`/`knowledge_graph`/`business_data`）并存，`SECTION_DEGRADED_KEYS`
+   （`container.py:66-76`）负责"重建成功时两套都清"，否则界面会出现"已经连上了却还挂着降级"（TS-013）。
+3. **历史别名兼容层**：`LEGACY_SECTION_ALIASES` / `LEGACY_ADAPTER_ALIASES`
+   （`config/models.py:26-27`）+ loader 的 `_migrate_legacy_sections`（`config/loader.py:23-38`），
+   段名 `mysql_meta → meta`、注册名 `mysql_meta → mysql`；请求层还留着旧 kind 的映射
+   （`routes.py:199-205` 的 `_DEGRADED_KEY`、`routes.py:1770-1776` 的 `attr_map`），
+   因为浏览器里缓存的旧页面仍会带旧 kind 发请求。
+4. **没有槽位的服务**：`redis` 段有配置页卡片、有容器属性 `c.redis`、有 degraded 键，
+   但**没有适配器槽位、也没有注册名**（客户端由 `rag/adapters/redis_cache.make_client` 直连）。
+   所以任何"按槽位查表"的代码（如 `_section_label`）对 redis 必须能安全退回无方言标题。
+
+页面入口的分布由这三层决定：配置页 = `_MODEL_SECTIONS`（llm/embedding）+
+`_SERVICE_SECTIONS`（meta/storage/redis/fulltext/vector_store/knowledge_graph/synonym）；
+`business_data`（只关配置页入口、能力仍在，见 TS-018）与 `auth` **只在监控页**出现；
+`doc_parser` 无页面入口。
+
+展示口径的分工（两者刻意不同）：配置页卡片的参数列表**不含 `adapter`**（实现不可改），
+所以标题必须带方言名（`_section_label`，如"元数据库 (MySQL)"）；监控页每行都有实现 badge，
+标题就只写到槽位为止（"元数据库"），否则同一行会出现两份口径。
+
+#### 5. 全量对照表（组件名 ↔ 槽位 ↔ 注册名）
+
+| 组件名（配置页） | 组件名（监控页） | 槽位 | 注册名（YAML `adapter:` 取值） | 容器属性 | 配置段 | 页面入口 | 失败时的去向 |
+|---|---|---|---|---|---|---|---|
+| LLM 大模型 | LLM 大模型 | `llm` | `openai_compatible`（别名 `vllm`）、`mock` | `c.llm` | `llm` | 配置页·模型 | 降级 `mock` |
+| 向量模型 (Embedding) | 向量模型 | `embedding` | `http_embedding`（别名 `openai_embedding`）、`mock` | `c.embedding` | `embedding` | 配置页·模型 | 降级 `mock` |
+| 元数据库 | 元数据库 | `meta` | `mysql`、`memory` | `c.meta` | `meta` | 配置页·服务 | 降级 `memory` |
+| 全文检索 | 全文检索 | `fulltext` | `elasticsearch`（别名 `opensearch`） | `c.fulltext` | `fulltext` | 配置页·服务 | 关闭（`None`） |
+| 向量库 | 向量库 | `vector_store` | `milvus`、`qdrant`、`pgvector` | `c.vector` | `vector_store` | 配置页·服务 | 关闭（`None`） |
+| 知识图谱 | 知识图谱 | `knowledge_graph` | `neo4j`、`nebula` | `c.graph` | `knowledge_graph` | 配置页·服务 | 关闭（`None`） |
+| —（无编辑入口） | 业务数据库 | `business_data` | `sqlalchemy` | `c.business` | `business_data` | 仅监控页 | 关闭（`None`） |
+| 同义词表 | 同义词表 | `synonym` | `file_based`、`http_service`、`none` | `c.synonym` | `synonym` | 配置页·服务 | 降级 `none` |
+| 对象存储 | 对象存储 | `storage` | `minio`、`local_fs` | `c.storage` | `storage` | 配置页·服务 | 降级 `local_fs` |
+| 缓存 (Redis) | 缓存 | **无槽位** | **无注册名**（`redis_cache.make_client` 直连） | `c.redis` | `redis` | 配置页·服务 | `None`（会话/记忆退化为进程内存） |
+| —（无连接测试卡） | 认证服务 | `auth` | `jwt`、`dev`、`oidc` | `c.auth` | `auth` | 仅监控页 | 降级 `dev` |
+| —（无页面入口） | —（不在监控列表） | `doc_parser` | `pdf`、`docx`、`xlsx`、`pptx`、`markdown`、`txt`、`html`、`image` | `c.parsers`（`{扩展名: 实例}`） | 无（解析器直接拿整份 config） | 无 | 该格式解析失败 |
+
+"失败时的去向"来自两处：带降级替身的取 `_CORE_FALLBACKS`（`container.py:35-42`，
+即 `llm/embedding/meta/auth/storage/synonym`），其余可选依赖走 `_try_create` → 置 `None` 关闭。
+`_LOCAL_IMPL = {mock, memory, dev, local_fs, none}`（`container.py:45`）表示"不需要 `base_url`
+的本地实现"，用来把"未配置"与"构造失败"区分开。
+
+`doc_parser` 的注册名 ↔ 扩展名（`create_parsers` 按 `supported_extensions` 展开）：
+
+| 注册名 | 覆盖扩展名 |
+|---|---|
+| `pdf` | `.pdf` |
+| `docx` | `.docx` `.doc` |
+| `xlsx` | `.xlsx` `.xls` `.csv` |
+| `pptx` | `.pptx` `.ppt` |
+| `markdown` | `.md` `.markdown` |
+| `txt` | `.txt` `.log` |
+| `html` | `.html` `.htm` |
+| `image` | `.png` `.jpg` `.jpeg` `.bmp` `.tiff` `.webp` |
+
+#### 6. 维护规则（改动前先看这五条）
+
+1. **新增实现**：装饰器注册即可被 `adapter:` 引用；若该槽位对用户可选（向量库/全文检索/图谱），
+   还要同步配置页可选项与文档。
+2. **新增别名**：只有当别名与主名**指向同一个类**时才允许直写 `_classes`；协议一旦分化，
+   必须拆成独立类 + 装饰器注册（否则"测试连接"与版本自检会打错分支）。
+3. **改名**：段名 / 槽位 / 注册名三处必须一起改，并保留 `LEGACY_*_ALIASES` 兼容层，
+   否则存量 YAML 与浏览器缓存载荷会直接 `AdapterNotFoundError`（TS-011 同类问题）。
+4. **展示名**：槽位名只说明"这是哪类能力"，实现名一律由 `name_of(运行实例)` 给出；
+   页面上任何"看起来像实现名"的文案都必须来自这一份数据，不能写死。
+5. **按槽位查表的代码**（`_section_label`、`_DEGRADED_KEY`、`SECTION_ADAPTERS`）
+   必须容忍两类例外：无槽位的 `redis`、以及历史 kind（`mysql_meta` / `vector` / `graph` / `business`）。

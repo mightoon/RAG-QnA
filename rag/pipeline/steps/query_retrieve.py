@@ -161,6 +161,12 @@ class RetrieveStep(PipelineStep):
             raise StepError("retrieve", "QueryPlan 未生成", retryable=False)
         route_cfg = _default_route_cfg(s)
         weights = plan.route_weights or {}
+        # 向量路的开启条件之一是"库里的向量与当前向量模型同源"，那份结论由
+        # sync_vector_space 预先算好（enabled_paths 是同步判据，不能 await 向量库）。
+        # 指纹一致时这里只读缓存 + 比一次字符串，正常部署没有额外 RPC，但它保证
+        # 判据永远反映"此刻"（例如刚在配置页换过向量模型）。
+        if getattr(s, "vector", None) is not None:
+            await s.sync_vector_space("default")
         # ── 系统启用 ∩ 用户选择 ∩ LLM 分配 ─────────────────────
         sys_enabled = set(s.enabled_paths())
         weights = {k: v for k, v in weights.items()
@@ -286,6 +292,16 @@ class RetrieveStep(PipelineStep):
         top_k = cfg.get("top_k", 20)
 
         async def _one_collection(col: str) -> list[RetrievedChunk]:
+            # 逐集合过向量空间门禁：这个集合里的向量与当前向量模型不同源时，
+            # 宁可不查（ANN 永远返回 top_k，RRF 又只按 rank 计票，噪声会真的
+            # 挤掉正确答案）。按集合判而不是整条路判：一套部署里可能只有某个
+            # 知识域的集合是旧的，其它集合照常可用。
+            if not await s.vector_read_ok(col):
+                log.warning(
+                    "vector_search_skipped_space",
+                    collection=col,
+                    reason=s.vector_space_reason(col)[:200])
+                return []
             hits: list[RetrievedChunk] = []
             for vec in vectors:
                 f = dict(filter_base)

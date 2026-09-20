@@ -18,6 +18,7 @@ import time
 from rag.config.models import VectorStoreConfig
 from rag.models import RetrievedChunk
 from rag.observability.logging import get_logger
+from rag.vector_space import TAG_KEY
 
 from .base import VectorStoreAdapter
 from .registry import AdapterRegistry
@@ -260,6 +261,10 @@ class MilvusVectorStore(VectorStoreAdapter):
         self._client_lock = threading.Lock()
         # 延迟创建索引（首次 upsert 时按 dim 建）
         self._ensured: set[str] = set()
+        # 空间指纹缓存：物理集合名 → 指纹（None = 已确认没有）。每次检索都要判
+        # 一次"库里的向量与当前向量模型是否同源"，缓存掉读取，判据本身仍走
+        # rag/vector_space.judge_space（写成功时同步刷新，见 write_space_tag）
+        self._tags: dict[str, str | None] = {}
 
     def _client(self):
         """首次使用时才建连
@@ -473,6 +478,75 @@ class MilvusVectorStore(VectorStoreAdapter):
                             consistency_level="Strong")
             return {r["chunk_id"] for r in res}
         return await asyncio.to_thread(_query)
+
+    # ── 向量空间指纹（载体：collection properties）──────────────
+    # 为什么用 properties 而不是 description：description 只在**建集合**那一次
+    # 能写，存量集合永远补不上（改它要 drop 重建），而本功能恰恰最需要给存量集合
+    # 补打指纹；properties 支持创建后写入（alter_collection_properties），
+    # 也不与"人类可读描述"抢同一个字段。
+    space_tag_supported = True
+
+    async def read_space_tag(self, collection: str) -> str | None:
+        full = self._full_name(collection)
+        if full in self._tags:
+            return self._tags[full]
+
+        def _read():
+            cli = self._client()
+            if not cli.has_collection(full):
+                return None
+            return (cli.describe_collection(full) or {}).get("properties", {}).get(TAG_KEY) or None
+
+        tag = await asyncio.to_thread(_read)
+        self._tags[full] = tag
+        return tag
+
+    async def write_space_tag(self, collection: str, tag: str) -> bool:
+        full = self._full_name(collection)
+
+        def _write():
+            cli = self._client()
+            if not cli.has_collection(full):
+                return False
+            cli.alter_collection_properties(
+                collection_name=full, properties={TAG_KEY: tag})
+            return True
+
+        try:
+            ok = await asyncio.to_thread(_write)
+        except Exception as e:
+            # 不抛给调用方：打不上指纹只意味着"以后判不了"，不该把入库/检索打断。
+            # 但必须发声 —— 该版本 Milvus 可能没有 collection properties（老版本），
+            # 那会让本地替身的伪向量不再受保护，属于"静默少了一层防护"
+            log.warning("vector_space_tag_write_failed", collection=full,
+                        error=f"{type(e).__name__}: {e}"[:200],
+                        hint="该 Milvus 版本可能不支持 collection properties："
+                             "指纹无法落库，本地替身写入将失去保护"
+                             "（建议演示时用 --noconnection 直接关掉向量库）")
+            return False
+        if ok:
+            self._tags[full] = tag
+        return ok
+
+    async def collection_rows(self, collection: str) -> int | None:
+        full = self._full_name(collection)
+
+        def _rows():
+            cli = self._client()
+            if not cli.has_collection(full):
+                return 0            # 还没建 = 确认空集合（可安全打标）
+            stats = cli.get_collection_stats(full) or {}
+            # row_count 在 Milvus 里是统计值（可能滞后于最近一次写入），但本判据
+            # 只区分"空 / 非空"：哪怕刚写完还没统计到，也是判成"空"→ 打标/放行，
+            # 而不会误判成"有数据"去拦下一次正常写入
+            return int(stats.get("row_count") or 0)
+
+        try:
+            return await asyncio.to_thread(_rows)
+        except Exception as e:
+            log.warning("vector_space_rows_failed", collection=full,
+                        error=f"{type(e).__name__}: {e}"[:200])
+            return None             # None = 读不到 → 判据按"可能有数据"保守处理
 
     # ── 健康检查 / 探测 ─────────────────────────────────────
 

@@ -25,7 +25,11 @@ from fastapi.templating import Jinja2Templates
 
 from rag.adapters.registry import AdapterRegistry
 from rag.api.deps import get_current_user, require_admin
-from rag.container import SECTION_DEGRADED_KEYS, ServiceContainer
+from rag.config.models import LEGACY_SECTION_ALIASES
+from rag.container import (
+    RECOVER_INTERVAL_SEC, RECOVERABLE_SECTIONS, SECTION_DEGRADED_KEYS,
+    ServiceContainer,
+)
 from rag.models import IngestStatus, UserContext
 from rag.observability.logging import get_logger
 
@@ -43,6 +47,23 @@ _PATH_DESC = {
     "graph": "知识图谱多跳遍历", "ephemeral": "会话临时文档",
     "structured": "结构化数据检索",
 }
+
+
+def _lost_path_reason(c: ServiceContainer, path: str) -> str:
+    """检索路「配了却不可用」的原因；**只补别处看不出来的那几种**
+
+    服务行本身红着的（连不上 / 未初始化）不必在这里重复：那一行有自己的
+    message，口径也统一。真正需要说清的是**服务行全绿、检索路却关着**的情况
+    —— 向量空间不一致、或向量模型未就绪。不给原因的话，用户看到"5/6 就绪"
+    只会以为系统在无缘无故少查一路。
+    """
+    if path == "vector":
+        if getattr(c, "vector", None) is not None and not c.vector_space_ok():
+            return c.vector_space_reason()
+        if any(k in c.degraded
+               for k in SECTION_DEGRADED_KEYS.get("embedding", ("embedding",))):
+            return "向量模型不可用，向量检索已关闭"
+    return ""
 
 
 def _container(request: Request) -> ServiceContainer:
@@ -138,28 +159,63 @@ _SPECIAL_KEYS = ("retrieval", "chunking", "prompts", "ingest", "ephemeral", "mem
 #   第 1 行 元数据库 / 对象存储 / 缓存
 #   第 2 行 全文检索 / 向量库 / 知识图谱
 #   第 3 行 同义词表
-# 注意：business_data（业务数据 (SQL)）**刻意不在列** —— 它的 YAML 段与容器初始化
+# 注意：business_data（业务数据库）**刻意不在列** —— 它的 YAML 段与容器初始化
 # 都保留（结构化检索仍可用），只是不再提供配置页编辑入口。
 _SERVICE_SECTIONS = (
-    ("mysql_meta", "元数据库 (MySQL)", "meta"),
-    ("storage", "对象存储 (MinIO)", "storage"),
+    ("meta", "元数据库", "meta"),
+    ("storage", "对象存储", "storage"),
     ("redis", "缓存 (Redis)", "redis"),
-    ("fulltext", "全文检索 (Elasticsearch)", "fulltext"),
-    ("vector_store", "向量库 (Milvus)", "vector"),
-    ("knowledge_graph", "知识图谱 (Neo4j)", "graph"),
+    ("fulltext", "全文检索", "fulltext"),
+    ("vector_store", "向量库", "vector"),
+    ("knowledge_graph", "知识图谱", "graph"),
     ("synonym", "同义词表", "synonym"),
 )
 
-# 向量库分段标题：三个 adapter 共用同一个配置段，标题要跟着实际 adapter 走 ——
-# 配 pgvector 的用户不该看到一个写着 (Milvus) 的标题。
-_VECTOR_LABELS = {
-    "milvus": "向量库 (Milvus)", "qdrant": "向量库 (Qdrant)",
-    "pgvector": "向量库 (pgvector)",
+# ── 标题里的方言名（仅配置页）──────────────────────────────────
+# 一个配置段可能被多个后端实现共用（元数据库 mysql/memory；向量库
+# milvus/qdrant/pgvector；全文检索 elasticsearch/opensearch……），
+# 配置页的分组标题必须跟着**实际配置的实现**走：写死 (MySQL) 时，只要把 adapter
+# 换成别的后端，页面就会显示「元数据库 (MySQL)」而卡片配的是 pgsql。
+# 键是注册名（@AdapterRegistry.register 的第二个参数），查不到就退回不带方言
+# 的槽位名。此表未登记的段（缓存/认证/LLM…）标题与实现无关，原样保留。
+#
+# 监控页**不用**这张表：那里每行都挂着实现 badge（且降级后如实变成
+# mock/memory），标题再拼一个方言名就成了同一行的第二份口径 —— 标题说
+# 「元数据库 (MySQL)」、badge 说 memory。所以监控页标题只写到槽位为止，
+# 实现名交给 badge 承担（见 _monitor_service_specs）。
+_SECTION_LABELS: dict[str, dict[str, str]] = {
+    "meta": {"mysql": "元数据库 (MySQL)"},
+    "storage": {"minio": "对象存储 (MinIO)", "local_fs": "对象存储 (本地目录)"},
+    "fulltext": {"elasticsearch": "全文检索 (Elasticsearch)",
+                 "opensearch": "全文检索 (OpenSearch)"},
+    "vector_store": {"milvus": "向量库 (Milvus)", "qdrant": "向量库 (Qdrant)",
+                     "pgvector": "向量库 (pgvector)"},
+    "knowledge_graph": {"neo4j": "知识图谱 (Neo4j)",
+                        "nebula": "知识图谱 (NebulaGraph)"},
 }
 
+
+def _section_label(section: str, label: str, *adapters: str) -> str:
+    """段标题加方言名：按传入顺序取第一个命中的，都不命中用调用方给的无方言标题
+
+    仅配置页使用：配置页卡片的参数列表里不含 adapter（实现不可改），标题是唯一
+    说明「这张卡片管的是哪个实现」的地方，所以必须带方言名。
+    """
+    labels = _SECTION_LABELS.get(section)
+    if not labels:
+        return label
+    for name in adapters:
+        hit = labels.get(str(name or "").lower())
+        if hit:
+            return hit
+    return label
+
+
 # 连接测试 kind → 容器 degraded 记录的组件键（两套命名并不完全一致）
+# "mysql_meta" 是历史 kind：改名为 meta 后仍保留映射，浏览器里缓存的旧页面
+# 还会带着它发请求，不能让它静默失效
 _DEGRADED_KEY = {
-    "meta": "mysql_meta", "mysql_meta": "mysql_meta",
+    "meta": "meta", "mysql_meta": "meta",
     "vector": "vector_store", "vector_store": "vector_store",
     "graph": "knowledge_graph", "knowledge_graph": "knowledge_graph",
     "business": "business_data", "business_data": "business_data",
@@ -217,7 +273,7 @@ _OPTIONAL_BY_GROUP = {"vector_store": frozenset({"user"})}
 
 # 服务分组「前置条件」提示（标题旁 ⓘ 悬浮显示）：仅列需要用户在服务端预先准备的服务
 _SERVICE_HINTS = {
-    "mysql_meta": {
+    "meta": {
         "title": "前提条件（需先在 MySQL 服务端执行）",
         "code": "\n".join([
             "CREATE DATABASE IF NOT EXISTS rag_meta DEFAULT CHARACTER SET utf8mb4;",
@@ -299,7 +355,7 @@ _SERVICE_HINTS = {
 
 # 服务分组中不再对用户暴露、改由代码恒定管理的参数
 # （隐藏开关必须同时写死取值，否则界面与配置文件会各说各话）
-_SERVICE_FIXED_PARAMS = {"mysql_meta": {"auto_create_tables": True}}
+_SERVICE_FIXED_PARAMS = {"meta": {"auto_create_tables": True}}
 
 # 服务分组内的参数显示顺序：只列需要「挪位置」的键，未列出的按模型字段顺序追加在后。
 # storage 的 secure(HTTPS) 与 endpoint 共同决定连接方式（协议头由 secure 拼出），
@@ -399,9 +455,8 @@ def _normalize_config(c: ServiceContainer) -> dict:
     services = []
     for key, label, test_kind in _SERVICE_SECTIONS:
         sect = dump.get(key) or {}
-        if key == "vector_store":
-            label = _VECTOR_LABELS.get(str(sect.get("adapter") or "").lower(),
-                                       label)
+        # 标题方言按配置里的 adapter 取：配置页展示的正是"将保存什么"
+        label = _section_label(key, label, sect.get("adapter"))
         fixed = _SERVICE_FIXED_PARAMS.get(key) or {}
         flat = [_param_row(k, v, key) for k, v in _service_params(sect, key)
                 if k != "adapter" and not isinstance(v, dict) and k not in fixed]
@@ -543,7 +598,9 @@ def _yaml_update_from_payload(payload: dict, enabled_paths: list[str]) -> dict:
     # 服务依赖域：扁平参数按类型写回（adapter 名不可改）
     service_keys = {k for k, _, _ in _SERVICE_SECTIONS}
     for group in (payload.get("serviceGroups") or []):
-        key = group.get("key")
+        # 旧页面缓存里可能还带着 mysql_meta：归一到 meta，否则这一段会被
+        # 当成"不在保存范围内"静默丢弃，用户改了主机却什么都没写回
+        key = LEGACY_SECTION_ALIASES.get(group.get("key"), group.get("key"))
         if key not in service_keys:
             continue
         sect = {}
@@ -723,6 +780,11 @@ async def config_page(request: Request, user: UserContext = Depends(_page_user))
 #     配置页还挂着降级」的自相矛盾。
 # 三条链路若各写各的超时，同一个服务会在三个界面给出三种结论，
 # 「监控说挂了、配置页说通了」就再也无法解释。
+#
+# 本页还有一件别处办不到的事：把"运行期掉线"写回容器（container.mark_section_down）。
+# 容器只在启动自检与配置保存时探依赖，"启动时健康、之后掉线"的段不会留下任何
+# 痕迹 —— 不登记，后台自愈（_recovery_candidate）就认为它没失联，那一行只能红着
+# 等重启，检索路也照旧谎报可用。每次刷新都带真实探测结论的，只有本页。
 
 _MONITOR_PROBE_BUDGET_SEC = 6.0
 
@@ -732,28 +794,22 @@ _MONITOR_STARTED_AT = time.time()
 # 本地替身实现名：命中即代表「这个能力没连外部服务，只是本地占位」
 _MONITOR_LOCAL_IMPLS = frozenset({"mock", "memory", "dev", "local_fs", "none"})
 
-# 上面这批替身里「完全没有网络端点」的几个：此时把配置里的地址摆在端点列，
-# 读者会以为真连上了（--noconnection 下 llm.adapter=mock 但 base_url 仍留着
-# 真实地址、mysql_meta.adapter=memory 但 host/port 仍是真实库），故显示 "—"。
+# 上面这批替身里「完全没有网络端点」的几个：这类行的地址只是**配置里留着**的那
+# 一个（--noconnection 下 llm.adapter=mock 但 base_url 仍是真实地址、
+# meta.adapter=memory 但 host/port 仍是真实库）。
+# 地址照报，但把 endpointInUse 标成 false，由前端写成「配置端点（当前未使用）」——
+# 抹成 "—" 会让排障第一步要核对的地址凭空消失（用户只能回配置页翻）。
 # local_fs 的本地目录、dev 的认证模式本身就是有意义的描述，不在此列。
 _MONITOR_NETWORK_FREE_LOCALS = frozenset({"mock", "memory", "none"})
 
 # 监控页分组（元组顺序即页面顺序）
+# infra 里放的都是「进程内能兜底」的基础组件：缓存 → 进程内存、对象存储 →
+# 本地文件系统、认证 → 进程内实现，故说明统一写成「退化为进程内本地实现」。
 _MONITOR_GROUPS = (
     ("core", "核心依赖", "缺失时自动降级为本地实现，能力受限但不阻断启动"),
-    ("retrieval", "检索与存储后端", "可选依赖，不可用时对应检索路自动关闭"),
-    ("infra", "基础设施", "缓存与会话；不可用时退化为进程内存"),
+    ("retrieval", "检索与存储组件", "可选依赖，不可用时对应检索路自动关闭"),
+    ("infra", "基础设施", "基础组件，不可用时退化为进程内本地实现"),
 )
-
-_MONITOR_FULLTEXT_LABELS = {
-    "elasticsearch": "全文检索 (Elasticsearch)",
-    "opensearch": "全文检索 (OpenSearch)",
-}
-_MONITOR_GRAPH_LABELS = {
-    "neo4j": "知识图谱 (Neo4j)",
-    "nebula": "知识图谱 (NebulaGraph)",
-}
-
 
 def _dsn_summary(dsn: str) -> str:
     """DSN 摘要：抹掉用户名与口令，只留方言与主机库名（监控页不外泄凭据）"""
@@ -765,7 +821,7 @@ def _dsn_summary(dsn: str) -> str:
 def _monitor_endpoint(key: str, cfg) -> str:
     """端点摘要：只给定位信息，绝不带 password / api_key / secret_key"""
     try:
-        if key == "mysql_meta":
+        if key == "meta":
             return f"{cfg.host}:{cfg.port}/{cfg.database}"
         if key == "redis":
             return f"{cfg.host}:{cfg.port}/{cfg.db}"
@@ -784,12 +840,63 @@ def _monitor_endpoint(key: str, cfg) -> str:
         if key == "synonym":
             return cfg.url or cfg.file or "—"
         if key == "auth":
-            return cfg.oidc_issuer if cfg.adapter == "oidc" else cfg.adapter
+            # 只有走 OIDC 才有"端点"可言；dev 模式下把实现名当端点显示，
+            # 会在 ⓘ 里多一句"端点：dev"—— 实现的方言名不是网络位置，别混着说。
+            return cfg.oidc_issuer if cfg.adapter == "oidc" else ""
         if key == "business_data":
             return _dsn_summary(cfg.dsn)
     except Exception:
         return "—"
     return "—"
+
+
+# 模型名前面那个名词：与「基础服务」第一列的槽位名对得上，才能一眼看出是"谁的模型"。
+# LLM 行讲的是主模型（改写/摘要另说），向量模型行讲的是 embedding 模型。
+_MODEL_NOUN = {"llm": "主模型 ", "embedding": "向量模型 "}
+
+
+def _monitor_model(key: str, cfg, runtime: str) -> tuple[str, str]:
+    """LLM / 向量模型行的「此刻在跑哪个模型」→ (短名, tooltip 明细)
+
+    方言名解决"用哪个实现"，这里补"该实现加载了哪个模型"：配
+    openai_compatible 时真正决定行为的是 model 字段，只报实现名等于把最该
+    确认的那一项留在配置页里。
+
+    本地替身（mock / memory…）不报模型名：--noconnection 或降级之后
+    llm.adapter=mock，但 cfg.model 仍是配置里那个真实模型，照着念会把
+    内置演示实现说成"qwen38-27b"，与同一行的 mock badge 直接打架。
+    但「配置了真实模型、此刻跑的却是本地替身」这件事必须说出来 —— 否则
+    用户只看到一行 mock，不知道配置里的模型去哪了（见下 local 分支）。
+    """
+    if key not in ("llm", "embedding"):
+        return "", ""
+    model = str(getattr(cfg, "model", "") or "").strip()
+    local = runtime in _MONITOR_LOCAL_IMPLS
+    if local:
+        # 短名留空（此刻在跑的不是它，不能当运行结果显示），但**必须**在 ⓘ 里
+        # 交代配置里的模型去哪了，否则第二列只剩一个 mock，用户分不清是配置丢了
+        # 还是被降级了。model 为空也要说："未配置"本身就是一种需要看见的配置状态
+        # （本项目的 embedding 就长期没配 model，静默省掉 ⓘ 等于把那行留成哑巴）。
+        # 唯一无话可说的是配置里写的就是 mock：那没有"配置 vs 实际"的落差。
+        if model == runtime:
+            return "", ""
+        who = (f"{_MODEL_NOUN[key]}{model}" if model
+               else f"未配置{_MODEL_NOUN[key].strip()}")
+        return "", (f"{who}，当前实际运行 {runtime}"
+                    "（本地替身，未连接外部模型服务）")
+    if not model:
+        return "", ""
+    if key == "embedding":
+        dim = getattr(cfg, "dim", 0)
+        title = f"向量模型 {model}"
+        if dim:
+            title += f" · 输出维度 {dim}（须与向量库 collection 一致）"
+        return model, title
+    # LLM 按 task 路由到三个模型：只报主模型容易被读成"改写/摘要没生效"
+    rewrite = str(getattr(cfg, "rewrite_model", "") or "").strip()
+    summary = str(getattr(cfg, "summary_model", "") or "").strip()
+    return model, (f"主模型 {model} · 改写 {rewrite or '同主模型'}"
+                   f" · 摘要 {summary or '同主模型'}")
 
 
 async def _monitor_probe(adapter) -> dict:
@@ -839,27 +946,28 @@ async def _monitor_probe_redis(c: ServiceContainer) -> dict:
 
 
 def _monitor_service_specs(c: ServiceContainer) -> tuple:
-    """(监控键, 中文名, 分组, 配置段, 适配器实例) —— 顺序即页面顺序"""
+    """(监控键, 中文名, 分组, 配置段, 适配器实例) —— 顺序即页面顺序
+
+    中文名一律**只写到槽位**（不带方言也不带括号别名）：实现名由同一行的 badge
+    按**实际运行**的实现给出，标题再拼一份就是多余的第二口径。槽位名才是这一行
+    稳定的身份 —— 底下的实现换成别的产品、或降级成本地替身，标题都还是
+    「元数据库」，而 badge 会如实改名。
+    """
     cfg = c.config
     return (
         ("llm", "LLM 大模型", "core", cfg.llm, c.llm),
-        ("embedding", "向量模型 (Embedding)", "core", cfg.embedding, c.embedding),
-        ("mysql_meta", "元数据库 (MySQL)", "core", cfg.mysql_meta, c.meta),
-        ("storage", "对象存储", "core", cfg.storage, c.storage),
-        ("auth", "认证服务", "core", cfg.auth, c.auth),
-        ("synonym", "同义词表", "core", cfg.synonym, c.synonym),
-        ("vector_store",
-         _VECTOR_LABELS.get(str(cfg.vector_store.adapter), "向量库"),
-         "retrieval", cfg.vector_store, c.vector),
-        ("fulltext",
-         _MONITOR_FULLTEXT_LABELS.get(str(cfg.fulltext.adapter), "全文检索"),
-         "retrieval", cfg.fulltext, c.fulltext),
-        ("knowledge_graph",
-         _MONITOR_GRAPH_LABELS.get(str(cfg.knowledge_graph.adapter), "知识图谱"),
-         "retrieval", cfg.knowledge_graph, c.graph),
-        ("business_data", "业务数据 (SQL)", "retrieval",
+        ("embedding", "向量模型", "core", cfg.embedding, c.embedding),
+        ("meta", "元数据库", "core", cfg.meta, c.meta),
+        ("fulltext", "全文检索", "retrieval", cfg.fulltext, c.fulltext),
+        ("vector_store", "向量库", "retrieval", cfg.vector_store, c.vector),
+        ("knowledge_graph", "知识图谱", "retrieval",
+         cfg.knowledge_graph, c.graph),
+        ("business_data", "业务数据库", "retrieval",
          cfg.business_data, c.business),
-        ("redis", "缓存 (Redis)", "infra", cfg.redis, c.redis),
+        ("synonym", "同义词表", "retrieval", cfg.synonym, c.synonym),
+        ("storage", "对象存储", "infra", cfg.storage, c.storage),
+        ("redis", "缓存", "infra", cfg.redis, c.redis),
+        ("auth", "认证服务", "infra", cfg.auth, c.auth),
     )
 
 
@@ -870,6 +978,7 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
     async def _row(spec: tuple) -> dict:
         key, label, category, sec, adapter = spec
         enabled = bool(getattr(sec, "enabled", True))
+        retry = None
         if adapter is None:
             if not enabled:
                 message = "已禁用（配置未启用）"
@@ -883,18 +992,53 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
             result = await _monitor_probe_redis(c)
         else:
             result = await _monitor_probe(adapter)
+        # 运行期掉线（实例还在、只是探不通）→ 把探测结论写回容器
+        # （实例已被摘掉的走上面 "未初始化" 分支：那是部署期结论，不在此列）
+        # 不登记的话，这一行只会红着不动：degraded 里没有它，_recovery_candidate()
+        # 两个条件都不成立 → 后台自愈永远跳过它，向量路也照旧算可用（见
+        # container._vector_model_ready）。登记之后这一行才会自愈、检索路才会跟着关。
+        if (enabled and not cfg.noconnection and result["probe"] == "live"
+                and not result["online"]):
+            c.mark_section_down(key, label, str(result["message"] or ""))
+        # 后台自愈的重试进度：失联的段由它接手，把「试了几次、最近一次什么时候」
+        # 报出来。否则用户看到状态长时间不变，只会以为程序根本没在管，
+        # 又得靠重启/重存配置去猜。
+        if (not result["online"] and enabled and not cfg.noconnection
+                and key in RECOVERABLE_SECTIONS):
+            stat = (c.recovery_stats or {}).get(key)
+            if stat and stat.get("attempts"):
+                last = datetime.fromtimestamp(stat["lastAt"]).astimezone()
+                retry = {
+                    "attempts": int(stat["attempts"]),
+                    "at": last.isoformat(timespec="seconds"),
+                    "atText": last.strftime("%H:%M:%S"),
+                    "intervalSec": int(RECOVER_INTERVAL_SEC),
+                }
         # 配置名 ≠ 运行名：降级后实例已经换成 mock/memory，
         # 展示必须读运行名，否则会把本地 mock 当成真实外部服务汇报。
         configured = str(getattr(sec, "adapter", "") or "")
         runtime = AdapterRegistry.name_of(key, adapter) or configured
+        # 缓存（Redis）是唯一不进注册表的槽位：只有一个实现，配置段里也就没有
+        # adapter 字段可选（见 RedisConfig），于是上面两句双双取空 → 第二列成了
+        # 全表唯一一格 '—'，与其它行"实例不在，就报配置里那个注册名"的规则不一致。
+        # 固定报 redis：它确实是外部依赖（不在 _MONITOR_LOCAL_IMPLS 里，徽章照常
+        # 按"真实实现"上色），而这个短名正是配置页与日志里对它的称呼。
+        if key == "redis" and not runtime:
+            runtime = "redis"
+        # 标题不拼方言：badge 已经按运行名给出实现，标题只保留槽位名（见
+        # _monitor_service_specs）。两条信息各自只有一个出处，就不会打架。
+        # 模型名同样只认运行名：降级成 mock 时它必须消失，不能把配置里的
+        # 真实模型名挂在演示实现旁边（同 badge 的道理）
+        model, model_title = _monitor_model(key, sec, runtime)
         endpoint = _monitor_endpoint(key, sec)
-        if runtime in _MONITOR_NETWORK_FREE_LOCALS:
-            endpoint = "—"
-        elif adapter is None and enabled:
-            # 该启用却没连上（如 noconnection 跳过 Redis）：把配置里的地址
-            # 摆在端点列会读成"已连到这个实例"，故隐去；未启用的则保留，
-            # 那正是「配了什么但被关掉了」的有用信息。
-            endpoint = "—"
+        # 端点一律报「配置里写了什么」，只把"此刻是不是它"另标一位。
+        # 降级成替身（milvus→memory）、未启用、演示模式跳过、未初始化 —— 都只是
+        # "没用它"，不是"没配"：地址抹掉就等于把排障要核对的第一项藏起来。
+        # 误读风险由文字承担（前端把它写成「配置端点（当前未使用）」），
+        # 不再靠隐藏信息来避免 —— 那是拿"看不到"换"不会误读"。
+        endpoint_in_use = bool(
+            enabled and adapter is not None
+            and runtime not in _MONITOR_NETWORK_FREE_LOCALS)
         reason = next((c.degraded[k]
                        for k in SECTION_DEGRADED_KEYS.get(key, (key,))
                        if k in c.degraded), "")
@@ -902,7 +1046,13 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
             "key": key, "label": label, "category": category,
             "adapter": runtime,
             "configuredAdapter": configured,
+            # 显示模型名还是注册名，由前端按"有没有模型名"决定，后端不再另发
+            # 开关字段：同一件事有两个出处，迟早会打架
+            "model": model,
+            "modelTitle": model_title,
             "endpoint": endpoint,
+            # 端点仍是"配置值"还是"此刻在用的地址"：由前端决定措辞
+            "endpointInUse": endpoint_in_use,
             "enabled": enabled,
             "probe": result["probe"],
             "online": result["online"],
@@ -911,6 +1061,7 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
             "localImpl": runtime in _MONITOR_LOCAL_IMPLS,
             "degraded": bool(reason),
             "degradedReason": reason,
+            "retry": retry,
         }
 
     services = list(await asyncio.gather(*(_row(s)
@@ -944,6 +1095,11 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
                                   .astimezone().isoformat(timespec="seconds"),
             "uptimeSeconds": int(time.time() - _MONITOR_STARTED_AT),
         },
+        # 后台自愈开关与节奏：文案由服务端给，免得前端把 30 秒写死后与后端漂移
+        "recovery": {
+            "enabled": not bool(cfg.noconnection),
+            "intervalSec": int(RECOVER_INTERVAL_SEC),
+        },
         "summary": {
             "total": len(services),
             "enabledTotal": len(active),
@@ -970,7 +1126,8 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
                             for p in enabled_paths],
                 "live": [{"name": p, "description": _PATH_DESC.get(p, p)}
                          for p in live_paths],
-                "lost": [{"name": p, "description": _PATH_DESC.get(p, p)}
+                "lost": [{"name": p, "description": _PATH_DESC.get(p, p),
+                          "reason": _lost_path_reason(c, p)}
                          for p in lost_paths],
             },
             "ingest": dict(_queue_view(c), concurrency=cfg.ingest.concurrency,
@@ -1266,7 +1423,7 @@ def _local_models_root(request: Request) -> Path:
 # 背景（TS-014）：历史上"测试连接"通过而保存后自检报不可达，根因是两条链路的
 # 超时预算不一致（探测无预算、自检 6s），叠加服务端 skip_name_resolve=OFF 导致
 # 每个新连接要等满一次反向 DNS（实测 10s）。现在：
-#   ① 预算统一到 mysql_meta.HEALTH_BUDGET_SEC，两条链路共用同一个常量；
+#   ① 预算统一到 meta_mysql.HEALTH_BUDGET_SEC，两条链路共用同一个常量；
 #   ② 探测一律**真实建连**，不复用任何缓存的引擎/空闲连接 —— 页面上的
 #      "测试连接"必须反映此刻服务端的真实状态（服务端刚修好或刚宕机，
 #      点一下就看得出来），而不是把一条早就建好的连接报成"正常"。
@@ -1285,10 +1442,10 @@ async def _probe_mysql_with_form(c: ServiceContainer,
     这里每次都用表单当前值**新建适配器并真实建连**：复用连接会让"测试连接"
     报出早已离开服务端的旧连接状态（服务端刚修改配置、刚宕机都看不出来）。
     """
-    from rag.adapters.mysql_meta import MySQLMetaStore
-    base = getattr(c.config, "mysql_meta", None)
+    from rag.adapters.meta_mysql import MySQLMetaStore
+    base = getattr(c.config, "meta", None)
     if base is None:
-        return False, "当前配置缺少 mysql_meta 段，无法测试", False
+        return False, "当前配置缺少 meta 段，无法测试"
     overrides: dict = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -1671,9 +1828,10 @@ async def health_test(request: Request,
             message = f"连接失败: {str(e)[:150]}"
     else:
         # 服务依赖：kind → 容器属性
-        attr_map = {"mysql_meta": "meta", "vector_store": "vector",
+        attr_map = {"meta": "meta", "mysql_meta": "meta",
+                    "vector_store": "vector",
                     "knowledge_graph": "graph", "business_data": "business",
-                    "meta": "meta", "vector": "vector", "graph": "graph",
+                    "vector": "vector", "graph": "graph",
                     "business": "business", "fulltext": "fulltext",
                     "storage": "storage", "synonym": "synonym",
                     "llm": "llm", "embedding": "embedding"}

@@ -75,13 +75,13 @@
 │  │ 两阶段写入        │         │ Prompt组装        │   │
 │  └──────────────────┘         └──────────────────┘   │
 │                                                       │
-│  共享：MemoryManager | AdapterRegistry | MySQLMeta    │
+│  共享：MemoryManager | AdapterRegistry | MetaStore   │
 └────────────────────────┬──────────────────────────────┘
                          │  标准接口契约
 ┌────────────────────────▼──────────────────────────────┐
 │                   适配器接口层                          │
 │  LLM │ Embedding │ VectorStore │ FullTextSearch        │
-│  MySQLMeta │ DocParser │ KnowledgeGraph │ BusinessData │
+│  MetaStore │ DocParser │ KnowledgeGraph │ BusinessData │
 │  Synonym │ Auth │ Storage │ EntityLinker               │
 └────────────────────────┬──────────────────────────────┘
                          │
@@ -630,7 +630,7 @@ KW_EXACT 和 BM25 同为 ES，但查询语义根本不同：前者不分词（�
 
 **MySQL 元数据适配器**：独立于业务数据适配器，专门管理系统自身的元数据。核心方法包括：文档和 Chunk 元数据的 upsert/查询，元数据过滤查询（`query_chunk_ids`，返回符合条件的 chunk_id 白名单），入库任务的 CRUD，一致性巡检辅助查询。自动建表（DDL 幂等，首次启动时执行）。
 
-**Embedding 适配器**将文本转化为固定维度的向量表示，支持批量处理，并为 BGE 系列模型提供查询前缀注入（显著提升检索效果）。入库和检索必须使用完全相同的适配器实例，以确保向量空间的一致性。
+**Embedding 适配器**将文本转化为固定维度的向量表示，支持批量处理，并为 BGE 系列模型提供查询前缀注入（显著提升检索效果）。入库和检索必须使用完全相同的适配器实例，以确保向量空间的一致性；但"同一实例"只能覆盖单个进程内的情形，换过向量模型、演示期写入过伪向量等跨进程/跨版本的场景仍需另判。因此框架会把当前向量空间指纹（实现 + 模型 + 维度 + 真实/本地替身）写入向量库的集合属性，并在启动自检、配置热应用、入库写向量与检索前各比对一次：指纹不一致即停写并关闭该集合的向量检索路，宁可少查一路，也不把同维但不同源的向量混进同一个集合（详见 TS-022）。
 
 **向量库适配器**封装向量数据库的写入、检索、删除操作，支持基于元数据的过滤条件（权限、时间范围、所属 collection），并能按 doc_id 批量删除（知识更新时使用）。内置 Milvus、Qdrant、pgvector 三种实现。
 
@@ -660,7 +660,7 @@ KW_EXACT 和 BM25 同为 ES，但查询语义根本不同：前者不分词（�
 | Embedding      | http_embedding / openai_embedding | ✓        | 向量化                   |
 | VectorStore    | milvus / qdrant / pgvector        | ✓        | 语义检索                 |
 | FullTextSearch | elasticsearch / opensearch        | ✓        | BM25 检索                |
-| MySQLMeta      | mysql_meta                        | ✓        | 元数据过滤 / 任务管理    |
+| MetaStore      | mysql / memory                    | ✓        | 元数据过滤 / 任务管理    |
 | DocParser      | pdf / docx / image                | ✓        | 文档解析                 |
 | BusinessData   | sqlalchemy                        | ✓        | NL2SQL                   |
 | KnowledgeGraph | neo4j / nebula                    | ✓        | 关系推理                 |
@@ -1021,7 +1021,7 @@ IngestionCoordinator 将写入过程分为两阶段：
 │  VectorStore → Milvus    FullTextSearch → Elasticsearch           │
 │    kw_exact子字段（精确）                                          │
 │    text字段（BM25）                                                │
-│  MySQLMeta → MySQL元数据库   EntityLinker → 规范名映射             │
+│  MetaStore → 元数据库(MySQL) EntityLinker → 规范名映射             │
 │  DocParser → 各格式解析器    KnowledgeGraph → Neo4j/NebulaGraph    │
 │  BusinessData → 业务库      Auth → SSO/LDAP    Storage → MinIO    │
 └────────────────────────────────────────────────────────────────────┘

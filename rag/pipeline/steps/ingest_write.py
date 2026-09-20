@@ -130,6 +130,18 @@ class EmbedStep(PipelineStep):
     async def execute(self, ctx: IngestContext) -> None:
         if not ctx.chunks or ctx.services.vector is None:
             return
+        # 向量空间门禁：该集合里已有另一套向量空间的向量时**不写**（见
+        # rag/vector_space.py）。必须在这里"有意跳过"而不是让适配器报错：
+        # 抛出去会被记成写入失败 → 文档 PARTIAL、质量报告挂一条假故障。
+        # 跳过之后 ctx.embeddings 为空，写阶段自然不碰向量库（cp.milvus 保持
+        # False），verify 也会跳过 —— 这条链路上"没写"与"写失败"始终可区分。
+        blocked = await ctx.services.vector_write_blocked(ctx.doc.collection)
+        if blocked:
+            ctx.meta["vector_space_blocked"] = blocked
+            log.warning("embed_skipped_vector_space", doc_id=ctx.doc.doc_id,
+                        collection=ctx.doc.collection, reason=blocked[:200])
+            await ctx.report("embedding", 0.6, f"已跳过向量化：{blocked[:120]}")
+            return
         # 收集所有非父块 (chunk_id, text)
         items = [(c.chunk_id, ctx.chunk_texts[i])
                  for i, c in enumerate(ctx.chunks) if not c.is_parent]

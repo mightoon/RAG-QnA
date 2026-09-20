@@ -9,7 +9,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
+
+
+# ═══════════════════════════════════════════════════════════
+# 历史命名别名（改名时的兼容层）
+# ═══════════════════════════════════════════════════════════
+#
+# 元数据库段曾叫 mysql_meta，适配器注册名也叫 mysql_meta —— 槽位与实现同名，
+# 监控页的 badge（显示注册名）因此只能写出 "mysql_meta"：读者既看不出
+# 后端是哪个数据库，也看不出它是不是本地替身。
+# 现统一为：配置段 meta、适配器槽位 meta、注册名 mysql。
+#
+# 兼容口径：存量 YAML 与前端缓存里的旧键一律仍可读（loader 改段名 +
+# 字段别名 + adapter 值归一），下一次保存即以新键回写，旧键自然消失。
+LEGACY_SECTION_ALIASES: dict[str, str] = {"mysql_meta": "meta"}
+LEGACY_ADAPTER_ALIASES: dict[str, str] = {"mysql_meta": "mysql"}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -77,8 +92,13 @@ class FullTextConfig(BaseModel):
     # 连接问题，只会让「测试连接」与运行期自检各说各话（见 TS-015）
 
 
-class MySQLConfig(BaseModel):
-    adapter: str = "mysql_meta"
+class MetaStoreConfig(BaseModel):
+    """元数据库（配置段 meta）连接配置
+
+    字段按 MySQL 形状定义，由适配器解释：注册名 mysql 直接使用这组字段；
+    将来接入别的元数据库后端时，新增字段由对应适配器读取，段名不必再改。
+    """
+    adapter: str = "mysql"                  # mysql / memory
     enabled: bool = True
     host: str = "localhost"
     port: int = 3306
@@ -88,9 +108,16 @@ class MySQLConfig(BaseModel):
     charset: str = "utf8mb4"
     auto_create_tables: bool = True
     # 注：连接池容量 / 建连超时 / 健康检查预算**不是用户配置项**，
-    # 统一由 rag/adapters/mysql_meta.py 的模块常量管理（POOL_SIZE /
+    # 统一由 rag/adapters/meta_mysql.py 的模块常量管理（POOL_SIZE /
     # CONNECT_TIMEOUT_SEC / HEALTH_BUDGET_SEC）—— 用户不需要、也不应
     # 通过调它们来解决连接问题（见 TS-014）
+
+    @field_validator("adapter")
+    @classmethod
+    def _normalize_adapter(cls, v: str) -> str:
+        """历史注册名 mysql_meta → mysql（存量配置无需手工改）"""
+        name = str(v or "").strip()
+        return LEGACY_ADAPTER_ALIASES.get(name, name)
 
 
 class RedisConfig(BaseModel):
@@ -297,7 +324,10 @@ class AppConfig(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     fulltext: FullTextConfig = Field(default_factory=FullTextConfig)
-    mysql_meta: MySQLConfig = Field(default_factory=MySQLConfig)
+    # 元数据库：段名 meta（历史名 mysql_meta 仍可读，见 LEGACY_SECTION_ALIASES）
+    meta: MetaStoreConfig = Field(
+        default_factory=MetaStoreConfig,
+        validation_alias=AliasChoices("meta", "mysql_meta"))
     redis: RedisConfig = Field(default_factory=RedisConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     knowledge_graph: KnowledgeGraphConfig = Field(default_factory=KnowledgeGraphConfig)

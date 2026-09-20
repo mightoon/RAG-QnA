@@ -47,7 +47,7 @@ try:
                     {'key': 'max_tokens', 'value': '1024', 'type': 'int'},
                 ]}],
             'serviceGroups': [{
-                'key': 'mysql_meta',
+                'key': 'meta',
                 'configParams': [
                     {'key': 'host', 'value': '127.0.0.1', 'type': 'str'},
                     {'key': 'port', 'value': '3306', 'type': 'int'},

@@ -15,9 +15,27 @@ from typing import Any
 
 import yaml
 
-from .models import AppConfig
+from .models import LEGACY_SECTION_ALIASES, AppConfig
 
 _ENV_PATTERN = re.compile(r"\$\{([^}^{]+)\}")
+
+
+def _migrate_legacy_sections(raw: dict) -> dict:
+    """历史段名 → 现段名（mysql_meta → meta），就地改写并返回
+
+    存量的 customer_config.yaml 与浏览器里缓存的老配置都还带着旧键，
+    必须继续能读；这里改键之后，配置页下一次保存就会以新键回写，
+    旧键自然消失 —— 用户不必手工编辑配置文件。
+    新键已存在时以新键为准，旧键视为残留直接丢弃。
+    """
+    if not isinstance(raw, dict):
+        return raw
+    for old, new in LEGACY_SECTION_ALIASES.items():
+        if old in raw:
+            block = raw.pop(old)
+            if new not in raw:
+                raw[new] = block
+    return raw
 
 _SENSITIVE_FIELDS = {
     "api_key", "password", "secret_key", "jwt_secret",
@@ -55,7 +73,7 @@ def load_config(path: str | Path = "customer/customer_config.yaml") -> AppConfig
         return cfg
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
-    raw = _interpolate_env(raw)
+    raw = _migrate_legacy_sections(_interpolate_env(raw))
     cfg = AppConfig(**raw)
     cfg._config_path = str(path)
     return cfg
@@ -109,7 +127,11 @@ class ConfigLoader:
             with open(self._path, "r", encoding="utf-8") as f:
                 raw = yaml.safe_load(f) or {}
 
-        merged = _deep_merge(raw, updates)
+        # 旧段名迁移：文件里的旧键与本次更新都先归一到新键，否则写回的文件
+        # 会同时留着 mysql_meta 与 meta 两段，下一次加载以 meta 为准、
+        # 旧段却一直在文件里误导读者
+        raw = _migrate_legacy_sections(raw)
+        merged = _deep_merge(raw, _migrate_legacy_sections(dict(updates)))
         if preserve_sensitive:
             _restore_sensitive(raw, updates, merged)
 

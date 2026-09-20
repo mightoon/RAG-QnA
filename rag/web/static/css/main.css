@@ -212,7 +212,6 @@ table.params-table input[type=checkbox]{width:16px;height:16px}
 .stat-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-md);padding:16px 20px}
 .stat-card-label{font-size:var(--fs-xs);color:var(--text-tertiary)}
 .stat-card-value{font-size:var(--fs-2xl);font-weight:var(--fw-bold);margin-top:4px}
-.stat-card-sub{font-size:var(--fs-xs);color:var(--text-tertiary);margin-top:2px}
 .stat-card-value.ok{color:var(--success)}
 .stat-card-value.warn{color:var(--warning)}
 .stat-card-value.error{color:var(--error)}
@@ -664,21 +663,26 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .monitor-block{margin-bottom:var(--space-4)}
 .monitor-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
 .monitor-svc-list{display:flex;flex-direction:column}
-/* 三列最小宽合计 140+86+52+2*8=294px：基础服务列已改为纵向单列铺满，这个下限
-   留作窄屏保险 —— 再窄时端点列先被省略号截断，也不会把整行顶出卡片 */
-.monitor-svc{display:grid;grid-template-columns:minmax(140px,1.6fr) minmax(86px,1fr) 52px;
+/* 三列最小宽合计 150+120+60+2*8=346px：第一列组件名（必要时代「降级」徽章）、
+   第二列注册名（LLM / 向量模型显示模型名）与它的 ⓘ、第三列耗时。基础服务列已
+   改为纵向单列铺满，这个下限留作窄屏保险 —— 再窄时第二列先被截断，也不会把
+   整行顶出卡片 */
+.monitor-svc{display:grid;grid-template-columns:minmax(150px,1.3fr) minmax(120px,1fr) 60px;
   gap:8px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)}
 .monitor-svc:last-child{border-bottom:none}
 .monitor-svc-main{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
+/* 组件名做成单行省略号盒子（防长名字撑破列），代价是它**不能**再塞绝对定位的
+   气泡：overflow:hidden 会把 .info-pop 的内容一起裁掉，点开就是空的。行内说明
+   一律挂在它外面的 .monitor-svc-main 上（见 monitor.js serviceRow）。 */
 .monitor-svc-name{font-size:var(--fs-sm);font-weight:var(--fw-medium);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.monitor-svc-endpoint{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-tertiary);
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 注册名列：统一一枚 badge（有模型名显示模型名）+ 它的 ⓘ（端点等口径收进气泡，
+   不再单独占一列）。这一列不做 overflow:hidden —— 里面的 ⓘ 气泡是绝对定位的，
+   裁掉祖先等于把气泡内容一起裁掉（点开是空的，DOM 里却什么都在）。 */
+.monitor-svc-reg{display:flex;align-items:center;gap:6px;min-width:0}
+.monitor-svc-none{font-size:var(--fs-xs);color:var(--text-tertiary)}
 .monitor-svc-latency{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-secondary);
   text-align:right;white-space:nowrap}
-.monitor-svc-note{grid-column:1/-1;font-size:var(--fs-xs);color:var(--warning);
-  line-height:1.5;margin-top:-2px}
-.monitor-svc-note.info{color:var(--text-tertiary)}
 .monitor-kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px 20px}
 .monitor-kv-label{font-size:var(--fs-xs);color:var(--text-tertiary)}
 .monitor-kv-value{font-size:var(--fs-sm);font-weight:var(--fw-medium);margin-top:2px;word-break:break-all}
@@ -690,14 +694,38 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
   line-height:1.7}
 .monitor-degraded-list b{color:var(--warning);font-weight:var(--fw-semibold)}
 
+/* ── 运行监控页：行内说明（ⓘ）──
+   点击展开、鼠标移出（或点空白 / Esc）收起：口径说明不常驻版面。
+   靠右的方块居中展开会顶出视口，故 pop-right / pop-left 改贴边对齐。 */
+.info-wrap{position:relative;display:inline-flex;align-items:center;margin-left:5px;
+  vertical-align:middle;font-weight:var(--fw-normal)}
+.info-dot{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
+  border-radius:50%;border:1px solid var(--border-strong);color:var(--text-tertiary);
+  font-size:10px;font-weight:var(--fw-bold);font-style:normal;line-height:1;cursor:pointer;
+  user-select:none;transition:color var(--anim-fast),border-color var(--anim-fast),background var(--anim-fast)}
+.info-dot:hover{color:var(--primary);border-color:var(--primary)}
+.info-dot:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+/* 「这条是在报问题」与「这条只是口径说明」在收起状态下必须能分辨：十一个灰 ⓘ
+   里混着一两条故障原因，不区分就没人会去点（以前黄字常驻时才看得见） */
+.info-wrap.warn .info-dot{border-color:var(--warning);color:var(--warning)}
+.info-wrap.warn .info-dot:hover{color:var(--primary);border-color:var(--primary)}
+.info-wrap.open .info-dot{background:var(--primary);border-color:var(--primary);color:#fff}
+.info-pop{display:none;position:absolute;top:calc(100% + 6px);left:50%;transform:translateX(-50%);
+  z-index:80;width:max-content;max-width:min(320px,calc(100vw - 56px));padding:8px 10px;
+  background:var(--bg-surface);color:var(--text-secondary);border:1px solid var(--border);
+  border-radius:var(--radius-sm);box-shadow:var(--shadow-md);font-size:var(--fs-xs);
+  font-weight:var(--fw-normal);line-height:1.6;letter-spacing:0;white-space:normal;text-align:left}
+/* 图标与气泡之间的空隙也要能接住指针，否则鼠标一移出图标气泡就收了 */
+.info-pop::before{content:"";position:absolute;top:-6px;left:0;right:0;height:6px}
+.info-wrap.open .info-pop{display:block}
+.info-wrap.pop-right .info-pop{left:auto;right:0;transform:none}
+.info-wrap.pop-left .info-pop{left:0;right:auto;transform:none}
+
 /* ── 监控页：Tab 与指标图表 ── */
 .monitor-tabs{margin-bottom:var(--space-4)}
 /* 基础服务 / 指标图表两个 tab 内的卡片纵向单列排列：横向并排时每列会被压到
    300px 出头，端点与说明频繁折行，纵向铺满反而更好读 */
 .monitor-groups-vertical{grid-template-columns:minmax(0,1fr)}
-.stat-card-link{cursor:pointer;transition:border-color var(--anim-fast) var(--anim-ease),
-  box-shadow var(--anim-fast) var(--anim-ease)}
-.stat-card-link:hover{border-color:var(--warning);box-shadow:var(--shadow-sm)}
 
 .mchart-bars{display:flex;flex-direction:column;gap:10px}
 .mchart-bar-row{display:grid;grid-template-columns:minmax(120px,1.4fr) minmax(80px,3fr) 72px;

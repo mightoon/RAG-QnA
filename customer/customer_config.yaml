@@ -17,9 +17,9 @@ llm:
   max_concurrency: 8
 embedding:
   adapter: http_embedding
-  base_url: ''
+  base_url: http://192.168.100.237:8000/v1
   api_key: ''
-  model: ''
+  model: qwen3-embed-0.6b
   dim: 1024
   batch_size: 32
   query_prefix: ''
@@ -41,8 +41,8 @@ fulltext:
   password: ''
   index_prefix: rag_
   verify_certs: false
-mysql_meta:
-  adapter: mysql_meta
+meta:
+  adapter: mysql
   enabled: true
   host: 192.168.100.239
   port: 3306

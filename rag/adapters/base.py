@@ -128,6 +128,31 @@ class VectorStoreAdapter(ABC):
     async def health_check(self) -> bool:
         return True
 
+    # ── 向量空间指纹（可选能力，判据在 rag/vector_space.py）──────────
+    # 一个 collection 里的向量必须来自同一个向量空间（同一实现 + 同一模型 +
+    # 同一维度），否则 ANN 会静默返回同维但不同源的噪声，见该模块开头。
+    # 载体自选：Milvus 用 collection properties（建集合之后仍可写，description
+    # 不行）。**未实现**的适配器保持 space_tag_supported = False —— 容器会据此
+    # 如实说明"无法校验"，而不是假装校验通过。
+
+    space_tag_supported: bool = False
+
+    async def read_space_tag(self, collection: str) -> str | None:
+        """读该集合记录的空间指纹（无 / 不支持 → None）"""
+        return None
+
+    async def write_space_tag(self, collection: str, tag: str) -> bool:
+        """把指纹写到集合上（成功 → True；载体不支持/写失败 → False，不抛异常）"""
+        return False
+
+    async def collection_rows(self, collection: str) -> int | None:
+        """集合内的向量条数（判"空集合"用）；读不到返回 None
+
+        None 与 0 必须区分：0 = 确认是空集合（可安全打标/放行），None = 拿不准
+        （按"可能有数据"保守处理，见 vector_space.judge_space）。
+        """
+        return None
+
 
 # ═══════════════════════════════════════════════════════════
 # FullTextSearch
@@ -185,13 +210,13 @@ class FullTextSearchAdapter(ABC):
 
 
 # ═══════════════════════════════════════════════════════════
-# MySQLMeta
+# MetaStore（元数据库）
 # ═══════════════════════════════════════════════════════════
 
-class MySQLMetaAdapter(ABC):
+class MetaStoreAdapter(ABC):
     """
-    元数据库适配器：文档/Chunk/表格/任务/批次/反馈/画像的 CRUD，
-    以及元数据前置过滤（query_chunk_ids 白名单）。
+    元数据库适配器（注册类型 meta）：文档/Chunk/表格/任务/批次/反馈/画像的
+    CRUD，以及元数据前置过滤（query_chunk_ids 白名单）。
     首次启动自动建表（DDL 幂等）。
     """
 

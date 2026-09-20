@@ -131,10 +131,11 @@ cb_IQA_platform/
 └── rag/                          # 平台代码
     ├── models.py                 # 全部 Pydantic 数据模型
     ├── container.py              # ServiceContainer 依赖装配
+    ├── vector_space.py           # 向量空间指纹（防"同维不同源"向量混库）
     ├── config/                   # 配置模型 + 加载器（${ENV:-default} 插值）
     ├── adapters/                 # 适配器层（11 类 + Registry）
     │   ├── llm.py  embedding.py  vector_store.py  fulltext.py
-    │   ├── mysql_meta.py  storage.py  knowledge_graph.py
+    │   ├── meta_mysql.py  storage.py  knowledge_graph.py
     │   ├── business_data.py  synonym.py  auth.py  doc_parser.py
     │   └── base.py  registry.py
     ├── pipeline/
@@ -263,8 +264,8 @@ fulltext:                          # Elasticsearch
   hosts: [${ES_HOST:-http://localhost:9200}]
   index_prefix: rag_
 
-mysql_meta:                        # 元数据库
-  adapter: mysql_meta
+meta:                              # 元数据库（文档/Chunk/任务/反馈等）
+  adapter: mysql                   # 内存替身：memory
   enabled: true
   host: ${MYSQL_HOST:-localhost}
   port: 3306
@@ -289,7 +290,7 @@ storage:                           # 原文件存储
   # local_root: ./data/files
 ```
 
-> **必需组件**（llm / embedding / mysql_meta / auth / storage）连接失败 → 启动报 `CoreDependencyError` 并退出；
+> **必需组件**（llm / embedding / meta / auth / storage）连接失败 → 启动报 `CoreDependencyError` 并退出；
 > **可选组件**（vector_store / fulltext / graph / business / redis）失败 → 仅告警降级。
 
 #### 可选检索组件
