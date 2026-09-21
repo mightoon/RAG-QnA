@@ -104,6 +104,22 @@
     state.dirty = JSON.stringify(state.config) !== state.baseline;
   }
 
+  /* 某个模块倒回上次落盘的那一套（「放弃修改」）：从基线里把这一块整体取回来。
+     基线就是"这个模块已保存/已认可"的值 —— markSaved() 在入库、切换选中、激活等
+     操作后都会把它同步过去，所以取基线即取用户上次认可的那套配置（模型卡片上是
+     "当前生效的配置"或"点开的那条库条目"）。
+     只动本模块，别的模块的未保存改动不受牵连（与保存同一粒度）。 */
+  function restoreModule(paths) {
+    let base;
+    try {
+      base = JSON.parse(state.baseline);
+    } catch (e) { return false; }
+    (Array.isArray(paths) ? paths : [paths])
+      .forEach(p => _patch(state.config, base, p));
+    state.dirty = JSON.stringify(state.config) !== state.baseline;
+    return true;
+  }
+
   /* ── 单模块保存载荷 ── */
   function groupScope(g) {
     return g.saveScope || g.tab || 'special';
@@ -118,9 +134,9 @@
   function groupPayload(g) {
     const scope = groupScope(g);
     if (scope === 'model') {
-      return { modelProviders: [{ key: g.key, endpoint: g.endpoint,
-                                  paramsJson: g.paramsJson,
-                                  configParams: g.configParams || [] }] };
+      // 模型段不再走"整段覆盖"保存（见 upsertModel）：后端也会拒收这类载荷，
+      // 在这里就挡住，免得走到接口才失败
+      throw new Error('模型配置走模型库接口保存（ConfigData.upsertModel）');
     }
     if (scope === 'service') {
       return { serviceGroups: [{ key: g.key, paramsJson: g.paramsJson || {},
@@ -136,17 +152,73 @@
     return res;
   }
 
+  /* ── 模型库（模型 tab）──
+     库 = 这一段里所有「已测通」的配置；active 的那一条就是运行参数（后端
+     models._sync_model_library 会把顶层字段按它重写）。三个操作都直接落盘并热
+     应用，返回该段最新的库视图与 active 条目 —— 前端据此同时刷新左列表与右表单。 */
+  function _applyLibrary(section, res) {
+    const g = (state.config.modelProviders || []).find(x => x.key === section);
+    if (!g) return null;
+    g.library = res.library;
+    // 右侧表单显示的就是"当前生效的配置"：只有 agent 条目变了它才该变
+    if (res.active) {
+      g.endpoint = res.active.endpoint;
+      // 只取第一个：它是这条配置调用的那个，也是表单「模型ID」框该显示的值
+      g.modelIds = (res.active.modelIds || []).slice(0, 1);
+      g.configParams = JSON.parse(JSON.stringify(res.active.configParams || []));
+    }
+    markSaved(['model:' + section]);   // 服务端已落盘：同步本模块基线，别亮"未保存"
+    return g;
+  }
+
+  /* 存入模型库：body = {id, endpoint, configParams, verified, activate}
+     id 为空 = 新增，非空 = 更新那一条 */
+  async function upsertModel(section, body) {
+    const res = await API.post('/api/admin/model-library/upsert',
+      Object.assign({ section: section }, body));
+    return { res: res, group: _applyLibrary(section, res) };
+  }
+
+  async function activateModel(section, id) {
+    const res = await API.post('/api/admin/model-library/activate',
+      { section: section, id: id });
+    return { res: res, group: _applyLibrary(section, res) };
+  }
+
+  async function deleteModel(section, id) {
+    const res = await API.post('/api/admin/model-library/delete',
+      { section: section, id: id });
+    return { res: res, group: _applyLibrary(section, res) };
+  }
+
   /* params：所在分组的 configParams 行（含 type），后端据此还原类型直连探测，
-     使「改了表单但还没保存」也能测到真实值，而不是已保存的旧配置 */
-  async function testConnection(kind, endpoint, apiKey, model, params) {
+     使「改了表单但还没保存」也能测到真实值，而不是已保存的旧配置。
+     模型卡片走的是"真调用"：后端拿地址 + Key + 模型ID 发一次最小请求，
+     有正确回应才算 r.online=true。
+     entryId：正在编辑的那条库条目 —— 框里的圆点没动时后端用它**这一条自己的**
+     钥匙，而不是 active 那条借来的（见 routes._effective_api_key）
+     apiKeyCleared：用户把框里那串圆点删干净了 = 主动清空，后端就按空钥匙测 */
+  async function testConnection(kind, endpoint, apiKey, model, params, entryId,
+                                apiKeyCleared) {
     return API.post('/api/admin/health/test',
       { kind, endpoint, apiKey: apiKey || '', model: model || '',
-        params: params || [] });
+        params: params || [], entryId: entryId || '',
+        apiKeyCleared: !!apiKeyCleared });
+  }
+
+  /* 「获取模型ID」：按表单里的地址 + Key 拉一次 /models，只返回候选列表，
+     不做可用性判定（那是 testConnection 的事）。列表为空也算成功 ——
+     有的服务不实现 /models，用户手填模型ID即可。Key 的回落规则同上 */
+  async function listModels(kind, endpoint, apiKey, params, entryId, apiKeyCleared) {
+    return API.post('/api/admin/model-library/list-models',
+      { kind, endpoint, apiKey: apiKey || '', params: params || [],
+        entryId: entryId || '', apiKeyCleared: !!apiKeyCleared });
   }
 
   window.ConfigData = {
     state, load, markDirty, clearDirty, groupsFor,
-    moduleDirty, markSaved, saveModule, groupScope, groupPath, groupPayload,
-    testConnection,
+    moduleDirty, markSaved, restoreModule, saveModule, groupScope, groupPath,
+    groupPayload,
+    testConnection, listModels, upsertModel, activateModel, deleteModel,
   };
 })();

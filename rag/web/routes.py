@@ -24,8 +24,11 @@ from fastapi.templating import Jinja2Templates
 
 from rag.adapters.registry import AdapterRegistry
 from rag.api.deps import get_current_user, require_admin
-from rag.config.models import LEGACY_SECTION_ALIASES
-from rag.config.secrets import MASK, SENSITIVE_KEYS, is_untouched
+from rag.config.models import (LEGACY_SECTION_ALIASES, MODEL_ENTRY_FIELDS,
+                               ModelEntry, clean_model_ids, model_param_fields,
+                               new_entry_id)
+from rag.config.secrets import (MASK, SENSITIVE_KEYS, is_display_dots,
+                                is_untouched)
 from rag.container import (
     RECOVER_INTERVAL_SEC, RECOVERABLE_SECTIONS, SECTION_DEGRADED_KEYS,
     ServiceContainer,
@@ -227,20 +230,27 @@ _DEGRADED_KEY = {
 
 # 模型域：UI 分组键（= YAML 键）→ (中文名, 可编辑扁平参数)
 # 仅展示用户需要关心的参数；timeout/并发/批大小等由代码默认值管理
-# 顺序 = 用户填写顺序：模型名 → API 地址 → 模型ID → 其余。
+# 顺序 = 用户填写顺序：模型名 → API 地址 → API Key → 模型ID → 其余。
 # display_name 排在最前：它不连任何东西，只是这张卡片的"名字"，
 # 值会同步显示在标题上（前端按 key 认它，见 config-ui.js 的 syncNameTag）。
 # API 地址（base_url）不在这张表里 —— 它是卡片上的独立控件（见 _normalize_config
-# 的 "endpoint"），由前端插到 display_name 与 model 之间。
+# 的 "endpoint"），由前端插到 display_name 与 api_key 之间。
+# api_key 排在 model 之前：填完地址与 Key 才能去服务端问"有哪些模型"
+# （前端在两者之间插一行「获取模型ID」，见 config-ui.js 的 injectModelPicker）。
 # rewrite_model 不下发到界面：它不是"必配项"，留一个空输入框只会让人以为
 # 不填就改写失效（真实行为是缺省跟随主模型）。YAML 键与字段都保留 —— 老配置里
 # 写了照旧生效，且它不在保存载荷里，保存其他项也不会把它抹掉。
 _MODEL_SECTIONS = (
     ("llm", "LLM 大模型",
-     ("display_name", "model", "api_key", "temperature", "max_tokens")),
+     ("display_name", "api_key", "model", "temperature", "max_tokens")),
     ("embedding", "向量模型 (Embedding)",
-     ("display_name", "model", "api_key", "dim", "query_prefix")),
+     ("display_name", "api_key", "model", "dim", "query_prefix")),
 )
+
+# 只有这两段有"模型库"（多套已测通的配置并存）；rerank 是本机权重目录，
+# 没有地址/凭据可存
+_MODEL_SECTION_KEYS = frozenset(k for k, _, _ in _MODEL_SECTIONS)
+_MODEL_SECTION_PARAMS = {k: params for k, _, params in _MODEL_SECTIONS}
 
 _PARAM_LABELS = {
     "base_url": "API 地址", "api_key": "API Key", "model": "模型ID",
@@ -273,6 +283,24 @@ _PARAM_LABELS = {
 #   - sensitive_fields：它是"哪些列要打码"的名字清单（business_data 的配置），
 #     本身不是凭据；当密码框会让它无法编辑，保存时还会被空值抹掉。
 _SECRET_PARAM_KEYS = SENSITIVE_KEYS
+
+# 凭据行（_param_row 的 reveal）的两种下发口径：
+#
+#   默认 —— 不下发真值，按 TS-023 只给 hasValue（存过没有）与 valueLen（存了多长），
+#   前端据此画等量圆点当"已存"的占位（占位是纯显示，不作为值回传）。服务段、以及
+#   模型段里除 api_key 之外的凭据（数据库密码、Secret Key…）都走这条。
+#
+#   reveal=True —— 下发**解密后的真值**。只有**模型段**传：模型卡片与模型库条目。
+#   因为模型卡片上的「测试模型」「获取模型ID」「存入模型库」都直接读书框里的文本，
+#   框里的内容**就是**发出去/存下来的那把钥匙。只给占位会留一个假象：用户删掉几个
+#   字符后剩下的那串圆点会被当成"没改过"、回落到这条自己的钥匙 —— 框里明明改坏了、
+#   测试却照样通过（用户报的就是这一幕）。给了真值，改坏它 = 真把钥匙改坏了，测试
+#   如实失败。代价是这把钥匙会出现在页面内存里：它是管理员自己填进去的凭据，配置台
+#   本身也是 require_admin（登录后才可达），所以只对模型段认这个代价。
+#
+# 服务段绝不传 reveal：同义词表里也有个叫 api_key 的参数，但它走的是"留空/圆点 =
+# 沿用原值"的老路，没有上面那个假象 —— 按**键名**放行会把凭据多送一份到页面，
+# 所以这里由调用点显式决定（见 _normalize_config 的模型段与 _entry_view）。
 
 # 允许留空的参数：UI 在输入框右侧标注 optional
 # （MySQL 免密账号；ES 未开启安全认证时用户名/密码都不用填）
@@ -423,11 +451,13 @@ def _service_params(sect: dict, group: str) -> list[tuple[str, object]]:
 
 
 def _param_row(k: str, v, group: str | None = None,
-               plain_value: object = None) -> dict:
+               plain_value: object = None, reveal: bool = False) -> dict:
     """标量配置项 → 前端行描述（带类型，保存时按类型还原 YAML 标量）
 
     group 用于按分组追加「可留空」标记（见 _OPTIONAL_BY_GROUP）。
     plain_value：该字段**未脱敏**的原值，只有凭据行用得上（见下方 valueLen）。
+    reveal：凭据行是否下发**解密后的真值**。只有模型段传 True（理由见上方那段注释），
+    服务段一律不传 —— 那里的凭据继续走"留空/圆点 = 沿用原值"。
     """
     if isinstance(v, bool):
         typ = "bool"
@@ -450,13 +480,17 @@ def _param_row(k: str, v, group: str | None = None,
     # 这里只给两个纯标记：hasValue（存过没有）与 valueLen（存了多长），
     # 前端据此画等量圆点（占位是纯显示，不作为值回传）；
     # 保存时留空 → 后端保留原值（见 _yaml_update_from_payload / _restore_sensitive）。
+    # 例外：reveal=True（只有模型段传）时下发**解密后的真值**，理由见上方那段注释 ——
+    # 那里框里的内容直接决定"发出去/存下来的是哪把钥匙"，占位说不清楚。
     raw = "" if v is None else str(v)
     row = {"key": k, "label": _PARAM_LABELS.get(k, k), "value": v,
            "type": typ, "editable": True,
            "optional": optional,
            "secret": secret}
     if secret:
-        row["value"] = ""
+        row["value"] = (str(plain_value)
+                        if reveal and plain_value is not None
+                        else "")
         # v 来自 _redact：有值时是 "******"，没值时保持空 —— 两种都能判出"是否已配置"
         row["hasValue"] = bool(raw.strip())
         # 位数必须取自**脱敏前**的明文：掩码恒为 6 个星号，用它的长度画点会把
@@ -481,6 +515,39 @@ def _blank_secret_masks(obj):
     return obj
 
 
+def _entry_view(section: str, e: ModelEntry, active_id: str) -> dict:
+    """模型库条目 → 前端视图（endpoint + configParams，与卡片表单同构）
+
+    刻意复用表单那套行结构（含类型 / 凭据标记）：前端的「更改」才能原样回填表单，
+    不必再写一遍字段映射 —— 少一份"两处字段名不一致"的机会。
+    """
+    flat = {"display_name": e.display_name, "base_url": e.base_url,
+            "api_key": e.api_key, "model": e.model, **e.params}
+    red = _redact(flat)          # 条目里的 api_key 同样不能明文下发
+    return {
+        "id": e.id,
+        "displayName": e.display_name or e.model or e.base_url,
+        "endpoint": e.base_url,
+        "testedAt": e.tested_at,
+        "active": bool(e.id) and e.id == active_id,
+        # [0] 是这条配置调用的那个 —— 表单里的「模型ID」输入框填的就是它
+        # （configParams 里那行 model 与它同源，见 normalize_entry_models）。
+        # 界面只摆这一个（见 config-ui.js 的模型库卡片），列表仍整体返回：
+        # 老配置里可能存过多个ID，别在接口层丢掉它们
+        "modelIds": list(e.model_ids),
+        "configParams": [_param_row(k, red.get(k), plain_value=flat.get(k),
+                                    reveal=True)
+                         for k in _MODEL_SECTION_PARAMS.get(section, ())
+                         if k in flat],
+    }
+
+
+def _library_view(section: str, entries: list, active_id: str) -> dict:
+    """一个模型段的库视图：条目（按加入顺序）+ 当前 active 的 id"""
+    return {"activeId": active_id,
+            "entries": [_entry_view(section, e, active_id) for e in entries]}
+
+
 def _normalize_config(c: ServiceContainer) -> dict:
     """AppConfig → 前端配置统一载荷（含降级状态，指导补齐配置）"""
     cfg = c.config
@@ -494,13 +561,27 @@ def _normalize_config(c: ServiceContainer) -> dict:
     for key, label, params in _MODEL_SECTIONS:
         sect = dump.get(key) or {}
         plain_sect = plain.get(key) or {}
+        # 模型库视图取自配置对象（明文），不是脱敏后的 dump：条目里的 api_key
+        # 由 _entry_view 单独按同一套凭据规则处理
+        sect_cfg = getattr(cfg, key, None)
+        lib_entries = list(getattr(sect_cfg, "models", None) or [])
+        active_id = str(getattr(sect_cfg, "active_id", "") or "")
+        # 右侧表单里的「模型ID」输入框填的是 active 条目 model_ids 里的第一个
+        # （界面上模型ID 就这一个，见 config-ui.js 的 model 行）；与 endpoint /
+        # configParams 同源：表单显示的就是"当前生效的配置"
+        active_entry = next((e for e in lib_entries if e.id == active_id), None)
         models.append({
             "key": key, "label": label, "tab": "model", "refresh": None,
             "editable": True, "showTestButton": True,
             "endpoint": sect.get("base_url", ""),
+            "modelIds": list(active_entry.model_ids) if active_entry else [],
             "configParams": [_param_row(k, sect.get(k),
-                                        plain_value=plain_sect.get(k))
+                                        plain_value=plain_sect.get(k),
+                                        reveal=True)
                              for k in params if k in sect],
+            # 这一段里所有「已测通」的配置。active 的那一条就是上面这些顶层
+            # 字段的来源（见 models._sync_model_library）
+            "library": _library_view(key, lib_entries, active_id),
         })
 
     services = []
@@ -558,8 +639,9 @@ def _normalize_config(c: ServiceContainer) -> dict:
 def _coerce_param(row: dict):
     """前端行值 → YAML 标量（按 type 还原；非法数值返回 None 表示跳过）"""
     v = row.get("value")
-    # 掩码是"未修改"的显示占位（见 rag/config/secrets.py），绝不能当值写进 YAML
-    if v is None or v == MASK:
+    # 掩码与 UI 圆点都是"未修改"的显示占位（见 rag/config/secrets.py），
+    # 绝不能当值写进 YAML
+    if v is None or v == MASK or is_display_dots(v):
         return None
     typ = row.get("type") or "str"
     s = str(v).strip()
@@ -633,23 +715,14 @@ def _yaml_update_from_payload(payload: dict, enabled_paths: list[str]) -> dict:
                             "is_admin": _b(p.get("is_admin"))})
         update["permissions"] = cleaned
 
-    # 模型域：endpoint → base_url，扁平参数按类型写回
-    for group in (payload.get("modelProviders") or []):
-        key = group.get("key")
-        if key not in ("llm", "embedding"):
-            continue
-        sect: dict = {}
-        if group.get("endpoint") is not None:
-            sect["base_url"] = str(group["endpoint"]).strip()
-        for row in group.get("configParams") or []:
-            k = row.get("key")
-            if not k:
-                continue
-            v = _coerce_param(row)
-            if v is not None:
-                sect[str(k)] = v
-        if sect:
-            update[key] = sect
+    # 模型域改走模型库接口（/model-library/upsert 等），这里不再直接写顶层字段：
+    # 顶层是 active 条目的镜像（见 models._sync_model_library），从这条路径写进去
+    # 会在下一次加载时被 active 条目覆盖 —— 一次静默失败：用户以为保存了，实际
+    # 什么都没生效。浏览器缓存了旧 JS 的页面会走到这里，明确报错让它刷新，
+    # 而不是让它"看起来保存成功"。
+    if payload.get("modelProviders"):
+        raise HTTPException(
+            400, "模型配置已改为「模型库」方式保存：请刷新页面（Ctrl+F5）后重试")
 
     # 服务依赖域：扁平参数按类型写回（adapter 名不可改）
     service_keys = {k for k, _, _ in _SERVICE_SECTIONS}
@@ -1609,6 +1682,236 @@ async def save_config(request: Request,
             "restartRequired": not applied, "message": message}
 
 
+# ── 模型库：多套「已测通」的模型并存，选一个作为 active ──
+#
+# 为什么不做成"保存表单 = 覆盖当前配置"：用户手上常有若干个可用的服务地址
+# （线上 DeepSeek、内网 vLLM、本机 Ollama…），覆盖式保存意味着换回来时要重新
+# 填一遍地址与 key。库里的条目是"一套连得上的配置"的快照，active 只决定业务
+# 用哪一套 —— 切换不重填、不丢 key。
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "请求体必须是 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是 JSON 对象")
+    return body
+
+
+def _config_file(c: ServiceContainer) -> Path:
+    """配置文件绝对路径（与 save_config 同一套兜底）"""
+    path = Path(getattr(c.config, "_config_path", "")
+                or "customer/customer_config.yaml")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        alt = Path.cwd() / "customer/customer_config.yaml"
+        if alt.exists():
+            return alt
+    return path
+
+
+def _model_section(request: Request, section: str):
+    """校验段名并取出内存里的（明文）模型段配置"""
+    if section not in _MODEL_SECTION_KEYS:
+        raise HTTPException(400, f"未知的模型段：{section or '(空)'}")
+    return getattr(_container(request).config, section)
+
+
+async def _write_model_section(request: Request, section: str,
+                               entries: list[ModelEntry],
+                               active_id: str) -> dict:
+    """把模型库写盘并热应用（三个模型库接口共用）
+
+    提交的是**整段**：entries 列表（loaders._deep_merge 对列表是整段替换）、
+    active_id，以及 active 条目的顶层镜像字段。镜像必须一起提交，否则配置文件里
+    会留下"顶层写着上一个模型、列表里 active 指着新模型"的自相矛盾状态 ——
+    运行期不受影响（加载时按 active 重算顶层），但读文件的人会被误导。
+    """
+    active = next(e for e in entries if e.id == active_id)
+    sect: dict = {"models": [e.model_dump(mode="json") for e in entries],
+                  "active_id": active_id}
+    for k in MODEL_ENTRY_FIELDS:
+        sect[k] = getattr(active, k)
+    sect.update(active.params)
+    update = {section: sect}
+
+    cfg_path = _config_file(_container(request))
+    try:
+        from rag.config.loader import merge_config_file
+        # preserve_sensitive=False：这里每个凭据都取自内存里的明文真值，没有
+        # "界面留空"这回事；保旧值只会把上一条的 key 复活到顶层 —— 一个免密
+        # 的本地服务会因此收到一个不相干的旧钥匙
+        merge_config_file(cfg_path, update, preserve_sensitive=False)
+    except Exception as e:
+        raise HTTPException(500, f"写入配置文件失败: {e}")
+
+    applied, degraded, message = False, {}, None
+    try:
+        from rag.api.runtime import apply_config_update
+        result = await apply_config_update(request.app, update, cfg_path)
+        applied = True
+        degraded = result.get("degraded") or {}
+    except Exception as e:
+        # 与配置页其它保存一致：写盘成功但热应用失败 → 如实告知，重启后生效
+        message = f"已写入配置文件，但热应用失败（重启后生效）: {e}"
+    return {"applied": applied, "scope": section, "degraded": degraded,
+            "restartRequired": not applied, "message": message}
+
+
+def _reuse_entries(sect) -> list[ModelEntry]:
+    """复制一份库里的条目（改副本，避免写盘失败时内存已被改坏）"""
+    return [ModelEntry.model_validate(e.model_dump()) for e in sect.models]
+
+
+@admin_ui_router.post("/model-library/upsert")
+async def model_library_upsert(request: Request,
+                               user: UserContext = Depends(require_admin)):
+    """把表单里那套「已测通」的配置存入模型库（带 id = 更新，不带 = 新增）
+
+    只接受测通过的配置：没测过就能入库，库里就会出现一批"看着可用、其实没连过"
+    的条目 —— 那恰恰是这个列表要解决的问题。
+    """
+    body = await _json_body(request)
+    section = str(body.get("section") or "")
+    if not body.get("verified"):
+        raise HTTPException(400, "该配置还没有通过「测试模型」，通过后才能存入模型库")
+
+    sect = _model_section(request, section)
+    rows = [r for r in (body.get("configParams") or []) if isinstance(r, dict)]
+    by_key = {str(r.get("key")): r for r in rows}
+
+    name = str((by_key.get("display_name") or {}).get("value") or "").strip()
+    endpoint = str(body.get("endpoint") or "").strip()
+    # **第一个模型ID是这条配置实际调用的那个**（表单里的「模型ID」输入框填的就是
+    # 它）。界面只发这一个 —— 「获取模型ID」拉回来的候选属于选择手段，不入配置；
+    # 但接口不去砍列表：老配置里可能存过多个ID，第 [0] 个仍是调用者。
+    # 兜底 model 行：缓存了旧 JS 的页面只发那一行，没有 modelIds
+    model_ids = clean_model_ids(body.get("modelIds") or []) \
+        or clean_model_ids([(by_key.get("model") or {}).get("value")])
+    if not name:
+        raise HTTPException(400, "模型名必填：它就是列表里显示、也是你用来认它的名字")
+    if not endpoint:
+        raise HTTPException(400, "API 地址必填：留空表示本机 Mock 模式，无需入库")
+    if not model_ids:
+        raise HTTPException(400, "模型ID必填：集合点的地址不足以确定调用哪个模型")
+
+    entries = _reuse_entries(sect)
+    entry_id = str(body.get("id") or "")
+    # 一张卡片由「模型名 + 在用的那个模型ID」共同确定，不是只看名字：同一台机器上
+    # vLLM 按模型名拆着跑、线上服务商一个 key 下挂好几个模型，都会出现"名字一样、
+    # 模型不同"的两条配置 —— 那是两张卡片，不该拒收
+    dup = next((e for e in entries
+                if e.display_name == name and e.model == model_ids[0]
+                and e.id != entry_id), None)
+    if dup is not None:
+        raise HTTPException(
+            400,
+            f"已有同名同模型「{name} / {model_ids[0]}」：改那一条，"
+            "或换个模型名 / 模型ID")
+
+    target = next((e for e in entries if e.id and e.id == entry_id), None)
+    is_new = target is None
+    if is_new:
+        target = ModelEntry(id=new_entry_id())
+        entries.append(target)
+
+    # 凭据：界面**下发**的就是解密后的真 key（见 _param_row 的 reveal），
+    # 框里通常就是那把钥匙，原样存下来即可。这里仍走 _effective_api_key 统一算，
+    # 而不是"留空就原样留着"：新建条目时表单里的留空意味着"用上面那把已经测通的
+    # 钥匙"，原样留着就等于把配置存成空 key —— 卡片看着是好的，其实只借了段顶层的
+    # 钥匙，下次「更改」时 API Key 框是空的（而且这条一旦被设为 active，顶层镜像
+    # 也跟着变空，业务直接失去鉴权）。
+    # 改一条时它取那一条自己的 key（与「测试模型」用的是同一把，见 _form_api_key）：
+    # 老条目存成空 key 的就保持为空，等用户补填，不从别的条目借。
+    # 把框删干净 = 用户主动清空这条的 key；圆点串（旧页面）当"没改"
+    api_row = by_key.get("api_key") or {}
+    target.api_key = _effective_api_key(
+        sect, api_row.get("value"), "" if is_new else target.id,
+        cleared=bool(api_row.get("cleared")))
+    target.display_name = name
+    target.base_url = endpoint
+    target.model_ids = model_ids
+    target.model = model_ids[0]     # 镜像：业务调用的就是列表里的第一个
+    target.tested_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    # 条目参数必须**完整**：缺项会让"切到这条"变成"这一项沿用上一条的值"，
+    # 用户看到的就是"切了模型但温度没跟着变"。界面没给的项用当前段值兜底
+    params = {k: getattr(sect, k) for k in model_param_fields(section)
+              if hasattr(sect, k)}
+    for row in rows:
+        k = str(row.get("key") or "")
+        if k in model_param_fields(section):
+            v = _coerce_param(row)
+            if v is not None:
+                params[k] = v
+    target.params = params
+
+    # 库里本来一条都没有 → 它只能当 active（没有第二条可选）；否则按界面的选择
+    activate = bool(body.get("activate")) or not sect.active_id
+    active_id = target.id if activate else sect.active_id
+
+    result = await _write_model_section(request, section, entries, active_id)
+    active = next(e for e in entries if e.id == active_id)
+    return {"ok": True, "section": section, "noop": False,
+            "library": _library_view(section, entries, active_id),
+            "active": _entry_view(section, active, active_id), **result}
+
+
+@admin_ui_router.post("/model-library/activate")
+async def model_library_activate(request: Request,
+                                 user: UserContext = Depends(require_admin)):
+    """切换业务实际使用的模型：只改 active_id 与顶层镜像，条目本身不动"""
+    body = await _json_body(request)
+    section = str(body.get("section") or "")
+    entry_id = str(body.get("id") or "")
+    sect = _model_section(request, section)
+    entries = _reuse_entries(sect)
+    active = next((e for e in entries if e.id == entry_id), None)
+    if active is None:
+        raise HTTPException(404, "该模型不在模型库里（可能已被删除），请刷新页面")
+
+    view = {"ok": True, "section": section,
+            "library": _library_view(section, entries, entry_id),
+            "active": _entry_view(section, active, entry_id)}
+    if entry_id == sect.active_id:
+        # 已经是 active：不写盘、不重连 —— 空热应用会白白重建一次连接
+        return {**view, "noop": True, "applied": True, "scope": None,
+                "degraded": {}, "restartRequired": False, "message": None}
+
+    result = await _write_model_section(request, section, entries, entry_id)
+    return {**view, "noop": False, **result}
+
+
+@admin_ui_router.post("/model-library/delete")
+async def model_library_delete(request: Request,
+                               user: UserContext = Depends(require_admin)):
+    """从库里删掉一条配置
+
+    当前 active 的那条不能删：删掉之后业务就没有模型可用了，必须先切到别的。
+    这条规则同时保证了"运行期永远能按 active 读到顶层字段"这个前提。
+    """
+    body = await _json_body(request)
+    section = str(body.get("section") or "")
+    entry_id = str(body.get("id") or "")
+    sect = _model_section(request, section)
+    if entry_id and entry_id == sect.active_id:
+        raise HTTPException(400, "它是当前生效的模型，不能删除；"
+                                 "请先把别的模型设为 active")
+    entries = _reuse_entries(sect)
+    left = [e for e in entries if e.id != entry_id]
+    if len(left) == len(entries):
+        raise HTTPException(404, "该模型不在模型库里（可能已被删除），请刷新页面")
+
+    result = await _write_model_section(request, section, left, sect.active_id)
+    return {"ok": True, "section": section, "noop": False,
+            "library": _library_view(section, left, sect.active_id),
+            "active": _entry_view(section, next(e for e in left
+                                                if e.id == sect.active_id),
+                                  sect.active_id), **result}
+
+
 def _local_models_root(request: Request) -> Path:
     """本地预置模型权重目录：优先配置文件所在工程根的 models/，兜底 cwd/models"""
     c = _container(request)
@@ -1642,8 +1945,8 @@ def _form_scalar_overrides(rows: list, fields) -> tuple[dict, str | None]:
         if k not in fields:
             continue
         raw = row.get("value")
-        if row.get("secret") and is_untouched(raw):
-            continue          # 凭据留空/掩码 → 沿用已保存值
+        if row.get("secret") and (is_untouched(raw) or is_display_dots(raw)):
+            continue          # 凭据留空/掩码/圆点 → 沿用已保存值
         v = _coerce_param(row)
         if v is None:
             txt = "" if raw is None else str(raw).strip()
@@ -1930,6 +2233,181 @@ async def _probe_redis_with_form(c: ServiceContainer,
     return await redis_probe(cfg)
 
 
+# OpenAI 兼容路径：模型段的 base_url 一律已含 /v1（与 adapters/embedding.py 同口径），
+# 这里只追加模型服务自己的两个端点
+_CHAT_PATH = "/chat/completions"
+_EMBEDDINGS_PATH = "/embeddings"
+# 真实模型调用的预算：冷启动的 vLLM / Ollama 首次请求要加载权重，比探 /models 慢得多。
+# 判据是"有没有正确回应"，不该因为等得久就判失败
+_MODEL_CALL_TIMEOUT_SEC = 30.0
+# 取模型列表的预算：只是一次 /models 查询，服务端再慢也就一个列表
+_MODEL_LIST_TIMEOUT_SEC = 10.0
+
+
+def _section_entry(sect, entry_id: object):
+    """段里按 id 找库条目（没给 id / 找不到 → None）"""
+    if not entry_id:
+        return None
+    for e in getattr(sect, "models", None) or []:
+        if e.id and e.id == str(entry_id):
+            return e
+    return None
+
+
+def _effective_api_key(sect, api_key: object, entry_id: object = "",
+                       cleared: bool = False) -> str:
+    """表单里的 API Key → 真正该发出去（以及该存下去）的那把钥匙
+
+    正常路径：模型段的 api_key 是唯一"框里就是真值"的凭据（见 _param_row 的 reveal），
+    框里的文本**就是**那把钥匙 —— 原样返回。用户在框里删掉
+    几个字符，就是真把钥匙改坏了，请求会如实失败（不再有"看着像改过、其实悄悄
+    回落到了自己的钥匙"这种假象）。
+
+    下面的回落只作兜底：旧页面（不下发真值）、以及非 reveal 的凭据仍在用
+    "留空 = 不改动"的语义（见 TS-023），规则是**用框里圆点代表的那把**。
+      - 正在「更改」某条（entry_id）：那一条自己的 key。它没存过 key（老条目存的
+        就是空、或本机服务免鉴权）就是空钥匙 —— 如实发出去、如实存下来，绝不拿
+        别的条目（active 那条）顶上：否则框里明明是空的、模型列表却拉回来了，
+        用户以为这条配置自带钥匙，其实只是借了别人的（借来的还不会被存下来，
+        于是成了一张永远要借钥匙的卡片）
+      - 没进编辑态（新建 / 表单显示的就是当前生效的配置）：段顶层 —— 它就是 active
+        条目的镜像
+    掩码 "******" 与留空同义（is_untouched 一并覆盖）；一串圆点也同义
+    （is_display_dots）—— 圆点串绝不可能是真钥匙，宁可当没改，也不能把它发出去。
+
+    框里被删干净则是用户**主动清空**（cleared=True）—— 那种情况下这条配置就是
+    不要钥匙，如实返回空，绝不回落到哪一把上。
+
+    「测试模型」「获取模型ID」「存入模型库」三条路径**共用本函数**：分开算就会出现
+    "拿 A 的钥匙测通了、入库却把条目存成空 key"这种自相矛盾的状态。
+    """
+    if cleared:
+        return ""          # 用户主动清空：不要钥匙（区别于"没动过"）
+    if is_display_dots(api_key):
+        # 圆点画的是"框里代表的那把"，不是真钥匙：与留空同义 → 走回落
+        api_key = ""
+    if not is_untouched(api_key):
+        return str(api_key or "").strip()
+    entry = _section_entry(sect, entry_id)
+    if entry is not None:
+        return str(getattr(entry, "api_key", "") or "")
+    return str(getattr(sect, "api_key", "") or "")
+
+
+def _form_api_key(request: Request, kind: str, api_key: object,
+                  entry_id: object = "", cleared: bool = False) -> str:
+    """表单里的 API Key → 真正该发出去的钥匙（规则详见 _effective_api_key）
+
+    框里通常就是真钥匙，原样返回；只有"留空 / 一串圆点"（旧页面、或非 reveal 的
+    凭据）才回落成"框里代表的那把" —— 留空若直接当空钥匙发出去，会换回一个 401，
+    表现为"地址能访问、却没有模型列表"（TS-023）。
+    """
+    sect = getattr(_container(request).config, kind, None)
+    if sect is None:
+        return "" if cleared else str(api_key or "").strip()
+    return _effective_api_key(sect, api_key, entry_id, cleared)
+
+
+def _resp_body_snippet(resp) -> str:
+    """响应体片段（换行压平）：报错时带上服务端原话，用户/我们才能判因"""
+    try:
+        return (resp.text or "").replace("\n", " ").strip()[:180]
+    except Exception:
+        return ""
+
+
+def _models_failure_reason(resp, endpoint: str) -> str:
+    """取模型列表失败 → 「下一步该动哪里」"""
+    code = resp.status_code
+    body = _resp_body_snippet(resp) or "（无响应体）"
+    if code in (401, 403):
+        return (f"HTTP {code}：鉴权失败 —— 上面那行 API Key 不对或没带上。"
+                f"原始信息：{body}")
+    if code == 404:
+        return (f"HTTP 404：{endpoint.rstrip('/')}/models 不存在 —— 检查 API 地址是"
+                f"否少写/多写 /v1。原始信息：{body}")
+    return f"HTTP {code}：服务端拒绝。原始信息：{body}"
+
+
+def _model_call_failure_reason(resp, endpoint: str, path: str,
+                               model_id: str) -> str:
+    """真实调用失败 → 把"模型ID不存在"与"路径/鉴权不对"分开说
+
+    这两类失败在 HTTP 上都常是 404/400，但处置动作完全不同：前者去改模型ID，
+    后者去改 API 地址。只报状态码会把用户引向错误的方向。
+    """
+    code = resp.status_code
+    body = _resp_body_snippet(resp) or "（无响应体）"
+    low = body.lower()
+    if code in (401, 403):
+        return (f"HTTP {code}：鉴权失败 —— API Key 不对或没带上。原始信息：{body}")
+    if (model_id.lower() in low
+            or ("model" in low and any(w in low for w in
+                                       ("not exist", "does not exist", "unknown",
+                                        "invalid", "no such")))):
+        return (f"HTTP {code}：服务端不认识模型ID「{model_id}」—— 可点「获取模型ID」"
+                f"按服务端返回的列表选一个（或核对拼写）。原始信息：{body}")
+    if code == 404:
+        return (f"HTTP 404：{endpoint.rstrip('/')}{path} 不存在 —— 检查 API 地址是否"
+                f"少写/多写 /v1。原始信息：{body}")
+    return f"HTTP {code}：服务端拒绝。原始信息：{body}"
+
+
+@admin_ui_router.post("/model-library/list-models")
+async def list_model_ids(request: Request,
+                         user: UserContext = Depends(require_admin)):
+    """「获取模型ID」：按表单里的 API 地址 + API Key 拉一次 OpenAI 兼容 /models
+
+    与「测试模型」刻意分开：这里只负责"把服务端自报的模型列出来给用户挑"，
+    不做可用性判定 —— 地址通不通、模型ID能不能用，是下一步「测试模型」的事。
+    选项列表本身也不可信（vLLM 报的是 --served-model-name，有的服务压根不实现
+    /models），所以它只是**省去手抄**，不是白名单：模型ID 始终允许手填。
+
+    拉列表用的钥匙 = 表单里那把（留空 = 正在「更改」的那条自己的，见
+    _effective_api_key）：所以"框里空着却拉到了列表"只会发生在**这条配置自己
+    存着 key**（框里画着圆点）的时候，否则如实报 401。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    kind = str(body.get("kind") or "llm")
+    endpoint = str(body.get("endpoint") or "").strip()
+    label = str(body.get("label") or kind)
+    if not endpoint:
+        return {"ok": False, "models": [],
+                "message": f"{label}：先填 API 地址，再来获取模型ID"}
+    # entryId：正在「更改」的那条。Key 留空时用它自己的钥匙（见 _effective_api_key）——
+    # 空 key 的条目就得如实 401，不能借 active 那条的钥匙把列表拉回来
+    api_key = _form_api_key(request, kind, body.get("apiKey"),
+                            body.get("entryId"),
+                            cleared=bool(body.get("apiKeyCleared")))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=_MODEL_LIST_TIMEOUT_SEC) as hc:
+            r = await hc.get(endpoint.rstrip("/") + "/models", headers=headers)
+    except Exception as e:
+        return {"ok": False, "models": [],
+                "message": f"无法访问 {endpoint}：{str(e)[:150]}"}
+    if r.status_code != 200:
+        return {"ok": False, "models": [],
+                "message": _models_failure_reason(r, endpoint)}
+    models: list = []
+    try:
+        for m in ((r.json() or {}).get("data") or []):
+            if isinstance(m, dict) and m.get("id"):
+                models.append(str(m["id"]))
+    except Exception:
+        models = []
+    models = models[:100]
+    if not models:
+        return {"ok": True, "models": [],
+                "message": "服务端没返回模型列表：可手填模型ID"}
+    return {"ok": True, "models": models,
+            "message": f"取到 {len(models)} 个模型：点徽标即填入「模型ID」"}
+
+
 @admin_ui_router.post("/health/test")
 async def health_test(request: Request,
                       user: UserContext = Depends(require_admin)):
@@ -1970,36 +2448,75 @@ async def health_test(request: Request,
             message = (message + "；models/ 目录为空或不存在，"
                        "请预先放置权重目录") if model else \
                       "models/ 目录为空或不存在，请预先放置权重目录"
-    # LLM/Embedding：填写了 endpoint 时直接探测该地址（OpenAI 兼容 /models）
+    # LLM/Embedding「测试模型」：用表单里的地址 + Key + 模型ID **真发一次请求**
+    # （对话模型 → /chat/completions，向量模型 → /embeddings），有正确回应才算通过。
+    # 旧口径只 GET 一次 /models，等于只证明"地址通"：模型ID 填错、Key 没权限、
+    # 模型其实没加载，全都会显示"测试通过"，要到问答/入库时才炸在业务里。
     elif kind in ("llm", "embedding") and endpoint:
-        try:
+        model_id = str(body.get("model") or "").strip()
+        # 与「获取模型ID」「入库」同一把钥匙（见 _effective_api_key）：
+        # 框里的圆点没动 = 沿用（回落）；把圆点删干净 = 主动清空，如实拿空钥匙去测
+        api_key = _form_api_key(request, kind, body.get("apiKey"),
+                                body.get("entryId"),
+                                cleared=bool(body.get("apiKeyCleared")))
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        path = _CHAT_PATH if kind == "llm" else _EMBEDDINGS_PATH
+        if not model_id:
+            message = ("模型ID为空：先点上面的「获取模型ID」选一个，"
+                       "或直接手填再测")
+        else:
             import httpx
-            headers = {}
-            api_key = str(body.get("apiKey") or "")
-            # 页面不会回传已保存的 key（见 _param_row）：留空/掩码时回落到当前配置里
-            # 的凭据，探测才带得上认证。若不回落，探测会拿不到认证 → 401，既把
-            # "端点可达"当成成功，又让模型列表空掉（TS-023）
-            if is_untouched(api_key):
-                sect = getattr(c.config, kind, None)
-                api_key = str(getattr(sect, "api_key", "") or "")
-            if not is_untouched(api_key):
-                headers["Authorization"] = f"Bearer {api_key.strip()}"
-            async with httpx.AsyncClient(timeout=6) as hc:
-                r = await hc.get(endpoint.rstrip("/") + "/models",
-                                 headers=headers)
-            online = r.status_code < 500
-            message = (f"HTTP {r.status_code} · " +
-                       ("端点可达" if online else "端点异常"))
-            # 解析 OpenAI 兼容 /models 响应，供前端展示可选模型列表
-            if r.status_code == 200:
-                try:
-                    data = (r.json() or {}).get("data") or []
-                    models = [str(m.get("id")) for m in data
-                              if isinstance(m, dict) and m.get("id")][:100]
-                except Exception:
-                    models = []
-        except Exception as e:
-            message = f"连接失败: {str(e)[:150]}"
+            if kind == "llm":
+                payload = {"model": model_id,
+                           "messages": [{"role": "user", "content": "ping"}],
+                           "max_tokens": 1, "temperature": 0,
+                           "stream": False}
+            else:
+                payload = {"model": model_id, "input": ["ping"]}
+
+            async def _call(pl: dict):
+                async with httpx.AsyncClient(
+                        timeout=_MODEL_CALL_TIMEOUT_SEC) as hc:
+                    return await hc.post(endpoint.rstrip("/") + path,
+                                         headers=headers, json=pl)
+
+            try:
+                r = await _call(payload)
+                if (r.status_code == 400 and kind == "llm"
+                        and any(s in _resp_body_snippet(r).lower() for s in
+                                ("max_tokens", "temperature",
+                                 "unsupported", "unknown parameter"))):
+                    # 个别新模型（o1 系等）不收 max_tokens/temperature，且响应体点名
+                    # 参数不受支持 —— 去掉这两个键再来一次，别让参数的差异伪装成
+                    # "连不上"（判据仍是"有没有正确回应"）
+                    payload.pop("max_tokens", None)
+                    payload.pop("temperature", None)
+                    r = await _call(payload)
+                if r.status_code != 200:
+                    message = _model_call_failure_reason(r, endpoint, path,
+                                                         model_id)
+                elif kind == "llm":
+                    try:
+                        choices = (r.json() or {}).get("choices") or []
+                    except Exception:
+                        choices = []
+                    online = bool(choices)
+                    message = (f"{model_id} 正常回应（HTTP 200）" if online else
+                               "HTTP 200 但响应里没有 choices：这不是 OpenAI 兼容的"
+                               "对话接口（检查 API 地址是否指向 /v1）")
+                else:
+                    try:
+                        vec = ((r.json() or {}).get("data")
+                               or [{}])[0].get("embedding") or []
+                    except Exception:
+                        vec = []
+                    online = bool(vec)
+                    message = (f"{model_id} 正常返回向量（{len(vec)} 维）"
+                               if online else
+                               "HTTP 200 但响应里没有向量：这不是 OpenAI 兼容的"
+                               "向量接口（检查 API 地址是否指向 /v1）")
+            except Exception as e:
+                message = f"调用失败: {str(e)[:150]}"
     else:
         # 服务依赖：kind → 容器属性
         attr_map = {"meta": "meta", "mysql_meta": "meta",

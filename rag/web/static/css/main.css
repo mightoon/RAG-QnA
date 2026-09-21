@@ -145,7 +145,6 @@ img{max-width:100%}
 .form-label{display:block;font-size:var(--fs-sm);font-weight:var(--fw-medium);
   color:var(--text-secondary);margin-bottom:6px}
 .form-hint{font-size:var(--fs-xs);color:var(--text-tertiary);margin-top:4px;line-height:1.5}
-.form-hint.inline{display:inline;margin-left:8px;margin-top:0}
 .form-error{font-size:var(--fs-xs);color:var(--error);margin-top:4px}
 .form-input,.form-select,.form-textarea{width:100%;padding:8px 12px;border:1px solid var(--border);
   border-radius:var(--radius-sm);font-size:var(--fs-sm);font-family:inherit;background:var(--bg-surface);
@@ -551,16 +550,65 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .perm-row.admin-row input{border-color:var(--warning);background:var(--warning-light)}
 .perm-remove{flex-shrink:0}
 .model-stack{display:flex;flex-direction:column;gap:16px}
-.model-chip-box{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)}
-.model-chip-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+/* 候选模型徽标：一排在按钮后面铺开（rerank 的扫描结果用它铺在卡片下方） */
+.model-chip-box{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);
+  display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.model-chip-list{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
 .model-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);
   border-radius:999px;padding:3px 10px;font-size:var(--fs-xs);cursor:pointer;
   background:var(--bg-surface);font-family:var(--font-mono);color:var(--text-primary)}
 .model-chip:hover{border-color:var(--primary)}
 .model-chip.active{border-color:var(--primary);background:var(--primary-light)}
+/* 只读的 chip（模型库卡片上那条配置的模型ID）：不是按钮，别给可点的暗示 */
+.model-chip.static{cursor:default}
+.model-chip.static:hover{border-color:var(--border)}
 .model-chip-name{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.model-chip-x{color:var(--text-tertiary);font-weight:var(--fw-bold);line-height:1;cursor:pointer}
-.model-chip-x:hover{color:var(--error)}
+/* 模型 tab：左列模型库 + 右列配置表单。
+   表单缩到右边：它只是"填参数 → 测试 → 入库"的入口，参数也没几行，占满整宽时
+   右边大半是空白；而用户真正要看的是左边"有哪些已测通的、当前用哪个" */
+.model-card-body{display:grid;grid-template-columns:minmax(280px,400px) minmax(0,1fr);
+  gap:16px;align-items:start}
+.model-form-col{min-width:0}
+.model-lib{border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:12px 14px;background:var(--bg-base)}
+.model-lib-head{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.model-lib-title{font-weight:var(--fw-medium);color:var(--text-primary)}
+.model-lib-empty{padding:18px 4px;text-align:center;color:var(--text-secondary);
+  font-size:var(--fs-sm)}
+.model-lib-item{border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:10px 12px;background:var(--bg-surface);margin-top:10px}
+.model-lib-item.active{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light)}
+/* 点卡片 = 把这条配置回填到右侧表单（卡片上不再有「更改」按钮）：整卡片可点，
+   hover 时底色微亮 + 边框转主色（active 那条本身已是主色边框，底色变化仍看得见） */
+.model-lib-item.clickable{cursor:pointer;
+  transition:background var(--anim-fast),border-color var(--anim-fast)}
+.model-lib-item.clickable:hover{background:var(--bg-hover);border-color:var(--primary)}
+/* 选中（右侧表单就是它）：蓝色实线框 + 浅蓝底。原来那圈黄色虚线加「编辑中」字样的
+   写法已去掉 —— 选中只看框，卡片上不写状态字。
+   边框由 1px 变 2px，内边距跟着各减 1px 补回来：选中时卡片尺寸不跳、列表不抖 */
+.model-lib-item.selected{border:2px solid var(--primary);background:var(--primary-light);
+  padding:9px 11px}
+/* 一行装下「模型名 + 标记位 + 删除」：不换行，名字过长就省略号。
+   卡片上只有模型名和模型ID（地址、key 要点卡片回填才看得到），
+   这样一条卡片很矮，左列才装得下多条 */
+.model-lib-line{display:flex;align-items:center;gap:6px;flex-wrap:nowrap}
+.model-lib-name{font-weight:var(--fw-medium);color:var(--text-primary);
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-lib-acts{display:flex;align-items:center;gap:2px;flex-shrink:0;margin-left:auto}
+/* 卡片上的模型ID（这条配置调用谁）；左列不宽，压紧内边距。
+   单个ID再长也不许把卡片撑宽：省略号收尾，完整ID在 title 里 */
+.model-lib-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;min-width:0}
+.model-lib-chips .model-chip{max-width:100%;min-width:0;padding:2px 8px}
+.model-lib-chips .model-chip-name{min-width:0}
+.model-lib-del{color:var(--error)}
+/* 长得像徽标、实际可点（「设为 active」）：点完同一个槽位换成绿色 active 徽标 */
+.badge-btn{cursor:pointer;border:1px dashed var(--border);background:transparent;
+  color:var(--text-secondary);font-family:inherit;font-weight:var(--fw-medium)}
+.badge-btn:hover:not(:disabled){border-style:solid;border-color:var(--primary);
+  color:var(--primary);background:var(--primary-light)}
+/* 「可用模型」这一行：按钮 + 候选徽标排在同一行（装不下才换行） */
+.model-id-pick{flex:1;min-width:0}
+.model-id-pick-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .radio-group{display:flex;gap:16px;align-items:center;flex:1}
 .radio-opt{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
   font-size:var(--fs-sm);color:var(--text-primary)}
@@ -788,6 +836,8 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 @media (max-width:1024px){
   .doc-layout{grid-template-columns:1fr}
   .doc-side-panel{position:static}
+  /* 窄屏：模型库与表单改上下排（左右并排会把表单压得比参数名还窄） */
+  .model-card-body{grid-template-columns:1fr}
 }
 @media (max-width:900px){
   .sidebar{display:none}

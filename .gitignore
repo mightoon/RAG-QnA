@@ -20,3 +20,6 @@ customer/customer_config.local.yaml
 customer/.secrets.key
 models/bge-reranker-base/
 models/bge-reranker-v2-m3/
+# 本地调试用的临时脚本与产物（tmp_mkcfg.py / tmp_selftest_*.py / tmp_pid_*.txt …）：
+# 只排工程根目录下的，免得误传进仓库；子目录里的同名文件不在其列
+/tmp_*

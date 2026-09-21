@@ -6,10 +6,12 @@
 """
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import (AliasChoices, BaseModel, Field, field_validator,
+                      model_validator)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -25,6 +27,152 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator
 # 字段别名 + adapter 值归一），下一次保存即以新键回写，旧键自然消失。
 LEGACY_SECTION_ALIASES: dict[str, str] = {"mysql_meta": "meta"}
 LEGACY_ADAPTER_ALIASES: dict[str, str] = {"mysql_meta": "mysql"}
+
+
+# ═══════════════════════════════════════════════════════════
+# 模型库：一个模型段里的多条「已测通」配置
+# ═══════════════════════════════════════════════════════════
+#
+# 这一段原来只有一份扁平字段（地址 / 模型ID / 凭据 / 参数），用户改一次就是
+# "覆盖"掉上一套 —— 想留着上次那套地址和 key，只能自己抄到记事本里。模型库
+# 把「一套可用配置」固化成一个条目，多套并存，由 active_id 指定业务（问答、
+# 向量化）实际使用的那一套。
+#
+# 顶层那几个字段（base_url / api_key / model / display_name 与运行参数）
+# **始终是 active 条目的镜像**，不是第二份真相：适配器构造、监控页、降级判定
+# 全都照旧读顶层字段，因此本机制对运行期零侵入；两者也不会漂移 —— 每次加载都
+# 按 active 条目重写顶层（见 _sync_model_library）。
+#
+# 「一个地址 + 一个 key」下往往摆着好几个模型（同一台 vLLM 上 qwen / bge 混部，
+# 或线上服务商给了一串模型名），因此条目里存的是**一组模型ID** model_ids，
+# model 只是其中"业务实际调用"的那一个的镜像（见 normalize_entry_models）。
+MODEL_ENTRY_FIELDS = ("display_name", "base_url", "api_key", "model")
+
+# 各段独有的运行参数：条目里跟着条目走，顶层跟着 active 条目走。
+# 不含 adapter / rewrite_model / summary_model —— 它们是**段级**的：
+# 换地址、换模型都不改变"用哪个适配器、改写用不用小模型"。
+_MODEL_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
+    "llm": ("temperature", "max_tokens", "timeout", "max_concurrency"),
+    "embedding": ("dim", "batch_size", "query_prefix", "normalize", "timeout"),
+}
+
+# 存量配置（YAML 里还没有 models 段）自动升级出来的那条的 id。刻意用固定串而非
+# 随机值：界面的「更改」要按 id 找回同一条，随机 id 每加载一次就换一个，用户
+# 第二次点「更改」会变成新增。
+LEGACY_ENTRY_ID = "current"
+
+
+def new_entry_id() -> str:
+    """条目 id：短、随机、不可猜。只是身份，不含任何配置内容"""
+    return secrets.token_hex(4)
+
+
+def model_param_fields(section: str) -> tuple[str, ...]:
+    """该模型段的「条目级」运行参数名，顺序即界面上的填写顺序"""
+    return _MODEL_PARAM_FIELDS.get(section, ())
+
+
+class ModelEntry(BaseModel):
+    """模型库里的一条配置：一个服务地址 + 一组模型ID + 凭据 + 运行参数
+
+    只存"连得上这个服务"所需的东西。adapter、改写/摘要模型留在段级 ——
+    它们不属于某一条，换了地址也还是同一个适配器。
+    """
+    id: str = ""
+    display_name: str = ""          # 界面上列出来的模型名（用户认的就是它）
+    base_url: str = ""
+    api_key: str = ""
+    # 这一套「地址 + key」下可用的模型ID，第一个是业务实际调用的那个。
+    # 界面上按 chips 展示；点另一个即置首（= 换业务在用的模型）
+    model_ids: list[str] = Field(default_factory=list)
+    model: str = ""                 # = model_ids[0]，见 normalize_entry_models
+    tested_at: str = ""             # 最近一次连接测试通过的时间（界面如实显示新旧）
+    params: dict = Field(default_factory=dict)   # 见 _MODEL_PARAM_FIELDS[段名]
+
+
+def clean_model_ids(ids: Any) -> list[str]:
+    """模型ID列表：去空白、丢空串、去重，顺序照用户给的（第一个 = 在用）"""
+    out: list[str] = []
+    for v in ids or []:
+        s = str(v or "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def normalize_entry_models(e: ModelEntry) -> None:
+    """把「一个条目一组模型ID」收敛成一条不变式（原地修改）
+
+    两条规则：
+    1. model_ids 去重去空；**第一个就是业务在用的那个**，e.model 是它的镜像。
+    2. e.model 不在列表里 → 以它为准并置首。手改 YAML 只写了 model（存量配置
+       本来就只写 model）、或列表被写坏时，用户明确写下的那个ID才是他想用的。
+
+    e.model 之所以必须与 model_ids[0] 同源：适配器、监控、降级判定只读
+    e.model / 顶层字段，而卡片上显示的是 model_ids —— 两处一旦不一致，
+    用户看到的"在用模型"和业务实际调用的就不是一回事了。
+    """
+    ids = clean_model_ids(e.model_ids)
+    m = str(e.model or "").strip()
+    if m and (not ids or ids[0] != m):
+        ids = [m] + [i for i in ids if i != m]
+    e.model_ids = ids
+    e.model = ids[0] if ids else ""
+
+
+def _sync_model_library(sect: Any, section: str) -> None:
+    """维护「模型库 ↔ 顶层字段」的不变式（原地修改 sect）
+
+    三条规则，缺一条都会让"界面显示的 active"与"业务实际在用"对不上：
+    1. 库里没有条目、但顶层已配置 → 按顶层补一条。存量配置自动升级到模型库，
+       用户不必手改 YAML，也不会出现"页面上列表是空的，可业务在跑"的割裂感。
+    2. active_id 指向不存在的条目 → 先按身份（地址 + 模型ID）找回同一条，
+       再不然取第一条。手改 YAML 把 active_id 写丢时，这样选回的最接近原意。
+    3. 顶层身份与运行参数 ← active 条目。顶层是派生物 —— 运行期读的就是它，
+       所以"切 active"对适配器、监控、降级判定都是透明的。
+    """
+    fields = _MODEL_PARAM_FIELDS.get(section, ())
+    entries: list[ModelEntry] = list(sect.models)
+
+    if not entries:
+        # 没配过就返回：库为空才是正确状态，不是"配置丢了"。
+        # 判据只看 base_url —— 空地址 = 未配置（启动降级为内置 Mock）；只看
+        # 模型ID 不行，embedding 的 model 有默认值 "bge-m3"，那会把从没配过
+        # 的向量段也升级成一条"Mock 模型"条目
+        if not str(sect.base_url or "").strip():
+            return
+        entries = [ModelEntry(
+            id=LEGACY_ENTRY_ID,
+            display_name=str(sect.display_name or ""),
+            base_url=str(sect.base_url or ""),
+            api_key=str(sect.api_key or ""),
+            model=str(sect.model or ""),
+            params={k: getattr(sect, k) for k in fields if hasattr(sect, k)},
+        )]
+
+    # 存量条目只有 model（模型库刚上线那一版），让它补出 model_ids 并保持
+    # 「model = model_ids[0]」；手改 YAML 把两者写岔了也在这里收口
+    for e in entries:
+        normalize_entry_models(e)
+
+    active = next((e for e in entries if e.id and e.id == sect.active_id), None)
+    if active is None:
+        ident = lambda e: (e.base_url.strip(), e.model.strip())
+        cur = (str(sect.base_url or "").strip(), str(sect.model or "").strip())
+        active = next((e for e in entries
+                       if ident(e) == cur and (cur[0] or cur[1])), None) \
+            or entries[0]
+
+    sect.models = entries
+    sect.active_id = active.id
+    # 身份字段无条件写回（含留空）：否则用户清空的 base_url 会被上一次加载的
+    # 旧值"复活"。运行参数只在条目记过时才写 —— 条目诞生之后新增的参数字段
+    # 不该被这条路径清回默认值。
+    for k in MODEL_ENTRY_FIELDS:
+        setattr(sect, k, getattr(active, k))
+    for k in fields:
+        if k in active.params:
+            setattr(sect, k, active.params[k])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -49,6 +197,15 @@ class LLMConfig(BaseModel):
     max_tokens: int = 2048
     timeout: float = 60.0
     max_concurrency: int = 8
+    # 模型库与当前生效的那一条（见文件上方 _sync_model_library）：
+    # 上面这些字段是 active 条目的镜像，不要在保存路径里单独改它们
+    models: list[ModelEntry] = Field(default_factory=list)
+    active_id: str = ""
+
+    @model_validator(mode="after")
+    def _sync_library(self):
+        _sync_model_library(self, "llm")
+        return self
 
 
 class EmbeddingConfig(BaseModel):
@@ -65,6 +222,14 @@ class EmbeddingConfig(BaseModel):
     query_prefix: str = ""                  # BGE 系列: "为这个句子生成表示以用于检索相关文章："
     normalize: bool = True                  # 显式 L2 归一化（Milvus IP 度量依赖）
     timeout: float = 30.0
+    # 模型库与当前生效的那一条（语义同 LLMConfig，见 _sync_model_library）
+    models: list[ModelEntry] = Field(default_factory=list)
+    active_id: str = ""
+
+    @model_validator(mode="after")
+    def _sync_library(self):
+        _sync_model_library(self, "embedding")
+        return self
 
 
 class VectorStoreConfig(BaseModel):

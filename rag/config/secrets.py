@@ -77,6 +77,22 @@ def is_untouched(value: Any) -> bool:
     return False
 
 
+# UI 用等量圆点表示"这条已经存着钥匙"（实体值：能选中、能整串删掉，见 config-ui.js
+# 的凭据框渲染）。它是显示占位，不是钥匙 —— 一串圆点绝不可能是真凭据，一旦被当成
+# 值发出/写盘，真钥匙就被几个圆点换掉（不可逆）。所以凡是要"用值"的地方都得绕开它。
+# 模型段的 api_key 现在下发的是解密后的真值（见 web/routes._param_row 的 reveal），框里不再
+# 出现这种占位；这里保留判定当兜底：旧页面、或别的凭据传来的圆点串一律按"没改"处理。
+DOTS_CHAR = "•"
+
+
+def is_display_dots(value: Any) -> bool:
+    """值是不是 UI 画出来的那串圆点（非空且全部由圆点组成）"""
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    return bool(s) and set(s) == {DOTS_CHAR}
+
+
 def _secret_key(key_dir: Path) -> bytes:
     """取主密钥：环境变量优先，其次本机密钥文件（首次自动生成）"""
     env = str(os.environ.get(KEY_ENV) or "").strip()
