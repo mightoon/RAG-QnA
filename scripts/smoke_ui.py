@@ -5,6 +5,7 @@ C. 演示模式（noconnection）基础页面/接口
 运行前自动备份 customer/customer_config.yaml，结束后恢复。
 """
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -157,6 +158,44 @@ try:
               '| no path in id?', 'models/bge-reranker' not in text,
               '| port int?', 'port: 3306' in text)
         assert first.get('ok'), '第一个重排配置应入库成功'
+
+        # ── VLM 视觉模型：与 LLM 同构的第二块模型库 ──
+        # 配置页里这两段**共用一份表单**（点哪块库的卡片就编哪一段），所以这里要
+        # 验的正是"没有串段"：VLM 的条目进 vlm 段、llm 段那条原封不动
+        r = c.post('/api/admin/model-library/upsert', json={
+            'section': 'vlm', 'endpoint': 'http://127.0.0.1:9/v1',
+            'modelIds': ['qwen2.5-vl-7b'],
+            'configParams': [
+                {'key': 'display_name', 'value': 'smoke-vlm', 'type': 'str'},
+                {'key': 'model', 'value': 'qwen2.5-vl-7b', 'type': 'str'},
+                {'key': 'api_key', 'value': 'sk-vlm', 'type': 'str'},
+            ], 'verified': True, 'activate': True}, headers=h)
+        vbody = r.json()
+        ventries = (vbody.get('library') or {}).get('entries') or []
+        print('vlm upsert', r.status_code, vbody.get('ok'),
+              '| entries=', len(ventries))
+        assert vbody.get('ok') and ventries, 'VLM 条目应入库成功'
+        vtext = CFG.read_text(encoding='utf-8')
+        # vlm 与 llm 同为顶层段：镜像字段写在段内（vlm.model 等），不是 llm_model 那种
+        print('yaml has vlm section?', 'vlm:' in vtext,
+              '| vlm model?', 'qwen2.5-vl-7b' in vtext,
+              '| vlm library?', 'smoke-vlm' in vtext,
+              '| llm untouched?', 'test-model' in vtext)
+        assert 'vlm:' in vtext and 'qwen2.5-vl-7b' in vtext, 'vlm 段应落盘'
+        # 配置页载荷里要有这段（前端就是按 data.groups 里的 key='vlm' 出「模型库 ·
+        # VLM」那一块的；VLM 不单独出卡片，由 config-ui.js 挂在 LLM 卡片里）
+        page = c.get('/config', headers=h).text
+        has_vlm = bool(re.search(r'"key":\s*"vlm"', page))
+        print('config page has vlm group?', has_vlm,
+              '| has llm group?', bool(re.search(r'"key":\s*"llm"', page)))
+        assert has_vlm, '配置页载荷里应有 VLM 段'
+        # 「测试模型」对 vlm 与 llm 同一条路（对话接口）：不可达地址必须如实判失败
+        r = c.post('/api/admin/health/test',
+                   json={'kind': 'vlm', 'endpoint': 'http://127.0.0.1:9/v1',
+                         'model': 'qwen2.5-vl-7b'}, headers=h)
+        print('health/test vlm', r.status_code, r.json().get('online'),
+              (r.json().get('message') or '')[:50])
+        assert r.json().get('online') is False, '不可达的 VLM 地址必须判失败'
         # 连接测试（LLM 端点直测，127.0.0.1:9 不可达 → 失败但接口正常）
         r = c.post('/api/admin/health/test',
                    json={'kind': 'llm', 'endpoint': 'http://127.0.0.1:9/v1'}, headers=h)

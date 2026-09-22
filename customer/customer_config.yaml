@@ -8,7 +8,7 @@ auth:
 llm:
   adapter: openai_compatible
   base_url: https://api.deepseek.com
-  api_key: enc:v1:gAAAAABqsgtnOu-Im6rP_-lxqh6BTGdHCMsLFEd4BE-XmllK4Zr1kRr66qQsvuJep0i9lv_Gk6YdLPVgew_FyYMX5MLYsfFbyxYpdR-Ih9JH1Jdx97dB3ru2--YjJQFSlVvS-kWZeeds
+  api_key: enc:v1:gAAAAABqsjWKKT9O7jU9oJzkOYNjL3HM_tDIewPLvkbdin8luQQo4p1oFgfcnyuksy2WJp_7JWZ4Gng_G4TO4tGeJDDjEMyTBvykZ-hhB3BatwSQT7Dwb1XMPF62JJigwBYmM5zwrOcO
   model: deepseek-flash
   rewrite_model: ''
   temperature: 5.0
@@ -20,7 +20,7 @@ llm:
   - id: current
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqsgtngp5vnObQHWutWyeIm5g2DtuKJtoZBqPr1ePOIaX4wZ0vbkB84KPibxMKzIy-5mP-SX2HbVjTytcUrpVU76oVcc9dw7Vu560jJTi-7HfMEXpM_EgBBNR4NrFhulsls2eH
+    api_key: enc:v1:gAAAAABqsjWKCweZhQuZkObeH9OUhPWb7UMfhJg7zA6EO7ZEBVdnCl992SS2lb5iQQ7mWp231suQ7ITUyyteEqA_Na6k7Fruw1Wl5f0ZqKdnQC8GUUc76SOeA1Q7ja_vD6M4jrRUUpMu
     model_ids:
     - deepseek-flash
     model: deepseek-flash
@@ -33,7 +33,7 @@ llm:
   - id: ef4d181f
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqsgtnQU5W-jzhk9VwI8J_-N5qiyN03l-QdiKD9S29eIt6iLG7dZqB1t2E37mQm-1-Rxx28T-FG1SPjhdTEkxecv8Wv-jmTF8dnRy4IDF3oB9MlEpMHy431roUMSHmo3rTCIwb
+    api_key: enc:v1:gAAAAABqsjWKAIYwjz9UCdudm9F-rEL-Ap6oEWnBRs_O06hHiJalF5kcDLQThwvSTwhyrLOl_GVNcoYczHPsSsiP3jUTjZDcYTRW5_TEOijiB18mD0clm5wdXMkLrx0ub4CYYxr3bx-Y
     model_ids:
     - deepseek-v4-pro
     model: deepseek-v4-pro
@@ -41,19 +41,6 @@ llm:
     params:
       temperature: 7.0
       max_tokens: 8192
-      timeout: 60.0
-      max_concurrency: 8
-  - id: 09cd674a
-    display_name: int-qwen3.8
-    base_url: http://192.168.100.242:29138/v1
-    api_key: ''
-    model_ids:
-    - qwen38-27b
-    model: qwen38-27b
-    tested_at: '2026-09-21 17:24:36'
-    params:
-      temperature: 5.0
-      max_tokens: 65536
       timeout: 60.0
       max_concurrency: 8
   active_id: current
@@ -96,7 +83,7 @@ meta:
 redis:
   host: 192.168.100.239
   port: 6379
-  password: enc:v1:gAAAAABqsgtnuF8X_h5T7nYF94o4cwS2EOteV_NSOL1kLgyrwqHqH15v9wADac-K8AO0G4wGdPGMfC5mZYnd6hrY7MQJSGhzkQ==
+  password: enc:v1:gAAAAABqsjWKZuwAREUdkrt32TdTEQm9wZVBlORZCrEv07IyiWLp4Kz14CgxT0uKECXnUmWvf5C8TfVAbebwNkiLbYbNnHsgtQ==
   db: 0
   session_ttl_hours: 48
   prefix: 'rag:'
@@ -105,7 +92,7 @@ storage:
   enabled: true
   endpoint: 192.168.100.239:9000
   access_key: admin
-  secret_key: enc:v1:gAAAAABqsgtnMzQHUJYtuNbOP1AQU5mbWR4w8pl2hSjvaVfA6tXFHY7tr1LFqw0zfRqj6EpQv_MoKAsf1ltxvrlVxdyKilqZZA==
+  secret_key: enc:v1:gAAAAABqsjWKvgipmFci9X7W8q3NIO7n5_hSR5ByJcgyeW4mTYujV_Hx97np85GoYs1L5SYOyn5Y3NUnBm0ufG2gCI1UPFoY7g==
   bucket: rag-docs
   secure: false
   local_root: ./data/files
@@ -120,7 +107,7 @@ knowledge_graph:
 business_data:
   adapter: sqlalchemy
   enabled: false
-  dsn: enc:v1:gAAAAABqsgtnYPA1VOP3oG4-C__2wuT9VgRINF9gwo23rPuDTC2ejrtHqG49MOeZPVV1MnrSqY0GJLaTJCgqKRBchH1g7070QI4snvTDymHLitJkUoeTlrS5dN1ZEJLstVzTYrW6HcPHizfaFhKqlMKw8YFn2rWsKg==
+  dsn: enc:v1:gAAAAABqsjWKzDFqmBqbSdGT12YZp6AAxEAbMc1hRZ9dvBTie5Gs1J1fYb3hc5wLSmuxyUx3dUlsylLif70YB-CsNjektkTaR6VuVucTJg2pJVPNLSSkEmpmCtiqkaZF5p-1QzwUI5mKaZ0qkQJ3CkYywaQb8-HrGA==
   schema_file: customer/business_schema.yaml
   allowed_tables: []
   max_rows: 100
@@ -247,3 +234,27 @@ workflows_file: customer/workflows.yaml
 default_collection: default
 max_upload_mb: 500
 server_ingest_root: null
+vlm:
+  models:
+  - id: 66d943ae
+    display_name: int-qwen3.8
+    base_url: http://192.168.100.242:29138/v1
+    api_key: ''
+    model_ids:
+    - qwen38-27b
+    model: qwen38-27b
+    tested_at: '2026-09-22 16:00:10'
+    params:
+      temperature: 7.0
+      max_tokens: 2048
+      timeout: 60.0
+      max_concurrency: 8
+  active_id: 66d943ae
+  display_name: int-qwen3.8
+  base_url: http://192.168.100.242:29138/v1
+  api_key: ''
+  model: qwen38-27b
+  temperature: 7.0
+  max_tokens: 2048
+  timeout: 60.0
+  max_concurrency: 8

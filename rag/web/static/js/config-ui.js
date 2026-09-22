@@ -348,7 +348,7 @@
   /* 左列里「被点中的那条」的 id（按段）。选中 = 右侧表单现在显示的是它、入库时会
      更新它（没选中则是新增一条）。放这里而不是挂在 g 上：g 是回传给后端的配置载荷，
      掺进 _editingId 这类纯界面状态会被一起写进配置文件 */
-  const modelEdit = { llm: '', embedding: '', rerank: '' };
+  const modelEdit = { llm: '', vlm: '', embedding: '', rerank: '' };
 
   function libButton(text, cls, title, onClick) {
     const b = el('button', cls, text);
@@ -456,8 +456,36 @@
   /* 左列标题带上槽位名：三块模型库上下叠着，都只写「模型库」就分不清谁是谁
      （槽位名就是后端那套段名的 key；重排段虽挂在 retrieval 上，但接口层用
      routes._RerankStore 伪装成了同样的"段"，这里是同一个标题口径） */
-  const LIB_TAGS = { llm: 'LLM', embedding: 'Embedding', rerank: 'Rerank' };
+  const LIB_TAGS = { llm: 'LLM', vlm: 'VLM', embedding: 'Embedding',
+                     rerank: 'Rerank' };
   const libTitle = key => (LIB_TAGS[key] ? '模型库 · ' + LIB_TAGS[key] : '模型库');
+
+  /* ── 右列表单的"共用"：LLM 与 VLM 两块模型库只留一份填空框 ──
+     这两段本来就是同一种东西（OpenAI 兼容的对话服务：地址 + Key + 模型ID + 一组
+     运行参数），差别只在业务上谁去吃图。若各出一张卡片、各带一份一模一样的表单，
+     用户分不清该填哪一个、写进哪一段。所以 VLM 只作为左列的第二个库挂在 LLM 卡片
+     里（见 modelCard），右边只有一份表单：**点哪一块的卡片，表单就是编哪一段**，
+     段名跟着切（modelEdit、markSaved 的键、入库的 section 全是它）。
+     不是"两份表单轮流显隐"——那样填到一半的值会在切换时凭空消失。
+     表单标题对这两段统一写「大模型」（后端段标签仍是「LLM 大模型」「VLM 视觉
+     模型」，只用在报错与灰牌上），另挂一枚段名徽标说明此刻在编哪一段。 */
+  const SHARED_FORM_LIBS = ['llm', 'vlm'];
+  const SHARED_FORM_OWNER = 'llm';        // 卡片挂在谁身上（VLM 不自出一张卡）
+  const SHARED_FORM_TITLE = '大模型';
+  let sharedFormKey = SHARED_FORM_OWNER;  // 此刻表单在编哪一段
+  const isSharedLib = key => SHARED_FORM_LIBS.indexOf(key) >= 0;
+
+  /* 挂在同一张卡片上的库：owner → [自己, VLM]，其余段 → [自己] */
+  function libsOfCard(g) {
+    if (g.key !== SHARED_FORM_OWNER) return [g];
+    return [g].concat((ConfigData.groupsFor('model') || []).filter(
+      x => x !== g && isSharedLib(x.key)));
+  }
+
+  /* 此刻表单该编的那一段（点过 VLM 卡片就是 VLM，否则是卡片本来那一段） */
+  function sharedFormGroup(g) {
+    return libsOfCard(g).find(x => x.key === sharedFormKey) || g;
+  }
 
   function renderLibrary(g) {
     const lib = g.library || { activeId: '', entries: [] };
@@ -471,6 +499,9 @@
        没有条目时它也照旧摆着 —— 总得有个"从空白开始填"的入口 */
     const add = libButton('增加模型', 'btn btn-ghost btn-sm',
       '清空右侧表单，用来配一个新模型（测通后点「存入模型库」）', () => {
+        // 共用一份表单时（LLM / VLM）：先把表单切到本段，再清空 —— 否则清的是
+        // 另一段的值，看着像"点了没反应"
+        if (isSharedLib(g.key)) sharedFormKey = g.key;
         modelEdit[g.key] = '';
         clearFormForNew(g);
         ConfigData.markSaved(['model:' + g.key]);   // 清空不是改动
@@ -560,6 +591,9 @@
           + '（改完测试通过后点「更新模型库」）';
       item.addEventListener('click', ev => {
         if (ev.target.closest('button')) return;   // 卡上的按钮各管各的
+        // 共用一份表单时（LLM / VLM）：表单切到本段。点 VLM 的卡片就是在编 VLM，
+        // 点 LLM 的就是编 LLM —— 段名（modelEdit 的键、入库的 section）始终是 g.key
+        if (isSharedLib(g.key)) sharedFormKey = g.key;
         if (selected) {
           modelEdit[g.key] = '';
           restoreFormFromActive(g);
@@ -594,20 +628,36 @@
      真正要经常看的是左边"有哪些已测通的、当前用哪个"。 */
   function modelCard(g) {
     const body = el('div', 'model-card-body');
-    body.appendChild(renderLibrary(g));
+    const libs = libsOfCard(g);
+    /* 一块库就照旧直接摆进左列；两块（LLM + VLM）要先套一层列容器 ——
+       它们是同一列里上下叠着的两块 .model-lib，不是网格里的两个格子 */
+    const box = libs.length > 1 ? el('div', 'model-lib-col') : body;
+    libs.forEach(x => box.appendChild(renderLibrary(x)));
+    if (box !== body) body.appendChild(box);
 
     const right = el('div', 'model-form-col');
-    right.appendChild(groupCard(g));
+    // 表单跟着"最后点的那块库"走；只有一块库的卡片就是它自己
+    const fg = libs.length > 1 ? sharedFormGroup(g) : g;
+    right.appendChild(groupCard(fg, libs.length > 1 ? SHARED_FORM_TITLE : ''));
     body.appendChild(right);
     return body;
   }
 
   /* ── 模型/服务/高级组卡片 ── */
-  function groupCard(g) {
+  function groupCard(g, titleOverride) {
     const card = el('div', 'card perm-card');
     const head = el('header');
     const titleWrap = el('div', 'card-title');
-    titleWrap.appendChild(el('span', 'doc-title-main', g.label || g.key));
+    // 共用一份表单的两段（LLM / VLM）标题都写「大模型」（见 SHARED_FORM_TITLE）；
+    // 各自单独出卡片时（理论上的兜底）仍用后端给的那段标签
+    titleWrap.appendChild(el('span', 'doc-title-main',
+      titleOverride || g.label || g.key));
+    /* 同一份表单能编两段，标题又统一写「大模型」，就得有东西说清此刻写进去的是
+       哪一段的库 —— 这枚徽标就是那个说明（点另一块库的卡片它会跟着变） */
+    if (titleOverride) {
+      titleWrap.appendChild(el('span', 'badge badge-default',
+        LIB_TAGS[g.key] || g.key));
+    }
     /* 「模型名」的牌子：只有 LLM / 向量模型卡片有这一项（后端 _MODEL_SECTIONS）。
        名字写在参数行里，身份却必须挂在标题上 —— 否则换了一套模型服务，两张卡片的
        标题一模一样，只有逐行读参数才认得出配的是谁。这里从 configParams 里取同一份
@@ -1232,13 +1282,20 @@
     Partials.registerDataLoader('panel_system', () => ({}));
 
     Partials.registerPieceRenderer('panel_model', data => {
-      // 模型 tab：从上到下三个块（LLM / Embedding / Rerank），底部为检索策略。
-      // 前两块用 modelCard：左列模型库 + 右列配置表单
+      // 模型 tab：从上到下几个块（LLM + VLM / Embedding / Rerank），底部为检索策略。
+      // 前几块用 modelCard：左列模型库 + 右列配置表单
       const wrap = el('div');
       const stack = el('div', 'model-stack');
-      /* 三段模型库（LLM / 向量 / 重排）都是同一张卡片：段描述由后端下发，
-         重排段也在 data.groups 里（key='rerank'） */
-      (data.groups || []).forEach(g => stack.appendChild(modelCard(g)));
+      /* 四段模型库（LLM / VLM / 向量 / 重排）都是同一张卡片：段描述由后端下发，
+         重排段也在 data.groups 里（key='rerank'）。
+         VLM 自己不出卡片 —— 它与 LLM 共用右侧那份表单，作为左列的第二个库挂在
+         LLM 卡片里（见 modelCard），「模型库 · VLM」就贴在「模型库 · LLM」下头 */
+      const groups = data.groups || [];
+      const hasOwner = groups.some(x => x.key === SHARED_FORM_OWNER);
+      groups.forEach(g => {
+        if (hasOwner && g.key !== SHARED_FORM_OWNER && isSharedLib(g.key)) return;
+        stack.appendChild(modelCard(g));
+      });
       wrap.appendChild(stack);
       const ret = renderRetrievalBlock();
       ret.style.marginTop = '16px';

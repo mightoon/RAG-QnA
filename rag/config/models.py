@@ -54,6 +54,11 @@ MODEL_ENTRY_FIELDS = ("display_name", "base_url", "api_key", "model")
 # 换地址、换模型都不改变"用哪个适配器、改写用不用小模型"。
 _MODEL_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
     "llm": ("temperature", "max_tokens", "timeout", "max_concurrency"),
+    # VLM 视觉模型（多模态对话模型）：接的是同一个 OpenAI 兼容 /chat/completions，
+    # 地址 + Key + 模型ID 三件套与 llm 完全一样，条目级运行参数也就同一套 —— 差别
+    # 只在业务上谁去吃图。配置页里它与 llm 共用一份表单（见 config-ui.js 的
+    # SHARED_FORM_LIBS），段名各是各的：两个库、两个 active，互不覆盖
+    "vlm": ("temperature", "max_tokens", "timeout", "max_concurrency"),
     "embedding": ("dim", "batch_size", "query_prefix", "normalize", "timeout"),
     # 重排模型：条目级参数是「模型路径/API + 加载设备」。model_dir 存本机权重
     # 所在目录（用户填 models / /mydata/models 这类），也是**远程重排服务地址**
@@ -352,6 +357,38 @@ class LLMConfig(BaseModel):
     @model_validator(mode="after")
     def _sync_library(self):
         _sync_model_library(self, "llm")
+        return self
+
+
+class VLMConfig(BaseModel):
+    """视觉模型（VLM）：图片理解用的多模态对话模型
+
+    与 LLMConfig 同构，不是复制粘贴的巧合 —— 它就是一个 OpenAI 兼容的对话服务
+    （vLLM 上的 Qwen2-VL、线上 qwen-vl-max…），只是消息里能带图。因此模型库、
+    「测试模型」、写入 YAML 全都复用同一套机制（见 _sync_model_library）。
+    现状说明：本段眼下只做"配置 + 模型库"（可测通、可存多套、可切 active），
+    运行期还没有消费者 —— 入库时的图片描述仍走 llm 段（ingest_parse 的
+    VLMCaptionStep 拿 services.llm 发带图消息）。所以要接上它，改动点就一处：
+    容器按本段建一个适配器，那一步改读它。在此之前这块库配了不影响任何链路。
+    """
+    adapter: str = "openai_compatible"
+    # 显示名：同 LLMConfig.display_name（视觉模型与主模型常是两套服务，卡片标题
+    # 需要各自的标识才分得清；配置页里两者共用一份表单，这行更是唯一的区分）
+    display_name: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    temperature: float = 0.3
+    max_tokens: int = 2048
+    timeout: float = 60.0
+    max_concurrency: int = 8
+    # 模型库与当前生效的那一条（语义同 LLMConfig，见 _sync_model_library）
+    models: list[ModelEntry] = Field(default_factory=list)
+    active_id: str = ""
+
+    @model_validator(mode="after")
+    def _sync_library(self):
+        _sync_model_library(self, "vlm")
         return self
 
 
@@ -659,6 +696,8 @@ class AppConfig(BaseModel):
 
     auth: AuthConfig = Field(default_factory=AuthConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    # 视觉模型（图片理解）：配置页里与 llm 共用一份表单，存储仍是独立的段
+    vlm: VLMConfig = Field(default_factory=VLMConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     fulltext: FullTextConfig = Field(default_factory=FullTextConfig)

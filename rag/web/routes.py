@@ -244,15 +244,22 @@ _DEGRADED_KEY = {
 _MODEL_SECTIONS = (
     ("llm", "LLM 大模型",
      ("display_name", "api_key", "model", "temperature", "max_tokens")),
+    # VLM 视觉模型：与 llm 完全同构（同一个 OpenAI 兼容对话接口，只是消息里能带
+    # 图），所以它的段描述就在这里多一行 —— 模型库、获取模型ID、测试模型、写入
+    # YAML 全部自动继承（见 models.ModelEntry 与 _write_model_section 的通用分支）。
+    # 界面上它与 llm **共用右侧那一份表单**（标题写「大模型」），两块库上下叠着：
+    # 点哪一块的卡片就是在编哪一段（见 config-ui.js 的 SHARED_FORM_LIBS）
+    ("vlm", "VLM 视觉模型",
+     ("display_name", "api_key", "model", "temperature", "max_tokens")),
     ("embedding", "向量模型 (Embedding)",
      ("display_name", "api_key", "model", "dim", "query_prefix")),
 )
 
-# 「模型库」一共三段：上面两段 + 重排模型。三者的库都支持多套已测通的配置并存、
+# 「模型库」一共四段：上面三段 + 重排模型。它们的库都支持多套已测通的配置并存、
 # 可切 active、可删，但重排有一段不同 —— **存储位置**：它是本机 Cross-Encoder 权重
 # 目录，没有服务地址、没有凭据可存，库里也就没有 base_url/api_key（见
 # models._sync_rerank_library），所以它挂在 retrieval 段上，不是这里的顶层段。
-# 三个模型库接口用 _RerankStore 把它伪装成同样的"段"，流程一行都不用改。
+# 模型库接口用 _RerankStore 把它伪装成同样的"段"，流程一行都不用改。
 _MODEL_SECTION_KEYS = frozenset(k for k, _, _ in _MODEL_SECTIONS)
 _MODEL_SECTION_PARAMS = {k: params for k, _, params in _MODEL_SECTIONS}
 # 重排段的行顺序：模型名 → 模型路径/API → 模型ID → 推理设备（前端在 model 前插
@@ -2669,11 +2676,15 @@ async def health_test(request: Request,
                                "（核对「模型路径/API」与「模型ID」）")
                     if models:
                         message += "；该目录下有：" + "、".join(models)
-    # LLM/Embedding「测试模型」：用表单里的地址 + Key + 模型ID **真发一次请求**
+    # LLM/VLM/Embedding「测试模型」：用表单里的地址 + Key + 模型ID **真发一次请求**
     # （对话模型 → /chat/completions，向量模型 → /embeddings），有正确回应才算通过。
     # 旧口径只 GET 一次 /models，等于只证明"地址通"：模型ID 填错、Key 没权限、
     # 模型其实没加载，全都会显示"测试通过"，要到问答/入库时才炸在业务里。
-    elif kind in ("llm", "embedding") and endpoint:
+    elif kind in ("llm", "vlm", "embedding") and endpoint:
+        # VLM 是"能带图的对话模型"，接口与 LLM 完全同一条：这里发纯文字 ping 就够
+        # 了（多模态服务照样收纯文字消息）—— 要验的是"这个地址 + 这把 Key + 这个
+        # 模型ID 能不能对话"，不是"它会不会看图"
+        is_chat = kind in ("llm", "vlm")
         model_id = str(body.get("model") or "").strip()
         # 与「获取模型ID」「入库」同一把钥匙（见 _effective_api_key）：
         # 框里的圆点没动 = 沿用（回落）；把圆点删干净 = 主动清空，如实拿空钥匙去测
@@ -2681,13 +2692,13 @@ async def health_test(request: Request,
                                 body.get("entryId"),
                                 cleared=bool(body.get("apiKeyCleared")))
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        path = _CHAT_PATH if kind == "llm" else _EMBEDDINGS_PATH
+        path = _CHAT_PATH if is_chat else _EMBEDDINGS_PATH
         if not model_id:
             message = ("模型ID为空：先点上面的「获取模型ID」选一个，"
                        "或直接手填再测")
         else:
             import httpx
-            if kind == "llm":
+            if is_chat:
                 payload = {"model": model_id,
                            "messages": [{"role": "user", "content": "ping"}],
                            "max_tokens": 1, "temperature": 0,
@@ -2703,7 +2714,7 @@ async def health_test(request: Request,
 
             try:
                 r = await _call(payload)
-                if (r.status_code == 400 and kind == "llm"
+                if (r.status_code == 400 and is_chat
                         and any(s in _resp_body_snippet(r).lower() for s in
                                 ("max_tokens", "temperature",
                                  "unsupported", "unknown parameter"))):
@@ -2716,7 +2727,7 @@ async def health_test(request: Request,
                 if r.status_code != 200:
                     message = _model_call_failure_reason(r, endpoint, path,
                                                          model_id)
-                elif kind == "llm":
+                elif is_chat:
                     try:
                         choices = (r.json() or {}).get("choices") or []
                     except Exception:

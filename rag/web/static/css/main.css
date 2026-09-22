@@ -569,6 +569,10 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .model-card-body{display:grid;grid-template-columns:minmax(280px,400px) minmax(0,1fr);
   gap:16px;align-items:start}
 .model-form-col{min-width:0}
+/* 共用一份表单的两块模型库（LLM / VLM）上下叠在左列：两块 .model-lib 与单独一张
+   卡片里的库完全同款，这里只负责纵向排布与间距；宽度由 .model-card-body 的第一列
+   定，所以它自己不设宽（min-width:0 防长模型ID把列撑破） */
+.model-lib-col{display:flex;flex-direction:column;gap:12px;min-width:0}
 .model-lib{border:1px solid var(--border);border-radius:var(--radius-md);
   padding:12px 14px;background:var(--bg-base)}
 .model-lib-head{display:flex;align-items:center;gap:8px;margin-bottom:4px}
