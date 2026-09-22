@@ -8,7 +8,7 @@ auth:
 llm:
   adapter: openai_compatible
   base_url: https://api.deepseek.com
-  api_key: enc:v1:gAAAAABqsQMEypcsQg14bKyws2YNrHrJ6FsY8AP9eev7T5_GRn8ZZDAEpYb-KtXz6EmzeelVLQMBG_brtziO-Qjj71ZMCKB8kx-xjgtdyAA7bRtAKRK1sq_fQ7jjPfKTUyk72sIb0pXg
+  api_key: enc:v1:gAAAAABqsgtnOu-Im6rP_-lxqh6BTGdHCMsLFEd4BE-XmllK4Zr1kRr66qQsvuJep0i9lv_Gk6YdLPVgew_FyYMX5MLYsfFbyxYpdR-Ih9JH1Jdx97dB3ru2--YjJQFSlVvS-kWZeeds
   model: deepseek-flash
   rewrite_model: ''
   temperature: 5.0
@@ -20,7 +20,7 @@ llm:
   - id: current
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqsQMErMs-ieQXGo0VXgKmGKie6W9uYBuAadsihWDQQAxDqPL9vjxxPCDIs0yoqmXAzpRMA2QhNBqWjo8QQPDYyI7Sa20Ekwh6LsOps5OvI5Kalc_xl3dcB4ofe5mJtCviVjV8
+    api_key: enc:v1:gAAAAABqsgtngp5vnObQHWutWyeIm5g2DtuKJtoZBqPr1ePOIaX4wZ0vbkB84KPibxMKzIy-5mP-SX2HbVjTytcUrpVU76oVcc9dw7Vu560jJTi-7HfMEXpM_EgBBNR4NrFhulsls2eH
     model_ids:
     - deepseek-flash
     model: deepseek-flash
@@ -33,7 +33,7 @@ llm:
   - id: ef4d181f
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqsQMExfxeXfL9aukhsi8NYGYrCT7fFArY8-1kT6lVeP62_XcNbLwoPnhQLpCp4WBikaCdrVaTpTSLAc672tU6vCMphZ1lrDfO1QsXJIb56N2XvD6ign6wc_epnJzj6iIJWtpj
+    api_key: enc:v1:gAAAAABqsgtnQU5W-jzhk9VwI8J_-N5qiyN03l-QdiKD9S29eIt6iLG7dZqB1t2E37mQm-1-Rxx28T-FG1SPjhdTEkxecv8Wv-jmTF8dnRy4IDF3oB9MlEpMHy431roUMSHmo3rTCIwb
     model_ids:
     - deepseek-v4-pro
     model: deepseek-v4-pro
@@ -96,7 +96,7 @@ meta:
 redis:
   host: 192.168.100.239
   port: 6379
-  password: enc:v1:gAAAAABqsQMEdKomm4xDi4jSgaRyggmkE7yc0KSQJrs7IJuC2WW42I1Kp3-j4Va0RGHiS24NSuIdpuY0_QbtMc98nS41lMN4FQ==
+  password: enc:v1:gAAAAABqsgtnuF8X_h5T7nYF94o4cwS2EOteV_NSOL1kLgyrwqHqH15v9wADac-K8AO0G4wGdPGMfC5mZYnd6hrY7MQJSGhzkQ==
   db: 0
   session_ttl_hours: 48
   prefix: 'rag:'
@@ -105,7 +105,7 @@ storage:
   enabled: true
   endpoint: 192.168.100.239:9000
   access_key: admin
-  secret_key: enc:v1:gAAAAABqsQMEXNTTYcaoTQdzDHgiADUvlM6UzTh6MdefpQ5mvLQc23LEpfyof0iKCOyqKUFS6DoI2APTvzXs3ZQmeudJgu-GHw==
+  secret_key: enc:v1:gAAAAABqsgtnMzQHUJYtuNbOP1AQU5mbWR4w8pl2hSjvaVfA6tXFHY7tr1LFqw0zfRqj6EpQv_MoKAsf1ltxvrlVxdyKilqZZA==
   bucket: rag-docs
   secure: false
   local_root: ./data/files
@@ -120,7 +120,7 @@ knowledge_graph:
 business_data:
   adapter: sqlalchemy
   enabled: false
-  dsn: enc:v1:gAAAAABqsQME1Cd17Odaf2Pv9_CgIV-tFqtuQMG27Jc-P4Z545bP83Z0nsFmpfQQu5dQokNY0SX9gIdIFhaiC1UxjHuFk14QG661fVRtpp_s3xpLaGhjRJgcYAp6AreHOJ594vGkB2nBQ-6zSMrwXOQDkBGb79Eg3w==
+  dsn: enc:v1:gAAAAABqsgtnYPA1VOP3oG4-C__2wuT9VgRINF9gwo23rPuDTC2ejrtHqG49MOeZPVV1MnrSqY0GJLaTJCgqKRBchH1g7070QI4snvTDymHLitJkUoeTlrS5dN1ZEJLstVzTYrW6HcPHizfaFhKqlMKw8YFn2rWsKg==
   schema_file: customer/business_schema.yaml
   allowed_tables: []
   max_rows: 100
@@ -147,7 +147,7 @@ retrieval:
   graph_max_nodes: 50
   rrf_k: 60
   rerank_enabled: true
-  rerank_model: models/bge-reranker-base
+  rerank_model: bge-reranker-base
   rerank_device: cpu
   rerank_threshold: 0.3
   final_top_n: 6
@@ -157,6 +157,21 @@ retrieval:
   self_eval_max_iterations: 2
   ephemeral_score_boost: 1.2
   default_route_weights: {}
+  rerank_display_name: reranker02
+  rerank_models:
+  - id: 2228006d
+    display_name: reranker02
+    base_url: ''
+    api_key: ''
+    model_ids:
+    - bge-reranker-base
+    model: bge-reranker-base
+    tested_at: '2026-09-22 13:00:13'
+    params:
+      model_dir: models
+      device: cpu
+  rerank_active_id: 2228006d
+  rerank_model_dir: models
 pipeline:
   enable_vlm: true
   enable_summary: true

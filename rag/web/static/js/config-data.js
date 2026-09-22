@@ -162,7 +162,9 @@
     g.library = res.library;
     // 右侧表单显示的就是"当前生效的配置"：只有 agent 条目变了它才该变
     if (res.active) {
-      g.endpoint = res.active.endpoint;
+      // 重排模型没有服务地址（noEndpoint）：别把空 endpoint 塞回去，
+      // 否则表单会凭空多出「API 地址」这一行
+      if (!g.noEndpoint) g.endpoint = res.active.endpoint;
       // 只取第一个：它是这条配置调用的那个，也是表单「模型ID」框该显示的值
       g.modelIds = (res.active.modelIds || []).slice(0, 1);
       g.configParams = JSON.parse(JSON.stringify(res.active.configParams || []));

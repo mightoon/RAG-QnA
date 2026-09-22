@@ -577,7 +577,9 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
   font-size:var(--fs-sm)}
 .model-lib-item{border:1px solid var(--border);border-radius:var(--radius-sm);
   padding:10px 12px;background:var(--bg-surface);margin-top:10px}
-.model-lib-item.active{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-light)}
+/* active（业务正在用的那条）不靠边框表态：卡片上那块绿色「active」牌子就是它的标记。
+   原来这里还有一圈主色边框 + 浅蓝外圈，于是"当前生效但没被点中"的卡片看着也像被选中了；
+   蓝框从此只属于 .selected（见下）—— 两个信号不再抢同一个样式 */
 /* 点卡片 = 把这条配置回填到右侧表单（卡片上不再有「更改」按钮）：整卡片可点，
    hover 时底色微亮 + 边框转主色（active 那条本身已是主色边框，底色变化仍看得见） */
 .model-lib-item.clickable{cursor:pointer;

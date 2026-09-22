@@ -20,6 +20,8 @@ import math
 import threading
 from collections import OrderedDict
 
+from rag.config.models import (is_http_url, rerank_api_endpoint,
+                               resolve_rerank_model_path)
 from rag.models import RetrievedChunk
 from rag.observability.logging import get_logger
 from rag.pipeline.base import PipelineStep, StepRegistry, StepError
@@ -474,6 +476,59 @@ class _CrossEncoderCache:
 _CE_CACHE = _CrossEncoderCache(capacity=2)
 
 
+# 远程重排的 HTTP 预算：与本地加载不同，这里必然要等一次网络往返。给足它
+# （服务端可能正在冷启模型），但不能无限等 —— 超时由 RerankStep 兜住，
+# 退到 LLM 重排（三级退化的第二级）
+_RERANK_HTTP_TIMEOUT_SEC = 30.0
+
+
+def _rerank_scores_from_payload(data: dict, n: int) -> list[float]:
+    """rerank 响应体 → 按文档下标排好的分数（认识 Cohere/Jina 两套字段名）
+
+    契约：{"results":[{"index":i,"relevance_score":s}, …]}（Jina/Cohere 一致），
+    少数实现回 data/score。拿不回某一条就留 0：下游 rerank_threshold 会把它滤掉，
+    与 LLM 重排的退化口径一致。
+    """
+    items = (data or {}).get("results") or (data or {}).get("data") or []
+    scores = [0.0] * n
+    if not isinstance(items, list):
+        return scores
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            i = int(it.get("index", it.get("document_index")))
+            if not 0 <= i < n:
+                continue
+            scores[i] = float(it.get("relevance_score", it.get("score")))
+        except (TypeError, ValueError):
+            continue
+    return scores
+
+
+async def _remote_rerank_scores(url: str, model: str, pairs: list) -> list[float]:
+    """远程重排服务打分：POST {地址}/rerank（Cohere/Jina/vLLM/TEI 一致的契约）
+
+    {"model":…, "query":…, "documents":[…], "top_n":n}
+        → {"results":[{"index":i,"relevance_score":s}, …]}
+
+    整批一次请求（不是逐条）：重排本身就是"一个 query 对 N 个文档"，逐条打会白付
+    N 次往返。抛异常交给 RerankStep：那里会退到 LLM 重排，不会让一次网络抖动
+    把整条问答打掉。model 只在填了才带 —— 有的服务只跑一份权重，不认这个字段。
+    """
+    import httpx
+    query = pairs[0][0] if pairs else ""
+    docs = [t for _, t in pairs]
+    payload: dict = {"query": query, "documents": docs, "top_n": len(docs)}
+    if model:
+        payload["model"] = model
+    async with httpx.AsyncClient(timeout=_RERANK_HTTP_TIMEOUT_SEC) as hc:
+        resp = await hc.post(rerank_api_endpoint(url), json=payload)
+        resp.raise_for_status()
+        data = resp.json() or {}
+    return _rerank_scores_from_payload(data, len(docs))
+
+
 class RerankStep(PipelineStep):
     stop_on_error = False
 
@@ -513,18 +568,32 @@ class RerankStep(PipelineStep):
 
     async def _cross_encoder_rerank(self, ctx: QueryContext, query: str,
                                     chunks: list[RetrievedChunk]):
-        """本地 Cross-Encoder 精排（模型与设备取自 retrieval 配置，可热切换）"""
+        """精排：本机 Cross-Encoder 或远程重排服务（取自 retrieval 配置，可热切换）
+
+        「模型路径/API」一栏两义，这里就是分流点：填 http(s) 地址 = 那台远程重排
+        服务（打它的 /rerank），填目录 = 本机权重（模型与设备都从配置取）。
+        """
         s = ctx.services
         pairs = []
         for c in chunks:
             scoring_text = c.parent_content or c.text
             pairs.append((query, scoring_text[:1000]))
-        scores = await s.llm.score_pairs(pairs) if hasattr(
-            s.llm, "score_pairs") else None
+        cfg = s.config.retrieval
+        # 字段对齐：配置页保存的 rerank_model_dir / rerank_model / rerank_device。
+        # 「模型路径/API」与「模型ID」在界面上是两行（选目录 → 选模型），本机加载要
+        # 的是拼好的完整目录；那一栏留空时模型ID 本身就是完整引用（HuggingFace ID）
+        target = resolve_rerank_model_path(
+            getattr(cfg, "rerank_model_dir", ""),
+            cfg.rerank_model or "BAAI/bge-reranker-v2-m3")
+        if is_http_url(target):
+            # 远程重排：这一批 query-doc 交给它打分。地址补全与「测试模型」共用同一个
+            # 函数（models.rerank_api_endpoint）—— 配置页测过的地址就是这里打的地址
+            scores = await _remote_rerank_scores(target, cfg.rerank_model, pairs)
+        else:
+            scores = await s.llm.score_pairs(pairs) if hasattr(
+                s.llm, "score_pairs") else None
         if scores is None:
-            cfg = s.config.retrieval
-            # 字段对齐：配置页保存的 retrieval.rerank_model / rerank_device
-            model_name = (cfg.rerank_model or "BAAI/bge-reranker-v2-m3").strip()
+            model_name = target
             device = str(getattr(cfg, "rerank_device", "cpu") or "cpu").lower()
             if device == "cuda":
                 try:

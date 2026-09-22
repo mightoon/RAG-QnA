@@ -25,8 +25,9 @@ from fastapi.templating import Jinja2Templates
 from rag.adapters.registry import AdapterRegistry
 from rag.api.deps import get_current_user, require_admin
 from rag.config.models import (LEGACY_SECTION_ALIASES, MODEL_ENTRY_FIELDS,
-                               ModelEntry, clean_model_ids, model_param_fields,
-                               new_entry_id)
+                               ModelEntry, clean_model_ids, is_http_url,
+                               model_param_fields, new_entry_id,
+                               rerank_api_endpoint, resolve_rerank_model_path)
 from rag.config.secrets import (MASK, SENSITIVE_KEYS, is_display_dots,
                                 is_untouched)
 from rag.container import (
@@ -247,14 +248,30 @@ _MODEL_SECTIONS = (
      ("display_name", "api_key", "model", "dim", "query_prefix")),
 )
 
-# 只有这两段有"模型库"（多套已测通的配置并存）；rerank 是本机权重目录，
-# 没有地址/凭据可存
+# 「模型库」一共三段：上面两段 + 重排模型。三者的库都支持多套已测通的配置并存、
+# 可切 active、可删，但重排有一段不同 —— **存储位置**：它是本机 Cross-Encoder 权重
+# 目录，没有服务地址、没有凭据可存，库里也就没有 base_url/api_key（见
+# models._sync_rerank_library），所以它挂在 retrieval 段上，不是这里的顶层段。
+# 三个模型库接口用 _RerankStore 把它伪装成同样的"段"，流程一行都不用改。
 _MODEL_SECTION_KEYS = frozenset(k for k, _, _ in _MODEL_SECTIONS)
 _MODEL_SECTION_PARAMS = {k: params for k, _, params in _MODEL_SECTIONS}
+# 重排段的行顺序：模型名 → 模型路径/API → 模型ID → 推理设备（前端在 model 前插
+# 「获取模型ID」，在末尾补「测试模型」）。它没有**独立**的「API 地址」行：地址那
+# 一半已并进「模型路径/API」——填目录 = 本机 Cross-Encoder，填 http(s) 地址 =
+# 那台远程重排服务（见 models.is_http_url / rerank_api_endpoint）。所以这一段的
+# base_url/api_key 始终为空，前端也就不画那一行（见 _normalize_config 的
+# noEndpoint 与 config-ui.js 的 injectEndpoint）
+# 「模型路径/API」是权重目录或服务地址、「模型ID」是目录名或服务要的模型名：
+# 分两行才好按目录取候选（见 list_model_ids / health_test 的 kind == "rerank" 分支）
+_RERANK_PARAMS = ("display_name", "model_dir", "model", "device")
+_MODEL_SECTION_PARAMS["rerank"] = _RERANK_PARAMS
 
 _PARAM_LABELS = {
     "base_url": "API 地址", "api_key": "API Key", "model": "模型ID",
     "display_name": "模型名",
+    "device": "推理设备",                     # 重排模型：Cross-Encoder 加载设备
+    # 重排模型：本机权重目录，或远程重排服务地址（两义共用这一栏，故名字写全）
+    "model_dir": "模型路径/API",
     "temperature": "温度", "max_tokens": "最大 Token",
     "timeout": "超时(秒)", "max_concurrency": "并发数", "dim": "向量维度",
     "batch_size": "批大小", "query_prefix": "查询前缀",
@@ -584,6 +601,27 @@ def _normalize_config(c: ServiceContainer) -> dict:
             "library": _library_view(key, lib_entries, active_id),
         })
 
+    # 重排模型：三张卡片里唯一"库不在顶层段"的一个（挂在 retrieval 上，见 _RerankStore）。
+    # 它没有独立的服务地址可填（地址那一半并进了「模型路径/API」）—— noEndpoint 让
+    # 前端既不画「API 地址」行，也不在校验里要求它（见 config-ui.js 的
+    # injectEndpoint / buildPayload）。这里刻意不下发 endpoint 键
+    ret_cfg = cfg.retrieval
+    ret_active = next((e for e in ret_cfg.rerank_models
+                       if e.id == ret_cfg.rerank_active_id), None)
+    models.append({
+        "key": "rerank", "label": "重排模型 (Rerank)", "tab": "model",
+        "refresh": None, "editable": True, "showTestButton": True,
+        "noEndpoint": True,
+        # 勾了「启用重排」才真参与召回：没勾时左列绿牌换成灰牌「未启用」
+        "notEnabled": "" if ret_cfg.rerank_enabled else
+                      "「检索策略」里的「启用重排」没勾上：问答不会走重排",
+        "modelIds": list(ret_active.model_ids) if ret_active else [],
+        "configParams": [_param_row(k, getattr(ret_cfg, "rerank_" + k, None))
+                         for k in _RERANK_PARAMS],
+        "library": _library_view("rerank", list(ret_cfg.rerank_models),
+                                 ret_cfg.rerank_active_id),
+    })
+
     services = []
     for key, label, test_kind in _SERVICE_SECTIONS:
         sect = dump.get(key) or {}
@@ -627,9 +665,9 @@ def _normalize_config(c: ServiceContainer) -> dict:
             "enabledPaths": sorted(c.enabled_paths()),
             "defaultWeights": {k: round(float(v), 4) for k, v in weights.items()},
             "rerankEnabled": bool(cfg.retrieval.rerank_enabled),
-            "rerankModel": cfg.retrieval.rerank_model,
-            "rerankDevice": getattr(cfg.retrieval, "rerank_device", "cpu") or "cpu",
             "rerankThreshold": cfg.retrieval.rerank_threshold,
+            # 重排模型本身（模型名/模型ID/设备）不在这里下发：它是 modelProviders
+            # 里的第三段（库 + active 条目），见上面那段注释
         },
         "system": {"version": cfg.version, "roleCount": len(cfg.permissions),
                    "degraded": degraded},
@@ -692,11 +730,16 @@ def _yaml_update_from_payload(payload: dict, enabled_paths: list[str]) -> dict:
             if str(k) in allowed and _f(v) is not None}
     if "rerankEnabled" in ret_in:
         ret["rerank_enabled"] = _b(ret_in["rerankEnabled"])
-    if "rerankModel" in ret_in:
-        ret["rerank_model"] = str(ret_in["rerankModel"] or "").strip()
-    if "rerankDevice" in ret_in:
-        d = str(ret_in["rerankDevice"] or "cpu").strip().lower()
-        ret["rerank_device"] = d if d in ("cpu", "cuda") else "cpu"
+    # 重排模型的几个镜像字段不再走"整段保存"：库才是源、它们是 active 条目的派生物
+    # （见 models._sync_rerank_library），从这里写进去会被下一次加载覆盖掉 —— 那正是
+    # "界面说保存成功、其实没生效"的静默失败，所以这里直接报错让用户刷新页面
+    mirrors = [k for k in ("rerankModel", "rerankModelDir", "rerankDisplayName",
+                           "rerankDevice") if k in ret_in]
+    if mirrors:
+        raise HTTPException(
+            400, f"重排模型不再整段保存（收到 {', '.join(mirrors)}）："
+                 "请用模型库的「存入模型库」/「设为 active」/「删除」；"
+                 "若是刚升级过版本，刷新页面后重试")
     if "rerankThreshold" in ret_in:
         ret["rerank_threshold"] = _f(ret_in["rerankThreshold"], 0.3)
     if ret:
@@ -1364,7 +1407,11 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
             },
             "rerank": {
                 "enabled": bool(cfg.retrieval.rerank_enabled),
-                "model": cfg.retrieval.rerank_model,
+                # 这一处给**拼好的权重目录**而不是裸露的模型ID：监控页要回答的是
+                # "业务实际在跑哪份权重"，配置页才需要把「模型路径」与「模型ID」分开
+                "model": resolve_rerank_model_path(
+                    getattr(cfg.retrieval, "rerank_model_dir", ""),
+                    cfg.retrieval.rerank_model),
                 "device": cfg.retrieval.rerank_device,
             },
             "observability": {
@@ -1713,8 +1760,55 @@ def _config_file(c: ServiceContainer) -> Path:
     return path
 
 
+class _RerankStore:
+    """把 retrieval 上的重排模型库伪装成一个"模型段"
+
+    重排模型是本机 Cross-Encoder 权重：库挂在 retrieval 段上（见
+    models._sync_rerank_library），库里没有地址与凭据，身份只有模型ID，条目级参数
+    只有加载设备。除了这几处，条目结构与另外两段完全一致（同一个 ModelEntry），
+    所以三个模型库接口靠这个壳子就能原样复用，一行流程都不用改。
+    """
+
+    def __init__(self, ret):
+        self._ret = ret
+
+    @property
+    def models(self):
+        return self._ret.rerank_models
+
+    @property
+    def active_id(self):
+        return self._ret.rerank_active_id
+
+    @property
+    def display_name(self):
+        return self._ret.rerank_display_name
+
+    @property
+    def model(self):
+        return self._ret.rerank_model
+
+    @property
+    def model_dir(self):
+        return self._ret.rerank_model_dir
+
+    @property
+    def device(self):
+        return self._ret.rerank_device
+
+    @property
+    def base_url(self):
+        return ""       # 本机权重没有服务地址：卡片不画这一行，也不参与校验
+
+    @property
+    def api_key(self):
+        return ""       # 没有凭据可存
+
+
 def _model_section(request: Request, section: str):
     """校验段名并取出内存里的（明文）模型段配置"""
+    if section == "rerank":
+        return _RerankStore(_container(request).config.retrieval)
     if section not in _MODEL_SECTION_KEYS:
         raise HTTPException(400, f"未知的模型段：{section or '(空)'}")
     return getattr(_container(request).config, section)
@@ -1731,12 +1825,24 @@ async def _write_model_section(request: Request, section: str,
     运行期不受影响（加载时按 active 重算顶层），但读文件的人会被误导。
     """
     active = next(e for e in entries if e.id == active_id)
-    sect: dict = {"models": [e.model_dump(mode="json") for e in entries],
-                  "active_id": active_id}
-    for k in MODEL_ENTRY_FIELDS:
-        sect[k] = getattr(active, k)
-    sect.update(active.params)
-    update = {section: sect}
+    if section == "rerank":
+        # 重排库的存储位置与另外两段不同：库挂在 retrieval 上，且没有地址/凭据，
+        # 只写几个顶层镜像字段（模型名 / 模型路径 / 模型ID / 加载设备）
+        update = {"retrieval": {
+            "rerank_models": [e.model_dump(mode="json") for e in entries],
+            "rerank_active_id": active_id,
+            "rerank_display_name": active.display_name,
+            "rerank_model_dir": str(active.params.get("model_dir") or "").strip(),
+            "rerank_model": active.model,
+            "rerank_device": active.params.get("device") or "cpu",
+        }}
+    else:
+        sect: dict = {"models": [e.model_dump(mode="json") for e in entries],
+                      "active_id": active_id}
+        for k in MODEL_ENTRY_FIELDS:
+            sect[k] = getattr(active, k)
+        sect.update(active.params)
+        update = {section: sect}
 
     cfg_path = _config_file(_container(request))
     try:
@@ -1793,7 +1899,14 @@ async def model_library_upsert(request: Request,
         or clean_model_ids([(by_key.get("model") or {}).get("value")])
     if not name:
         raise HTTPException(400, "模型名必填：它就是列表里显示、也是你用来认它的名字")
-    if not endpoint:
+    if section == "rerank":
+        # 重排没有独立的「API 地址」，那一栏就是「模型路径/API」：留空这条配置谁也
+        # 重排不了 —— 运行期只能退到 LLM 重排，而用户以为自己配好了
+        if not str((by_key.get("model_dir") or {}).get("value") or "").strip():
+            raise HTTPException(
+                400, "模型路径/API 必填：填本机权重目录（如 models），"
+                     "或远程重排服务地址（http://host:port/v1）")
+    elif not endpoint:
         raise HTTPException(400, "API 地址必填：留空表示本机 Mock 模式，无需入库")
     if not model_ids:
         raise HTTPException(400, "模型ID必填：集合点的地址不足以确定调用哪个模型")
@@ -1830,7 +1943,7 @@ async def model_library_upsert(request: Request,
     api_row = by_key.get("api_key") or {}
     target.api_key = _effective_api_key(
         sect, api_row.get("value"), "" if is_new else target.id,
-        cleared=bool(api_row.get("cleared")))
+        cleared=bool(api_row.get("cleared"))) if section != "rerank" else ""
     target.display_name = name
     target.base_url = endpoint
     target.model_ids = model_ids
@@ -1846,6 +1959,10 @@ async def model_library_upsert(request: Request,
             v = _coerce_param(row)
             if v is not None:
                 params[k] = v
+    if section == "rerank":
+        # 模型路径首尾的空白会让拼出来的目录差一个字符（`models ` → `models /xxx`），
+        # 界面看不出来、加载时才报路径不存在，在这里一次收口
+        params["model_dir"] = str(params.get("model_dir") or "").strip()
     target.params = params
 
     # 库里本来一条都没有 → 它只能当 active（没有第二条可选）；否则按界面的选择
@@ -1912,17 +2029,49 @@ async def model_library_delete(request: Request,
                                   sect.active_id), **result}
 
 
-def _local_models_root(request: Request) -> Path:
-    """本地预置模型权重目录：优先配置文件所在工程根的 models/，兜底 cwd/models"""
+def _project_root(request: Request) -> Path:
+    """配置文件所在工程根：界面上相对路径（模型路径填 `models`）的统一基准
+
+    相对路径不能按进程 CWD 解 —— uvicorn 的启动目录不一定是工程根，那样同一个
+    `models` 会随启动方式指到不同地方，界面上看起来"时好时坏"。
+    """
     c = _container(request)
     cfg_path = Path(getattr(c.config, "_config_path", "") or
                     "customer/customer_config.yaml")
     if not cfg_path.is_absolute():
         cfg_path = Path.cwd() / cfg_path
-    root = cfg_path.parent.parent / "models"
+    return cfg_path.parent.parent
+
+
+def _rerank_models_dir(request: Request, model_dir: object) -> Path:
+    """重排模型的「模型路径」→ 实际要去列的目录
+
+    绝对路径直接用（`/mydata/models`）；相对路径按工程根解（`models`）—— 与运行期
+    加载时拼完整路径的基准一致（见 models.resolve_rerank_model_path）。
+    """
+    raw = str(model_dir or "").strip()
+    p = Path(raw)
+    return p if p.is_absolute() else _project_root(request) / raw
+
+
+def _weight_dir_names(root: Path) -> list[str]:
+    """权重目录下的可选模型名：只要目录名（去掉隐藏目录与下划线前缀的辅助目录）
+
+    只回目录名、不回 `models/xxx` 这种带路径的写法 —— 路径已由「模型路径」那一行
+    表达，徽标与模型ID 再拖一串路径，用户就得自己从里面截出目录名。
+    """
     if not root.is_dir():
-        root = Path.cwd() / "models"
-    return root
+        return []
+    return sorted(d.name for d in root.iterdir()
+                  if d.is_dir() and not d.name.startswith((".", "_")))
+
+
+def _row_value(rows, key: str) -> str:
+    """表单行 → 字符串值（读的始终是这一行**当前**填的值，不是已保存的旧值）"""
+    for r in rows or []:
+        if isinstance(r, dict) and str(r.get("key")) == key:
+            return str(r.get("value") or "").strip()
+    return ""
 
 
 def _form_scalar_overrides(rows: list, fields) -> tuple[dict, str | None]:
@@ -2374,6 +2523,28 @@ async def list_model_ids(request: Request,
     kind = str(body.get("kind") or "llm")
     endpoint = str(body.get("endpoint") or "").strip()
     label = str(body.get("label") or kind)
+    if kind == "rerank":
+        # 本机 Cross-Encoder：没有服务端可问，候选就是「模型路径/API」那个目录下的
+        # 子目录（与「测试模型」同一套扫描，见 health_test）。回目录名即可 ——
+        # 路径那一半用户已经填在「模型路径/API」里了，模型ID 不该再带一遍
+        rows = body.get("params") if isinstance(body.get("params"), list) else []
+        model_dir = _row_value(rows, "model_dir")
+        if not model_dir:
+            return {"ok": False, "models": [],
+                    "message": "重排模型：先填「模型路径/API」（如 models 或 "
+                               "/mydata/models），再来获取模型"}
+        if is_http_url(model_dir):
+            # 填的是远程服务地址：那边没有"目录"可列（rerank 服务通常也不实现
+            # /models），所以这里不是失败，只是没事可做 —— 模型ID 按服务要求手填
+            return {"ok": True, "models": [],
+                    "message": f"「模型路径/API」填的是远程服务地址（{model_dir}）："
+                               "远程重排不用列本地权重，模型ID 按服务要求手填即可"}
+        root = _rerank_models_dir(request, model_dir)
+        models = _weight_dir_names(root)
+        return {"ok": True, "models": models,
+                "message": (f"在 {root} 下找到 {len(models)} 个模型："
+                            "点徽标即填入「模型ID」" if models else
+                            f"{root} 下没有模型目录（该目录不存在、或没放权重）")}
     if not endpoint:
         return {"ok": False, "models": [],
                 "message": f"{label}：先填 API 地址，再来获取模型ID"}
@@ -2408,6 +2579,41 @@ async def list_model_ids(request: Request,
             "message": f"取到 {len(models)} 个模型：点徽标即填入「模型ID」"}
 
 
+async def _probe_rerank_api(url: str, model: str) -> tuple[bool, str]:
+    """远程重排服务探活：真发一次两文档的 rerank，能解析出结果才算通
+
+    与 LLM/向量的「测试模型」同一个口径 —— 真调用，而不是只看地址通不通：地址
+    少写一段 /v1、服务压根没起、那个地址返回的其实不是 rerank 契约（有些网关对
+    什么都回 200），都会在这里当场暴露，而不是等用户问答时才发现重排没生效。
+    端点补全用 models.rerank_api_endpoint：测的就是运行期要打的地址。
+    """
+    import httpx
+    target = rerank_api_endpoint(url)
+    payload: dict = {"query": "ping", "documents": ["ping", "pong"], "top_n": 2}
+    if model:
+        payload["model"] = model
+    try:
+        async with httpx.AsyncClient(timeout=_MODEL_CALL_TIMEOUT_SEC) as hc:
+            r = await hc.post(target, json=payload)
+    except Exception as e:
+        return False, f"无法访问 {target}：{str(e)[:150]}"
+    body = _resp_body_snippet(r) or "（无响应体）"
+    if r.status_code != 200:
+        if r.status_code in (401, 403):
+            return False, (f"HTTP {r.status_code}：鉴权失败 —— 这台重排服务要凭据，"
+                           f"而「模型路径/API」一栏只有地址。原始信息：{body}")
+        return False, f"HTTP {r.status_code}：{target} 拒绝。原始信息：{body}"
+    try:
+        data = r.json() or {}
+    except Exception:
+        return False, f"HTTP 200 但响应不是 JSON：不是 rerank 接口。原始信息：{body}"
+    items = data.get("results") or data.get("data") or []
+    if not isinstance(items, list) or not items:
+        return False, (f"HTTP 200 但响应里没有 results：{target} 不是 rerank 接口"
+                       f"（检查地址是否少了/多了 /v1）。原始信息：{body}")
+    return True, f"{target} 正常回应（{len(items)} 条打分）"
+
+
 @admin_ui_router.post("/health/test")
 async def health_test(request: Request,
                       user: UserContext = Depends(require_admin)):
@@ -2424,30 +2630,45 @@ async def health_test(request: Request,
     models: list = []
 
     if kind == "rerank":
-        # 本地 Cross-Encoder：扫描工程 models/ 目录下的预置权重
-        root = _local_models_root(request)
-        names = sorted(d.name for d in root.iterdir()
-                       if d.is_dir() and not d.name.startswith((".", "_"))) \
-            if root.is_dir() else []
-        models = [f"models/{n}" for n in names]
+        # 两义分流：「模型路径/API」填 http(s) 地址 = 那台远程重排服务，填目录 =
+        # 本机 Cross-Encoder 权重。两边都真测 —— 远程发一次最小 rerank 请求（地址
+        # 少写一段 /v1、服务没起、返回体不是 rerank 契约，都在这里当场暴露），
+        # 本机判"拼出来的目录在不在"：权重文件齐不齐、显存够不够，要到第一次
+        # 问答真正加载时才知道（TS-009 记的正是这条测试的口径局限）
         model = str(body.get("model") or "").strip()
-        if model:
-            p = Path(model)
-            if p.is_absolute() or p.exists():
-                online = p.is_dir()
-                message = "本地模型路径有效" if online else "本地路径不存在"
-            elif model in names or model.lstrip("./") in names:
-                online = True
-                message = f"已匹配本地权重 models/{model.lstrip('./')}"
-            else:
-                online = True
-                message = "未匹配本地权重，将按 HuggingFace ID 在线获取"
+        model_dir = _row_value(rows, "model_dir")
+        if is_http_url(model_dir):
+            online, message = await _probe_rerank_api(model_dir, model)
         else:
-            message = "未填写模型名称"
-        if not names:
-            message = (message + "；models/ 目录为空或不存在，"
-                       "请预先放置权重目录") if model else \
-                      "models/ 目录为空或不存在，请预先放置权重目录"
+            models = _weight_dir_names(_rerank_models_dir(request, model_dir)) \
+                if model_dir else []
+            if not model:
+                message = ("模型ID为空：先填「模型路径/API」再点「获取模型」选一个，"
+                           "或直接手填 HuggingFace ID / 完整路径")
+            elif not model_dir:
+                # 没填「模型路径/API」= 模型ID 本身就是完整引用：绝对路径可当场判定，
+                # 其余按 HuggingFace ID 在线获取（本地无从判定，不该拦着）
+                p = Path(model)
+                if p.is_absolute():
+                    online = p.is_dir()
+                    message = (f"本地权重目录存在：{p}" if online
+                               else f"本地路径不存在：{p}")
+                else:
+                    online = True
+                    message = (f"未填「模型路径/API」：将按 {model} 在线获取"
+                               "（HuggingFace ID）")
+            else:
+                p = Path(resolve_rerank_model_path(model_dir, model))
+                if not p.is_absolute():
+                    p = _project_root(request) / str(p)
+                online = p.is_dir()
+                if online:
+                    message = f"本地权重目录存在：{p}"
+                else:
+                    message = (f"本地权重目录不存在：{p}"
+                               "（核对「模型路径/API」与「模型ID」）")
+                    if models:
+                        message += "；该目录下有：" + "、".join(models)
     # LLM/Embedding「测试模型」：用表单里的地址 + Key + 模型ID **真发一次请求**
     # （对话模型 → /chat/completions，向量模型 → /embeddings），有正确回应才算通过。
     # 旧口径只 GET 一次 /models，等于只证明"地址通"：模型ID 填错、Key 没权限、

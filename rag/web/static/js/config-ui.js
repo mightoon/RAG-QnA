@@ -348,7 +348,7 @@
   /* 左列里「被点中的那条」的 id（按段）。选中 = 右侧表单现在显示的是它、入库时会
      更新它（没选中则是新增一条）。放这里而不是挂在 g 上：g 是回传给后端的配置载荷，
      掺进 _editingId 这类纯界面状态会被一起写进配置文件 */
-  const modelEdit = { llm: '', embedding: '' };
+  const modelEdit = { llm: '', embedding: '', rerank: '' };
 
   function libButton(text, cls, title, onClick) {
     const b = el('button', cls, text);
@@ -397,7 +397,9 @@
       if (!rows.some(r => r.key === p.key)) rows.push(p);
     });
     g.configParams = rows;
-    g.endpoint = entry.endpoint;
+    // 重排模型是本机权重，表单里没有「API 地址」这一行（见 noEndpoint），
+    // 也就没有 endpoint 可回填 —— 照旧给 g 塞一个空串反而会凭空长出一行
+    if (!g.noEndpoint) g.endpoint = entry.endpoint;
     // 只取第一个：它是这条配置调用的那个，也是「模型ID」框该显示的值
     // （老条目里可能存着多个，界面不再摆出其余那些）
     g.modelIds = (entry.modelIds || []).slice(0, 1);
@@ -408,9 +410,26 @@
     const entries = (g.library || {}).entries || [];
     const act = entries.find(e => e.active) || entries[0];
     if (!act) return;
-    g.endpoint = act.endpoint;
+    if (!g.noEndpoint) g.endpoint = act.endpoint;
     g.modelIds = (act.modelIds || []).slice(0, 1);
     g.configParams = JSON.parse(JSON.stringify(act.configParams || []));
+  }
+
+  /* 「增加模型」：把右侧表单清成一张空白表 —— 行都留着（标签/类型/是否凭据沿用
+     原有那套），只是值全空，于是接下来填的是一套**新**配置，入库走"新增"而不是
+     覆盖某一条（有无 id 决定新增还是更新，见 buildPayload）。
+     凭据行的「已存过」标记也一并抹掉：留着它，api_key 框会摆出上一条钥匙长度的
+     圆点，看着像还在用旧钥匙（圆点占位见 secretFormValue）。
+     清完把基线对齐到这张空表：清空不算"改动"，「未保存」不该亮起来，真填了字段
+     才由 touch() 点亮。 */
+  function clearFormForNew(g) {
+    (g.configParams || []).forEach(p => {
+      p.value = '';
+      p.hasValue = false;
+      p.valueLen = 0;
+    });
+    if (!g.noEndpoint) g.endpoint = '';
+    g.modelIds = [];
   }
 
   /* 模型库操作后的统一提示：核心是"生效没生效"，别让用户以为切过去了 */
@@ -434,13 +453,31 @@
     Partials.refreshPiece('panel_model');    // 左列表 + 右表单都要重绘
   }
 
+  /* 左列标题带上槽位名：三块模型库上下叠着，都只写「模型库」就分不清谁是谁
+     （槽位名就是后端那套段名的 key；重排段虽挂在 retrieval 上，但接口层用
+     routes._RerankStore 伪装成了同样的"段"，这里是同一个标题口径） */
+  const LIB_TAGS = { llm: 'LLM', embedding: 'Embedding', rerank: 'Rerank' };
+  const libTitle = key => (LIB_TAGS[key] ? '模型库 · ' + LIB_TAGS[key] : '模型库');
+
   function renderLibrary(g) {
     const lib = g.library || { activeId: '', entries: [] };
     const entries = lib.entries || [];
     const box = el('div', 'model-lib');
     const head = el('div', 'model-lib-head');
-    head.appendChild(el('span', 'model-lib-title', '模型库'));
+    head.appendChild(el('span', 'model-lib-title', libTitle(g.key)));
     head.appendChild(el('span', 'badge badge-default', entries.length + ' 个已测通'));
+    /* 「增加模型」贴在这一行的最右边：点一下 = 右侧表单清空 + 退出选中态，
+       于是接下来填的是一套新配置（入库走新增）；不点它也能直接改现有条目。
+       没有条目时它也照旧摆着 —— 总得有个"从空白开始填"的入口 */
+    const add = libButton('增加模型', 'btn btn-ghost btn-sm',
+      '清空右侧表单，用来配一个新模型（测通后点「存入模型库」）', () => {
+        modelEdit[g.key] = '';
+        clearFormForNew(g);
+        ConfigData.markSaved(['model:' + g.key]);   // 清空不是改动
+        Partials.refreshPiece('panel_model');
+      });
+    add.style.marginLeft = 'auto';   // 靠这一行最右
+    head.appendChild(add);
     box.appendChild(head);
 
     if (!entries.length) {
@@ -464,7 +501,14 @@
          重绘，同一个位置变成绿牌 —— 标记与按钮共用一个槽，卡片不会跳。
          地址与 key 不进列表：它们占行宽又不常看，点卡片即可回填到右侧核对 */
       const acts = el('div', 'model-lib-acts');
-      if (e.active) {
+      if (e.active && g.notEnabled) {
+        /* 重排模型特有：这一条确实是 active，但「检索策略」里的「启用重排」没勾上，
+           它压根不参与召回 —— 绿牌 active 在这里就成了谎话，换成灰牌说明原因
+           （文案由后端给，见 _normalize_config 的 notEnabled） */
+        const b = el('span', 'badge badge-default', '未启用');
+        b.title = g.notEnabled;
+        acts.appendChild(b);
+      } else if (e.active) {
         acts.appendChild(el('span', 'badge badge-success', 'active'));
       } else {
         // 设为 active：只改"业务用哪一套"，条目本身不动
@@ -612,10 +656,22 @@
         // 是它的镜像）。「获取模型ID」拉回来的候选只是填充手段，不进配置
         const modelRow = (g.configParams || []).find(p => p.key === 'model') || {};
         const inUse = String(modelRow.value == null ? '' : modelRow.value).trim();
-        const ep = String(g.endpoint || '').trim();
-        if (!ep) {
+        // 重排模型是本机权重（noEndpoint）：没有服务地址可填，也不该拦住入库
+        const ep = g.noEndpoint ? '' : String(g.endpoint || '').trim();
+        if (!g.noEndpoint && !ep) {
           const err = new Error((g.label || g.key) +
             '：API 地址必填 —— 留空是本机 Mock 模式，没有可入库的配置');
+          err.validation = true;
+          throw err;
+        }
+        // 重排没有「API 地址」这一行，地址那一半并进了「模型路径/API」——
+        // 它就是这段的必填项（后端同样校验）：填目录 = 本机权重，填 http(s) 地址 =
+        // 远程重排服务。留空等于这条配置谁也重排不了，而用户以为配好了
+        const dirRow = (g.configParams || []).find(p => p.key === 'model_dir');
+        if (dirRow && !String(dirRow.value == null ? '' : dirRow.value).trim()) {
+          const err = new Error((g.label || g.key) +
+            '：模型路径/API 必填 —— 填本机权重目录（如 models），' +
+            '或远程重排服务地址（http://host:port/v1）');
           err.validation = true;
           throw err;
         }
@@ -761,7 +817,10 @@
     // 由循环末尾那次调用补上，等于退回原来的"地址行在最前"。
     let endpointDone = false;
     const injectEndpoint = () => {
-      if (endpointDone || g.endpoint === undefined) return;
+      // 重排模型（g.noEndpoint）没有独立的「API 地址」行：地址那一半已经并进
+      // 「模型路径/API」那一栏（见后端 _RERANK_PARAMS 与 models.is_http_url），
+      // 后端也不再下发 endpoint 键。所以这里不画，卡片上就没有那行
+      if (endpointDone || g.noEndpoint || g.endpoint === undefined) return;
       endpointDone = true;
       rows.appendChild(kvRow('API 地址', textInput(g.endpoint, v => {
         g.endpoint = v; touch('base_url');
@@ -775,11 +834,20 @@
     const injectModelPicker = () => {
       if (pickerDone || !isModel) return;
       pickerDone = true;
+      // 重排模型没有服务端可问：这一步是"列一下上面「模型路径/API」那个目录里有
+      // 哪些权重目录"，所以按钮名与提示都按本地目录说（后端 list-models 的 rerank
+      // 分支）。那一栏填的是远程服务地址时后端只回一句说明 —— 远程不用列本地权重
+      const localPick = !!g.noEndpoint;
       const ctl = el('div', 'model-id-pick');
-      const btn = el('button', 'btn btn-ghost btn-sm', '获取模型ID');
+      const btn = el('button', 'btn btn-ghost btn-sm',
+                     localPick ? '获取模型' : '获取模型ID');
       btn.type = 'button';
-      btn.title = '按上面填的 API 地址与 API Key 要一次可用模型列表；'
-        + 'Key 留空 = 用这条已保存的那把';
+      btn.title = localPick
+        ? '列出上面「模型路径/API」目录下的权重目录（每个子目录一个模型），'
+          + '点一个即填入「模型ID」；那一栏填的是远程服务地址（http(s)://…）'
+          + '则无需获取，模型ID 按服务要求手填'
+        : '按上面填的 API 地址与 API Key 要一次可用模型列表；'
+          + 'Key 留空 = 用这条已保存的那把';
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         btn.textContent = '获取中…';
@@ -836,6 +904,16 @@
     (g.configParams || []).forEach(p => {
       if (p.key !== 'display_name') injectEndpoint();
       if (p.key === 'model' && isModel) injectModelPicker();   // 排在模型ID上方
+      // 重排模型的「推理设备」是两选一（cpu / cuda）：理由同下面的 bool —— 后端按
+      // 白名单归一，手填 "GPU" 只会静默退回 cpu，那就成了"填了但没生效"
+      if (p.key === 'device') {
+        rows.appendChild(radioRow(p.label || p.key,
+          'svc-device-' + g.key,
+          [{ v: 'cpu', label: 'CPU' }, { v: 'cuda', label: 'GPU (CUDA)' }],
+          String(p.value || 'cpu').toLowerCase() === 'cuda' ? 'cuda' : 'cpu',
+          v => { p.value = v; touch(p.key); }));
+        return;
+      }
       // bool 型一律给单选，不让人手填 true/false：
       // 后端按字符串判真值（"1 / true / yes / on" 之外都算 false），填错只会静默变 false
       if (p.type === 'bool') {
@@ -887,12 +965,23 @@
           g.modelIds = t ? [t] : [];   // 清空 = 还没填，保存会被必填校验拦下
           p.value = t;
           touch('model');     // 换了模型ID → 上次那次「测试模型」不再为它背书
-        }, { placeholder: '如 qwen2.5-14b-instruct / bge-m3' });
+        }, {
+          // 重排的模型ID 是「模型路径/API」下的目录名（本机权重）或服务认的模型名
+          // （远程重排），两种都不拖路径 —— 路径/地址那一半在那一行里填；
+          // 在线服务的模型ID 才长这样带斜杠的名字
+          placeholder: g.noEndpoint ? '权重目录名，如 bge-reranker-base'
+                                    : '如 qwen2.5-14b-instruct / bge-m3',
+        });
         modelIdInput = input;
         rows.appendChild(kvRow(p.label || p.key, input, true));
         return;
       }
       if (p.key === 'display_name') opts.placeholder = '如：DeepSeek 线上 / 内网 vLLM';
+      if (p.key === 'model_dir') {
+        // 「模型路径/API」两义（后端按 is_http_url 分流）：占位符把两种写法都摆出来
+        opts.placeholder =
+          'models（本机权重目录），或 http://host:port/v1（远程重排服务）';
+      }
       // api_key 的框里是真值；其余凭据行摆的是圆点占位，状态里仍是空串 ——
       // "没动过"靠提交时现读框里的文本判定（见 secretFormValue / secretInputs）
       const input = textInput(initial, v => {
@@ -902,7 +991,8 @@
       }, opts);
       if (p.secret) secretInputs[p.key] = input;
       rows.appendChild(kvRow(p.label || p.key, input,
-        p.key === 'model' || p.key === 'display_name', p.optional));
+        p.key === 'model' || p.key === 'display_name' || p.key === 'model_dir',
+        p.optional));
     });
     injectEndpoint();   // 没有"模型名"的卡片：地址行退回最前
     // paramsJson → JSON 编辑框
@@ -1002,77 +1092,16 @@
     return wrap;
   }
 
-  /* ── 重排模型块（模型 tab 第三块：本地 Cross-Encoder） ── */
-  function renderRerankBlock() {
-    const c = ConfigData.state.config;
-    const r = (c && c.retrieval) || {};
-    const card = el('div', 'card perm-card');
-    const head = el('header');
-    const titleWrap = el('div', 'card-title');
-    titleWrap.appendChild(el('span', 'doc-title-main', '重排模型 (Rerank)'));
-    if (r.rerankEnabled === false) {
-      titleWrap.appendChild(el('span', 'badge badge-warning', '未启用'));
-    }
-    head.appendChild(titleWrap);
+  /* 重排模型块已并入上面那套通用模型卡片：库、表单、按钮全由 renderLibrary /
+     modelCard 渲染，段描述由后端下发（key='rerank'，见 routes._normalize_config）。
+     它与 LLM / 向量两段的差别只有两个开关：noEndpoint（没有**独立的** API 地址行 ——
+     地址那一半并进了「模型路径/API」，见 injectEndpoint）、notEnabled（没勾
+     「启用重排」时左列给灰牌）。 */
 
-    // 本块只负责 retrieval 下的两个键，保存时也只提交这两个键
-    const paths = ['retrieval.rerankModel', 'retrieval.rerankDevice'];
-    const save = moduleSaveControls(paths, () => ({
-      retrieval: { rerankModel: r.rerankModel || '', rerankDevice: r.rerankDevice || 'cpu' },
-    }), null, null, { errTtl: MODEL_ERR_TTL });
-    const touch = () => { ConfigData.markDirty(); save.refresh(); };
+  /* 左列那块的现在由通用 renderLibrary(g) 渲染（含「删除」「设为 active」「增加模型」） */
 
-    const actions = el('div', 'card-actions');
-    const t = el('button', 'btn btn-ghost btn-sm', '测试连接');
-    t.addEventListener('click', async () => {
-      t.disabled = true;
-      t.textContent = '测试中…';
-      try {
-        const res = await ConfigData.testConnection('rerank', '', '', r.rerankModel || '');
-        t.textContent = res.online ? `✓ ${res.latencyMs}ms` : '✗ 失败';
-        showToast(res.message || (res.online ? '模型可用' : '验证失败'),
-                  res.online ? 'success' : 'error',
-                  res.online ? undefined : MODEL_ERR_TTL);
-        if (Array.isArray(res.models) && res.models.length) {
-          // 扫出来的候选（权重目录 / 服务端报的）同样只是"选一个填进去"：
-          // 卡片下方铺一排徽标，点一个写进「模型名称」框，没有删除键
-          let chipsBox = card.querySelector('.model-chip-box');
-          if (!chipsBox) {
-            chipsBox = el('div', 'model-chip-box');
-            card.appendChild(chipsBox);
-          }
-          attachModelChips(chipsBox, res.models,
-            () => modelInput.value,
-            name => {
-              modelInput.value = name;
-              modelInput.dispatchEvent(new Event('input'));
-            });
-        }
-      } catch (e) {
-        t.textContent = '✗ 失败';
-        showToast('测试失败：' + e.message, 'error', MODEL_ERR_TTL);
-      } finally {
-        setTimeout(() => { t.disabled = false; t.textContent = '测试连接'; }, 3000);
-      }
-    });
-    actions.appendChild(t);
-    actions.appendChild(save.tag);
-    actions.appendChild(save.btn);
-    head.appendChild(actions);
-    card.appendChild(head);
-
-    const rows = el('div', 'perm-rows');
-    const modelInput = textInput(r.rerankModel || '', v => {
-      r.rerankModel = v; touch();
-    }, { placeholder: 'models/ 下的权重目录名，或 HuggingFace ID（如 BAAI/bge-reranker-v2-m3）' });
-    rows.appendChild(kvRow('模型名称', modelInput, false));
-    rows.appendChild(radioRow('推理设备', 'rerank-device',
-      [{ v: 'cpu', label: 'CPU' }, { v: 'cuda', label: 'GPU (CUDA)' }],
-      r.rerankDevice || 'cpu',
-      v => { r.rerankDevice = v; touch(); }));
-    card.appendChild(rows);
-    return card;
-  }
+  /* 右列表单也走通用 modelCard：行由后端 configParams 下发，「推理设备」在下面按
+     单选渲染（跟 bool 参数同一个思路），保存按钮是「存入模型库 / 更新模型库」 */
 
   /* ── 检索策略（附加到模型面板底部） ── */
   function renderRetrievalBlock() {
@@ -1207,8 +1236,9 @@
       // 前两块用 modelCard：左列模型库 + 右列配置表单
       const wrap = el('div');
       const stack = el('div', 'model-stack');
+      /* 三段模型库（LLM / 向量 / 重排）都是同一张卡片：段描述由后端下发，
+         重排段也在 data.groups 里（key='rerank'） */
       (data.groups || []).forEach(g => stack.appendChild(modelCard(g)));
-      stack.appendChild(renderRerankBlock());
       wrap.appendChild(stack);
       const ret = renderRetrievalBlock();
       ret.style.marginTop = '16px';

@@ -33,19 +33,23 @@ try:
 
         # ── B. 配置保存 → 热重建生效 ──
         print("=== B. 保存配置 → 热应用 ===")
+        # 模型段改走模型库接口：/api/admin/config 会拒收 modelProviders 与
+        # retrieval.rerank* 镜像字段（见 routes._yaml_update_from_payload），
+        # 顶层字段由 active 条目在加载时重写
+        r = c.post('/api/admin/model-library/upsert', json={
+            'section': 'llm', 'endpoint': 'http://127.0.0.1:9/v1',
+            'modelIds': ['test-model'],
+            'configParams': [
+                {'key': 'display_name', 'value': 'smoke-llm', 'type': 'str'},
+                {'key': 'model', 'value': 'test-model', 'type': 'str'},
+                {'key': 'api_key', 'value': 'sk-x', 'type': 'str'},
+                {'key': 'temperature', 'value': '0.5', 'type': 'float'},
+                {'key': 'max_tokens', 'value': '1024', 'type': 'int'},
+            ], 'verified': True, 'activate': True}, headers=h)
+        print('model upsert', r.status_code, r.json().get('ok'))
         payload = {
-            'retrieval': {'rerankEnabled': True,
-                          'rerankModel': 'BAAI/bge-reranker-v2-m3',
-                          'rerankThreshold': 0.35},
+            'retrieval': {'rerankEnabled': True, 'rerankThreshold': 0.35},
             'permissionMappings': [{'role': 'admin', 'collections': ['*'], 'is_admin': True}],
-            'modelProviders': [{
-                'key': 'llm', 'endpoint': 'http://127.0.0.1:9/v1',
-                'configParams': [
-                    {'key': 'model', 'value': 'test-model', 'type': 'str'},
-                    {'key': 'api_key', 'value': 'sk-x', 'type': 'str'},
-                    {'key': 'temperature', 'value': '0.5', 'type': 'float'},
-                    {'key': 'max_tokens', 'value': '1024', 'type': 'int'},
-                ]}],
             'serviceGroups': [{
                 'key': 'meta',
                 'configParams': [
@@ -62,11 +66,97 @@ try:
         r = c.get('/api/health', headers=h)
         deg = r.json().get('degraded') or {}
         print('after-rebuild degraded has llm?', 'llm' in deg)
+
+        # ── 重排模型库：多套配置并存 + 切 active + 删除 ──
+        # 重排是本机 Cross-Encoder 权重（无地址/凭据），库挂在 retrieval 上
+        # （见 routes._RerankStore / models._sync_rerank_library）
+        def _rerank_upsert(name, device):
+            # 「模型路径」= 权重所在目录、「模型ID」= 目录下的子目录名：两行分开存，
+            # 徽标与模型ID 都不带路径前缀（见 models.resolve_rerank_model_path）
+            return c.post('/api/admin/model-library/upsert', json={
+                'section': 'rerank',
+                'modelIds': ['bge-reranker-v2-m3'],
+                'configParams': [
+                    {'key': 'display_name', 'value': name, 'type': 'str'},
+                    {'key': 'model_dir', 'value': 'models', 'type': 'str'},
+                    {'key': 'model', 'value': 'bge-reranker-v2-m3', 'type': 'str'},
+                    {'key': 'device', 'value': device, 'type': 'str'},
+                ], 'verified': True, 'activate': False}, headers=h)
+
+        # 「获取模型」：按表单里的「模型路径」列目录，候选只回目录名
+        r = c.post('/api/admin/model-library/list-models',
+                   json={'kind': 'rerank',
+                         'params': [{'key': 'model_dir', 'value': 'models',
+                                     'type': 'str'}]}, headers=h)
+        picked = r.json().get('models') or []
+        print('rerank list-models', r.status_code, picked[:2],
+              '| bare(no path)?', bool(picked) and all('/' not in m for m in picked))
+        # 「测试模型」：模型路径 + 模型ID 拼出的目录在才算过
+        r = c.post('/api/admin/health/test',
+                   json={'kind': 'rerank', 'model': 'bge-reranker-base',
+                         'params': [{'key': 'model_dir', 'value': 'models',
+                                     'type': 'str'}]}, headers=h)
+        print('rerank health/test', r.status_code, r.json().get('online'),
+              (r.json().get('message') or '')[:60])
+        # 「模型路径/API」也接受远程重排服务地址（同一栏两义，见 models.is_http_url）：
+        # 列候选只回一句说明（远程不列本地权重）；「测试模型」真打它的 /rerank ——
+        # 给一个不可达端口，必须如实判失败，且地址要补成 …/v1/rerank（与运行期同一个
+        # 补全函数），不能只看"路径存不存在"就报通过
+        url_params = [{'key': 'model_dir', 'value': 'http://127.0.0.1:9/v1',
+                       'type': 'str'}]
+        r = c.post('/api/admin/model-library/list-models',
+                   json={'kind': 'rerank', 'params': url_params}, headers=h)
+        print('rerank list-models (url)', r.status_code, r.json().get('ok'),
+              (r.json().get('message') or '')[:50])
+        r = c.post('/api/admin/health/test',
+                   json={'kind': 'rerank', 'model': 'bge-reranker-base',
+                         'params': url_params}, headers=h)
+        _url_msg = r.json().get('message') or ''
+        print('rerank health/test (url)', r.status_code, r.json().get('online'),
+              _url_msg[:60])
+        assert r.json().get('online') is False, '不可达的远程重排地址必须判失败'
+        assert '/rerank' in _url_msg, '地址应补成 <地址>/rerank 再打'
+        # 「模型路径/API」必填（后端校验，前端也拦）：空着等于这条配置谁也重排不了
+        r = c.post('/api/admin/model-library/upsert', json={
+            'section': 'rerank', 'modelIds': ['bge-reranker-base'],
+            'configParams': [
+                {'key': 'display_name', 'value': 'smoke-rerank-nodir',
+                 'type': 'str'},
+                {'key': 'model_dir', 'value': '', 'type': 'str'},
+                {'key': 'model', 'value': 'bge-reranker-base', 'type': 'str'},
+            ], 'verified': True}, headers=h)
+        print('rerank upsert w/o model_dir', r.status_code,
+              (r.json().get('detail') or '')[:40])
+        assert r.status_code == 400, '缺「模型路径/API」应被拒收'
+
+        first = _rerank_upsert('smoke-rerank-cpu', 'cpu').json()
+        r2 = _rerank_upsert('smoke-rerank-gpu', 'cuda')
+        second = r2.json()
+        entries = (second.get('library') or {}).get('entries') or []
+        cpu_id = next(e['id'] for e in entries
+                      if e.get('displayName') == 'smoke-rerank-cpu')
+        gpu_id = next(e['id'] for e in entries
+                      if e.get('displayName') == 'smoke-rerank-gpu')
+        print('rerank upsert', r2.status_code, second.get('ok'),
+              '| entries=', len(entries))
+        r = c.post('/api/admin/model-library/activate',
+                   json={'section': 'rerank', 'id': gpu_id}, headers=h)
+        print('rerank activate', r.status_code, r.json().get('ok'))
+        r = c.post('/api/admin/model-library/delete',
+                   json={'section': 'rerank', 'id': cpu_id}, headers=h)
+        print('rerank delete', r.status_code, r.json().get('ok'),
+              '| left=', len((r.json().get('library') or {}).get('entries') or []))
+
         # YAML 写回验证
         text = CFG.read_text(encoding='utf-8')
         print('yaml has model?', 'test-model' in text,
-              '| rerank_model?', 'bge-reranker-v2-m3' in text,
+              '| rerank_model?', 'rerank_model: bge-reranker-v2-m3' in text,
+              '| rerank_model_dir?', 'rerank_model_dir: models' in text,
+              '| rerank_device=cuda?', 'rerank_device: cuda' in text,
+              '| rerank library?', 'smoke-rerank-gpu' in text,
+              '| no path in id?', 'models/bge-reranker' not in text,
               '| port int?', 'port: 3306' in text)
+        assert first.get('ok'), '第一个重排配置应入库成功'
         # 连接测试（LLM 端点直测，127.0.0.1:9 不可达 → 失败但接口正常）
         r = c.post('/api/admin/health/test',
                    json={'kind': 'llm', 'endpoint': 'http://127.0.0.1:9/v1'}, headers=h)

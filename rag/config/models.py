@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 import secrets
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,15 @@ MODEL_ENTRY_FIELDS = ("display_name", "base_url", "api_key", "model")
 _MODEL_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
     "llm": ("temperature", "max_tokens", "timeout", "max_concurrency"),
     "embedding": ("dim", "batch_size", "query_prefix", "normalize", "timeout"),
+    # 重排模型：条目级参数是「模型路径/API + 加载设备」。model_dir 存本机权重
+    # 所在目录（用户填 models / /mydata/models 这类），也是**远程重排服务地址**
+    # 的落脚点 —— 界面上就一栏，填目录走本机 Cross-Encoder、填 http(s) 走它的
+    # /rerank（见 is_http_url / rerank_api_endpoint）。模型ID 只存目录名或服务要
+    # 的模型名 —— 两处分开放，界面上才能"选目录 → 选模型"，而卡片徽标与模型ID
+    # 框只显示目录名，不拖着一串路径（见 resolve_rerank_model_path）。
+    # 它不是顶层的一个"段"（存储挂在 retrieval 上，见 _sync_rerank_library），
+    # 但沿用同一套条目结构与参数表 —— 三个模型库接口才能原样复用
+    "rerank": ("model_dir", "device"),
 }
 
 # 存量配置（YAML 里还没有 models 段）自动升级出来的那条的 id。刻意用固定串而非
@@ -98,6 +108,74 @@ def clean_model_ids(ids: Any) -> list[str]:
         if s and s not in out:
             out.append(s)
     return out
+
+
+def is_http_url(value: Any) -> bool:
+    """值是不是一个 http(s) 地址
+
+    重排的「模型路径/API」一栏两义共存（本机权重目录 / 远程重排服务地址），分流
+    全靠它：界面上按目录列候选、运行期按地址发请求（见 routes.health_test 的
+    rerank 分支与 query_retrieve 的远程分支）。
+    """
+    return str(value or "").strip().lower().startswith(("http://", "https://"))
+
+
+def rerank_api_endpoint(url: Any) -> str:
+    """「模型路径/API」填的地址 → 真正要 POST 的 rerank 端点
+
+    用户填的多半是服务根地址（`http://host:8080`、`http://host:8080/v1`），少数
+    会把端点一起填上。补全只认一种**已经完整**的写法（末段就是 rerank），其余一律
+    补 `/rerank` —— 猜「/v1/rerank 还是 /rerank」只能靠约定，而这个函数是
+    「测试模型」与运行期**共用**的：两边永远打同一个地址，不会出现"测通了但问答
+    不走它"（见 routes._probe_rerank_api 与 query_retrieve._remote_rerank_scores）。
+    """
+    u = str(url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    return u if u.rsplit("/", 1)[-1].lower() == "rerank" else u + "/rerank"
+
+
+def split_rerank_model_ref(value: Any) -> tuple[str, str]:
+    """旧口径的「模型路径 + 模型ID」合一体 → (模型路径, 模型ID)
+
+    只拆两种**不含歧义**的本地路径：
+    - 绝对路径（`/mydata/models/bge-reranker-base`、`D:/m/models/xxx`）：绝对路径
+      只可能是本地目录，HuggingFace ID 从不以分隔符开头；
+    - 工程预置目录前缀（`models/bge-reranker-base`）。
+
+    HuggingFace ID（`BAAI/bge-reranker-v2-m3`）与 http(s) 地址**都必须原样留着**：
+    前者没有本地目录，拆成 "BAAI" + "bge-reranker-v2-m3" 就再也下不回来了 —— 这
+    正是旧口径里"模型ID 里面既可以写 ID 也可以写路径"留下的坑；后者拆开就不再是
+    一个能打的地址（两处都靠"不以分隔符开头"这一条天然落到下面原样返回）。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return "", ""
+    if os.path.isabs(s) or s.startswith(("./", ".\\", "../", "..\\")):
+        d, _, m = s.replace("\\", "/").rpartition("/")
+        return (d, m) if d and m else ("", s)
+    head, sep, tail = s.partition("/")
+    if sep and head.strip().lower() == "models":
+        return "models", tail
+    return "", s
+
+
+def resolve_rerank_model_path(model_dir: Any, model: Any) -> str:
+    """(模型路径/API, 模型ID) → 交给重排后端的实际目标
+
+    界面上分两行填（先选目录、再选目录下的模型），加载要的是一个完整路径：
+    填了目录就拼成 `<目录>/<模型ID>`。「模型路径/API」填的是 http(s) 地址时原样
+    返回这个地址：那是台远程重排服务，模型ID 不进路径、只进请求体（见
+    query_retrieve 的远程分支）。目录留空则原样返回模型ID —— 这时它要么是
+    HuggingFace ID（在线获取，本来就没有本地目录），要么本身就是个完整路径。
+    """
+    d = str(model_dir or "").strip().rstrip("/\\")
+    m = str(model or "").strip()
+    if is_http_url(d):
+        return d
+    if not d or not m or os.path.isabs(m):
+        return m
+    return f"{d}/{m}"
 
 
 def normalize_entry_models(e: ModelEntry) -> None:
@@ -173,6 +251,75 @@ def _sync_model_library(sect: Any, section: str) -> None:
     for k in fields:
         if k in active.params:
             setattr(sect, k, active.params[k])
+
+
+def _sync_rerank_library(ret: Any) -> None:
+    """维护「重排模型库 ↔ retrieval.rerank_* 镜像」的不变式（原地修改 ret）
+
+    与 _sync_model_library 同构（库是源、顶层字段是 active 条目的镜像），差异只有
+    两处 —— 也是重排模型与另外两段本质不同的地方：
+    1. 存储挂在 retrieval 段上，不是一个顶层段：重排是本机 Cross-Encoder 权重目录，
+       没有服务地址、没有凭据可存；
+    2. 身份只有"模型ID"一个，条目级参数是「模型路径/API」与加载设备（填本机权重
+       目录时是路径、填远程服务地址时是 URL，两义共用同一栏）。
+    """
+    fields = _MODEL_PARAM_FIELDS["rerank"]
+    entries: list[ModelEntry] = list(ret.rerank_models)
+
+    if not entries:
+        # 顶层写着模型ID → 那是业务当下真正会去加载的那个，补成一条。
+        # 判据不能像 _sync_model_library 那样看"地址空不空"：重排的 rerank_model
+        # 缺省值本身就是一条可用的配置（运行期拿它加载 Cross-Encoder），
+        # 所以这里补出来的条目是实情，不是凭空造的 Mock 条目
+        raw = str(ret.rerank_model or "").strip()
+        if not raw:
+            return
+        # 旧口径把目录与模型ID 合写在 rerank_model 一处（如 models/bge-reranker-base），
+        # 拆开存：顶层只留目录名，目录挪到 model_dir —— 与界面上的两行同口径
+        model_dir = str(getattr(ret, "rerank_model_dir", "") or "").strip()
+        if not model_dir:
+            model_dir, raw = split_rerank_model_ref(raw)
+        entries = [ModelEntry(
+            id=LEGACY_ENTRY_ID,
+            display_name=str(ret.rerank_display_name or ""),
+            model=raw,
+            params={"model_dir": model_dir,
+                    "device": str(ret.rerank_device or "cpu")},
+        )]
+
+    for e in entries:
+        normalize_entry_models(e)
+        # 存量条目：模型ID 里可能还带着目录前缀（旧口径把目录与ID 合在一处），
+        # 挪到「模型路径」参数上 —— 卡片徽标与模型ID 框就只剩目录名了
+        if not str(e.params.get("model_dir") or "").strip():
+            d, m = split_rerank_model_ref(e.model)
+            if d:
+                e.params["model_dir"] = d
+                e.model = m
+                # 同一套权重下并列的其它模型ID 也按同样口径去前缀，徽标才一致
+                e.model_ids = clean_model_ids(
+                    split_rerank_model_ref(i)[1] for i in e.model_ids)
+
+    active = next((e for e in entries if e.id and e.id == ret.rerank_active_id),
+                  None)
+    if active is None:
+        cur = str(ret.rerank_model or "").strip()
+        active = next((e for e in entries
+                       if e.model.strip() == cur and cur), None) or entries[0]
+
+    ret.rerank_models = entries
+    ret.rerank_active_id = active.id
+    # 模型名与模型ID 无条件写回（含留空）：否则用户清空的那次会被旧值"复活"
+    ret.rerank_display_name = active.display_name
+    ret.rerank_model = active.model
+    # 设备只在条目记过时才写 —— 条目诞生之后新增的参数字段不该被清回默认值
+    for k in fields:
+        if k in active.params:
+            setattr(ret, "rerank_" + k, active.params[k])
+    # 模型路径与模型ID 是一对（拼出真正要加载的权重目录），所以它也**无条件**写回：
+    # 条目里缺这个参数时（手写配置、老客户端）留着上一次的旧路径，会把新模型ID
+    # 拼到不相干的目录下 —— 那是个只在加载时才炸的错配
+    ret.rerank_model_dir = str(active.params.get("model_dir") or "").strip()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -377,6 +524,12 @@ class RetrievalConfig(BaseModel):
     rrf_k: int = 60                         # RRF 常数
     rerank_enabled: bool = True
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # 「模型路径/API」：本机权重所在目录（models / /mydata/models 这类）或**远程
+    # 重排服务地址**（http(s)://…）。填目录时模型ID 是它下面的子目录名，加载时拼成
+    # 完整路径；填地址时模型ID 只进请求体（见 resolve_rerank_model_path / is_http_url）。
+    # 留空 = 模型ID 本身就是个可直接加载的引用 —— 上面那个缺省值就是这么用的
+    rerank_model_dir: str = ""
+    rerank_display_name: str = ""             # 模型名：只给界面区分用，不参与推理
     rerank_device: str = "cpu"                # Cross-Encoder 加载设备：cpu / cuda
     rerank_threshold: float = 0.3
     final_top_n: int = 6                    # 进入 Prompt 的 Chunk 数
@@ -386,6 +539,18 @@ class RetrievalConfig(BaseModel):
     self_eval_max_iterations: int = 2
     ephemeral_score_boost: float = 1.2
     default_route_weights: dict[str, float] = {}   # 软路由默认权重（0-1）
+    # 重排模型库与当前生效的那一条（见文件上方 _sync_rerank_library）：与 LLM /
+    # 向量段同构（多套已测通的配置并存，active 决定业务用哪条），只是存储挂在
+    # retrieval 上 —— 重排要么是本机权重目录、要么是一台无需凭据的远程重排服务
+    # （地址与权重目录共用 rerank_model_dir 这一栏），没有独立的 base_url/api_key。
+    # 上面那几个 rerank_* 字段是 active 条目的镜像，不要在保存路径里单独改它们
+    rerank_models: list[ModelEntry] = Field(default_factory=list)
+    rerank_active_id: str = ""
+
+    @model_validator(mode="after")
+    def _sync_rerank_lib(self):
+        _sync_rerank_library(self)
+        return self
 
 
 class PipelineConfig(BaseModel):
