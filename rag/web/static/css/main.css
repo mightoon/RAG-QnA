@@ -18,6 +18,12 @@
   --shadow-sm:0 1px 2px rgba(0,0,0,.05);
   --shadow-md:0 4px 12px rgba(0,0,0,.08);
   --shadow-lg:0 12px 32px rgba(0,0,0,.12);
+  /* 模型库卡片专用阴影：--shadow-sm 只有 5% 黑，一片卡片铺开时等于没有层次，
+     所以这里另给两档，且每档都叠两层 —— 一条贴边实影勾出轮廓，一条短扩散把
+     卡片从底色上托起来。悬浮用 --shadow-md 是不行的：它是给浮层（弹窗/气泡）
+     的，4px 以上的位移摊在静止的卡片上太"飘" */
+  --shadow-card:0 1px 2px rgba(15,23,42,.08),0 2px 8px rgba(15,23,42,.08);
+  --shadow-card-hover:0 2px 4px rgba(15,23,42,.10),0 6px 16px rgba(15,23,42,.12);
   --icon-chat:#6366F1;--icon-knowledge:#F59E0B;--icon-config:#10B981;--icon-monitor:#0EA5E9;
   --chat-bubble-user:#3B82F6;--chat-bubble-user-text:#FFF;
   --chat-bubble-ai:#FFFFFF;--chat-bubble-ai-border:#E5E7EB;
@@ -251,15 +257,22 @@ table.params-table input[type=checkbox]{width:16px;height:16px}
 .modal-content{background:var(--bg-surface);border-radius:var(--radius-lg);width:100%;max-width:520px;
   max-height:85vh;display:flex;flex-direction:column;box-shadow:var(--shadow-lg);
   animation:modalIn var(--anim-normal) var(--anim-ease)}
-.modal-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;
-  border-bottom:1px solid var(--border)}
+.modal-header{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  flex-wrap:wrap;padding:16px 20px;border-bottom:1px solid var(--border)}
 .modal-header h3{font-size:var(--fs-lg);font-weight:var(--fw-semibold)}
+/* 标题块吃掉剩余宽度：长标题自己换行，不去挤右边的按钮 */
+.modal-title{flex:1 1 auto;min-width:0}
+/* 头部右侧那组：调用方塞进来的操作（模型弹窗的「测试模型 / 更新模型库」）＋ 关闭键。
+   组内不许缩、整体贴右 —— 按钮因此永远紧挨着 ✕。窄屏摆不下时整组换到第二行
+   （flex-wrap 在上面），而不是把 ✕ 顶出弹窗 */
+.modal-header-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .modal-sub{font-size:var(--fs-xs);color:var(--text-tertiary);font-weight:400;margin-top:2px}
 .modal-body{padding:20px;overflow-y:auto}
 .modal-footer{display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid var(--border)}
 /* 模型编辑弹窗（config-ui.js 传 type:'model'）：里面是那份完整的模型表单（地址 /
-   Key / 模型ID / 获取模型ID 的候选徽标 / 测试与保存按钮），520px 摆不下 —— 宽一档，
-   仍靠 max-height 与 .modal-body 的滚动兜住矮屏 */
+   Key / 模型ID / 获取模型ID 的候选徽标），520px 摆不下 —— 宽一档，仍靠 max-height
+   与 .modal-body 的滚动兜住矮屏。「测试模型 / 存入模型库」不在表单里，在弹窗头部
+   那组 .modal-header-right 里（见 groupCard 的 headSink） */
 .modal-content.modal-model{max-width:780px}
 .modal-content.modal-warning .modal-header{border-bottom-color:var(--warning)}
 .modal-content.modal-danger .modal-header{border-bottom-color:var(--error)}
@@ -399,6 +412,10 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
 .page-header{margin-bottom:var(--space-5)}
 .page-header h1{font-size:var(--fs-2xl);font-weight:var(--fw-bold)}
 .page-subtitle{color:var(--text-secondary);font-size:var(--fs-sm);margin-top:4px}
+/* 页头标题旁的 ⓘ：那行说明收进了气泡（见 config-ui.js 的 mountPageInfoTip）。
+   .info-tip 自身不带外边距（卡片里靠 .card-title 的 gap），这里补一口气；
+   h1 是大字号，ⓘ 是 16px 的行内盒，靠 vertical-align:middle 才与标题中线对齐 */
+.page-header h1 .info-tip{margin-left:8px;vertical-align:middle}
 .upload-actions{display:flex;gap:10px;align-items:center;margin-bottom:var(--space-4);flex-wrap:wrap}
 .upload-hint{font-size:var(--fs-xs);color:var(--text-tertiary)}
 .drop-zone{border:2px dashed var(--border-strong);border-radius:var(--radius-lg);padding:24px;
@@ -555,7 +572,7 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .perm-remove{flex-shrink:0}
 /* 模型 tab：五大区域（LLM / VLM / Embedding / Rerank / Doc Parse）从上到下排，
    每段贯穿全行，段内的模型卡片从左到右铺开（见 config-ui.js 的 modelSection）。
-   页面上不再摆编辑表单 —— 点卡片、点能力徽标、点段头的「添加模型」才弹出编辑框 */
+   页面上不再摆编辑表单 —— 点卡片、点能力徽标、点段尾那张「+ 空卡片」才弹出编辑框 */
 .model-stack{display:flex;flex-direction:column;gap:20px}
 /* 候选模型徽标：一排在按钮后面铺开（rerank 的扫描结果用它铺在卡片下方） */
 .model-chip-box{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);
@@ -570,18 +587,26 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .model-chip.static{cursor:default}
 .model-chip.static:hover{border-color:var(--border)}
 .model-chip-name{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* 一段模型库 = 一个贯穿全行的区域：段头（库名 + 计数 + 添加模型）+ 卡片网格 */
+/* 一段模型库 = 一个贯穿全行的区域：段头（库名 + 最右的计数徽标）+ 卡片网格 */
 .model-sec{display:flex;flex-direction:column;gap:12px}
+/* 段名下的分割线比常规边框粗一档：它是"一类模型"的边界，在下面一片带阴影的
+   卡片之间，1px 的细线容易被看没 */
 .model-sec-head{display:flex;align-items:center;gap:8px;
-  padding-bottom:8px;border-bottom:1px solid var(--border)}
+  padding-bottom:8px;border-bottom:2px solid var(--border)}
 .model-sec-title{font-weight:var(--fw-semibold);color:var(--text-primary);
   font-size:var(--fs-md)}
+/* 空库时的指引横幅（摆在网格上方，见 config-ui.js 的 libGrid）：入口就是网格
+   末尾那张「+ 空卡片」，这里只说"接下来该怎么填、怎么算通过" */
 .model-lib-empty{padding:18px 4px;text-align:center;color:var(--text-secondary);
   font-size:var(--fs-sm);border:1px dashed var(--border);border-radius:var(--radius-md)}
-/* 卡片从左到右铺满整行：auto-fill 让列数随窗口宽度走，顺序永远是"先左后右、
-   再换行"，与库里的先后一致 */
+/* 空库时「指引横幅 + 网格」的竖排壳（.model-sec 的 gap 管不到这两层之间） */
+.model-lib{display:flex;flex-direction:column;gap:12px}
+/* 卡片从左到右铺满整行，定死 5 列 —— 卡面上只有三行短字，一行 5 张刚好。
+   原来用 auto-fill + 240px 下限，列数随窗口宽度自己走：宽屏铺到 7 列、窄屏只剩
+   3~4 列，同一页换个窗口就是两种观感。列宽仍随窗口缩，卡片按 aspect-ratio
+   等比缩，所以"一行 5 个"在任何宽度都成立；真·窄屏的减列交给下面的媒体查询 */
 .model-grid{display:grid;gap:14px;
-  grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+  grid-template-columns:repeat(5,minmax(0,1fr))}
 /* 一张卡片 = 库里的一个模型（文档解析：一个模型名）。形状方一点：长宽 6:4 ——
    卡面上只有"叫谁 + 调哪个模型 + 哪台服务"三行短字，方卡片铺成一片比细长条整齐。
    刻意不写 overflow:hidden：文档解析卡片上多挂几项能力时让它自然长高，
@@ -589,14 +614,34 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .model-card{aspect-ratio:6/4;display:flex;flex-direction:column;gap:6px;
   padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-md);
   background:var(--bg-surface);min-width:0;cursor:pointer;
+  box-shadow:var(--shadow-card);
   transition:background var(--anim-fast),border-color var(--anim-fast),
              box-shadow var(--anim-fast)}
-/* 点卡片 = 弹出这张卡片的编辑框（见 config-ui.js 的 openEditor）：hover 给可点的形状 */
-.model-card:hover{background:var(--bg-hover);border-color:var(--primary)}
+/* 点卡片 = 弹出这张卡片的编辑框（见 config-ui.js 的 openEditor）：hover 给可点的形状
+   （阴影同时抬高一档：卡片像被托起来一点，与"可点"这个形状配套） */
+.model-card:hover{background:var(--bg-hover);border-color:var(--primary);
+  box-shadow:var(--shadow-card-hover)}
+/* 段尾那张「+ 空卡片」：与真卡片同一个网格单元、同一条 aspect-ratio，底色与阴影
+   也照搬，所以看着就是"这一排里还空着的一格"；与真卡片的差别只剩虚线框和内容 */
+.model-card.add{border-style:dashed;
+  align-items:center;justify-content:center}
+.model-card.add:hover{border-style:solid}
+.model-card.add:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+/* 加号用两根细杆拼，不用字体里那个"+" —— 大字号下字体笔画按字重走，最细也还是
+   一坨。这里宽高都取自卡片自身：卡片缩它就缩，始终是"这张卡片的中等大小"；
+   杆的粗细 = 尺寸的 8%，要粗要细改这两个百分比即可 */
+.model-add-plus{position:relative;width:13%;aspect-ratio:1;flex:none;
+  color:var(--text-tertiary);user-select:none}
+.model-add-plus::before,.model-add-plus::after{content:'';position:absolute;
+  left:50%;top:50%;transform:translate(-50%,-50%);
+  background:currentColor;border-radius:2px}
+.model-add-plus::before{width:100%;height:8%}
+.model-add-plus::after{width:8%;height:100%}
+.model-card.add:hover .model-add-plus{color:var(--primary)}
 /* 选中（弹窗里正在编的就是它）：蓝框 + 浅蓝底，与弹窗里那份表单对上号。
    与 .model-card:hover 同色系，不靠"边框变粗"表态 —— 尺寸不跳、网格不抖 */
 .model-card.selected{border-color:var(--primary);background:var(--primary-light);
-  box-shadow:0 0 0 3px var(--primary-light)}
+  box-shadow:0 0 0 3px var(--primary-light),var(--shadow-card)}
 /* 卡面第一行：模型名 + 标记位（绿色 active 徽标 / 「设为 active」按钮，共用一个槽） */
 .model-card-top{display:flex;align-items:center;gap:6px;min-width:0}
 .model-card-name{font-weight:var(--fw-medium);color:var(--text-primary);
@@ -640,9 +685,32 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
   border-color:transparent}
 .model-cap-chip.selected{background:var(--primary-light);color:var(--primary);
   border-color:var(--primary);box-shadow:0 0 0 1px var(--primary) inset}
-/* 卡片末尾的「＋ 添加能力」（见 config-ui.js 的 addCapabilityChip）：长得像徽标、
-   实际是按钮 —— 给这张卡片再加一条（同一模型名、同一地址，另一项能力） */
-.model-cap-add{flex-shrink:0}
+/* 卡片末尾那枚「＋」（见 config-ui.js 的 addCapabilityChip）：给这张卡片再加一条
+   （同一模型名、同一地址，另一项能力）。它得和前面那排能力徽标长在一起，又不能
+   被读成"某个能力" —— 所以缩成圆圈加号，底色/描边照搬徽标（.badge-default 的
+   --bg-hover + --border）。
+   为什么非写 align-self:center 不可：那排徽标是 .model-lib-chips（flex，默认
+   align-items:stretch），一行文字把徽标撑到 ~25px 高，而这枚圆圈是定高 20px 的
+   （定了高就不再被 stretch 拉长）—— 此时 stretch 退化成"顶边对齐"，圆心会比
+   徽标中心高出两三个像素，一眼就看得出歪。center 一下，圆心的水平线与徽标
+   中线对齐，两者高度差的几像素平摊到上下。
+   选择器带上 .badge 是为了压过下面 .badge-btn 的虚线透明底（同为一个类，
+   写在后面的赢），hover 那条仍由 .badge-btn:hover 接管变主色 */
+.badge.model-cap-add{align-self:center;flex:none;position:relative;
+  width:20px;height:20px;padding:0;border-radius:50%;
+  border:1px solid var(--border);background:var(--bg-hover);
+  color:var(--text-secondary)}
+/* 加号在伪元素里画（圆心对齐由 transform 兜底，见下），不用字体里那个"＋"：
+   那个字形的墨迹中心与行盒中心并不重合，圆圈越小越看得出偏心 */
+.badge.model-cap-add::before,.badge.model-cap-add::after{content:'';position:absolute;
+  left:50%;top:50%;transform:translate(-50%,-50%);
+  background:currentColor;border-radius:1px}
+/* 杆长 11px、粗 1px：圆圈 20px、边框 1px，定位区 18px 见方 —— 杆太长会把
+   圆圈塞满、太短又缩成一点，11px 差不多是圆内接十字。粗 2px 时那两根与徽标
+   上的字差不多重，圆圈里就显得"黑"；细到 1px 才是一根发丝，与圆圈那圈 1px
+   的边同宽，看着才像一枚图标 */
+.badge.model-cap-add::before{width:11px;height:1px}
+.badge.model-cap-add::after{width:1px;height:11px}
 .model-cap-del{border:0;background:transparent;cursor:pointer;padding:0 4px;
   font-size:var(--fs-sm);line-height:1;color:inherit;opacity:.55;
   font-family:inherit;border-radius:8px}
@@ -883,7 +951,8 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 @media (max-width:1024px){
   .doc-layout{grid-template-columns:1fr}
   .doc-side-panel{position:static}
-  /* 窄屏：模型卡片放宽（两列挤成"细长条"就不好看了，交给 auto-fill 自己减列） */
+  /* 窄屏：上面定死的 5 列在这儿松开，交回 auto-fill 自己减列（200px 下限 ⇒
+     1024 宽约 4 列，更窄 3 列）。硬塞 5 列会把卡片压到放不下模型ID */
   .model-grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
 }
 @media (max-width:900px){

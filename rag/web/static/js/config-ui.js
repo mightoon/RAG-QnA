@@ -60,22 +60,32 @@
      移到这块区域之外就自动收起（也按 Esc 可收起，键盘用户没有「移出」这个机会）。
      为什么不是简单 mouseleave 就收：ⓘ 和提示框之间隔着 8px 空隙，
      鼠标往下移进框里时会先触发一次「移出」，于是给一个很短的宽限期，
-     只要在这段时间内进到框里，就算没离开过。 */
+     只要在这段时间内进到框里，就算没离开过。
+
+     hint 有两种写法：
+     - { title, code, notes }：卡片上的"前提条件"（带标题栏，可带代码块与条目）
+     - '一句话'：纯说明（页头那种），不加标题栏、不加项目符号；这种**不挂原生
+       title** —— 悬停就会冒出气泡，再挂一个原生提示会在同一位置晚一秒叠上来、
+       两句话打架（monitor.js 里 hover 型的提示同样不挂，同一个理由） */
   const TIP_HIDE_DELAY = 300;
   let _escBound = false;
   function infoTip(hint) {
+    if (typeof hint === 'string') hint = { text: hint };
     const wrap = el('span', 'info-tip');
     const icon = el('span', 'info-tip-icon', 'i');
     icon.setAttribute('role', 'button');
     icon.tabIndex = 0;
-    icon.title = '查看前提条件';
-    icon.setAttribute('aria-label', hint.title || '前提条件');
+    if (hint.title) icon.title = '查看前提条件';
+    icon.setAttribute('aria-label', hint.title || '说明');
     wrap.appendChild(icon);
 
     const bubble = el('div', 'info-tip-bubble');
-    const bar = el('div', 'info-tip-bar');
-    bar.appendChild(el('span', 'info-tip-title', hint.title || '说明'));
-    bubble.appendChild(bar);
+    if (hint.title) {
+      const bar = el('div', 'info-tip-bar');
+      bar.appendChild(el('span', 'info-tip-title', hint.title));
+      bubble.appendChild(bar);
+    }
+    if (hint.text) bubble.appendChild(el('div', 'info-tip-note', hint.text));
     if (hint.code) {
       const pre = el('pre', 'info-tip-code');
       pre.textContent = hint.code;
@@ -461,6 +471,12 @@
     return row ? String(row.value == null ? '' : row.value) : '';
   };
 
+  /* 值是不是一个 http(s) 地址。口径与后端 models.is_http_url 一致：重排那段的
+     「模型路径/API」一栏两义共存（本机权重目录 / 远程重排服务地址），后端靠这个
+     判断分流，界面靠它决定卡片上要不要写明"本地路径：" */
+  const isHttpUrl = v =>
+    /^https?:\/\//i.test(String(v == null ? '' : v).trim());
+
   /* 表单里「处理能力」当前选中项的显示文案（下拉选项里的 label），只用于提示 */
   function capabilityLabelOf(g) {
     const row = (g.configParams || []).find(p => p.key === 'capability') || {};
@@ -539,7 +555,15 @@
      routes._RerankStore 伪装成了同样的"段"，这里是同一个标题口径） */
   const LIB_TAGS = { llm: 'LLM', vlm: 'VLM', embedding: 'Embedding',
                    rerank: 'Rerank', doc_parse: 'Doc Parse' };
-  const libTitle = key => (LIB_TAGS[key] ? '模型库 · ' + LIB_TAGS[key] : '模型库');
+  /* 段标题里的中文名：tab 已经叫「模型库」了，段名再写"模型库 ·"就与 tab 撞车，
+     改成一句话说清这一段装的是哪一类模型。LIB_TAGS 仍只作**短槽位名**用 ——
+     段落里那几处（弹窗标题、表单里"此刻在编哪一段"的徽标）要的是 LLM / VLM
+     这种短标记，别把它一起换成长名 */
+  const LIB_NAMES = { llm: '大语言模型', vlm: '多模态模型', embedding: '嵌入模型',
+                      rerank: '重排模型', doc_parse: '文档分析模型' };
+  const libTitle = key => (LIB_TAGS[key]
+    ? (LIB_NAMES[key] || key) + ' · ' + LIB_TAGS[key]
+    : '模型库');
   /* 段的**显示**顺序（自上而下）。后端给的顺序是 llm / vlm / embedding /
      doc_parse，重排段挂在 retrieval 上、由载荷循环末尾单独追加（见 routes.
      _normalize_config），所以排在最后。界面上要求重排紧跟在向量模型之后、
@@ -556,8 +580,8 @@
   /* ── 编辑表单的"共用"：LLM 与 VLM 两段只留一份填空框 ──
      这两段本来就是同一种东西（OpenAI 兼容的对话服务：地址 + Key + 模型ID + 一组
      运行参数），差别只在业务上谁去吃图。若各弹一份一模一样的表单，用户分不清该填
-     哪一个、写进哪一段。所以弹窗里的表单只有一份：**点哪一段的卡片/「添加模型」，
-     表单就是编哪一段**，段名跟着切（modelEdit、markSaved 的键、入库的 section
+     哪一个、写进哪一段。所以弹窗里的表单只有一份：**点哪一段的卡片 / 段尾那张
+     「+ 空卡片」，表单就是编哪一段**，段名跟着切（modelEdit、markSaved 的键、入库的 section
      全是它）。不是"两份表单轮流显隐"——那样填到一半的值会在切换时凭空消失。
      表单标题对这两段统一写「大模型」（后端段标签仍是「LLM 大模型」「VLM 视觉
      模型」，只用在报错与灰牌上），另挂一枚段名徽标说明此刻在编哪一段。 */
@@ -579,38 +603,65 @@
     return libsOfCard(g).find(x => x.key === sharedFormKey) || g;
   }
 
-  /* 段头（两种卡片口径共用）：段名 + 计数 + 最右边的「添加模型」 */
+  /* 段头（两种卡片口径共用）：段名 + 最右边的计数徽标。
+     计数说清"几张卡片、几项能力"：这一段库里的一条 = 一项能力、不是一张卡片，
+     照别的段写「N 个已测通」会被读成"N 张卡片"。
+     这一格原来是「添加模型」按钮，入口搬到网格末尾的空卡片上后空了出来，正好把
+     计数从段名后面挪过来 —— 它是"这一段有多少"的汇总，本来就该落在边上 */
   function libHead(g) {
     const entries = ((g.library || {}).entries) || [];
     const head = el('div', 'model-sec-head');
     head.appendChild(el('span', 'model-sec-title', libTitle(g.key)));
-    /* 计数说清"几张卡片、几项能力"：这一段库里的一条 = 一项能力、不是一张卡片，
-       照别的段写「N 个已测通」会被读成"N 张卡片" */
-    head.appendChild(el('span', 'badge badge-default', g.capabilityBadges
+    const cnt = el('span', 'badge badge-default', g.capabilityBadges
       ? dpCards(entries).length + ' 张卡片 · ' + entries.length + ' 项能力'
-      : entries.length + ' 个已测通'));
-    /* 「添加模型」贴在这一行的最右边：点一下 = 弹出空白编辑框，接下来填的是一套
-       新配置（入库走新增）；不点它也能直接点卡片改现有条目。没有条目时它也照旧
-       摆着 —— 总得有个"从空白开始填"的入口 */
-    const add = libButton('添加模型', 'btn btn-ghost btn-sm',
-      '弹出空白编辑框，用来配一个新模型（测通后点「存入模型库」）', () => {
-        // 共用一份表单时（LLM / VLM）：先把表单切到本段，再清空 —— 否则清的是
-        // 另一段的值，看着像"点了没反应"
-        if (isSharedLib(g.key)) sharedFormKey = g.key;
-        modelEdit[g.key] = '';
-        clearFormForNew(g);
-        ConfigData.markSaved(['model:' + g.key]);   // 清空不是改动
-        openEditor(g);
-      });
-    add.style.marginLeft = 'auto';   // 靠这一行最右
-    head.appendChild(add);
+      : entries.length + ' 个已测通');
+    cnt.style.marginLeft = 'auto';   // 靠这一行最右
+    head.appendChild(cnt);
     return head;
   }
 
-  /* 库空着时的提示（两种卡片口径共用） */
+  /* 「添加模型」的唯一实现：清空表单 → 弹出空白编辑框，接下来填的是一套**新**
+     配置（入库走"新增"，有无条目 id 决定新增还是更新，见 buildPayload）。
+     调用方只有段尾那张「+ 空卡片」（见 addCardNode） */
+  function beginAdd(g) {
+    // 共用一份表单时（LLM / VLM）：先把表单切到本段，再清空 —— 否则清的是
+    // 另一段的值，看着像"点了没反应"
+    if (isSharedLib(g.key)) sharedFormKey = g.key;
+    modelEdit[g.key] = '';
+    clearFormForNew(g);
+    ConfigData.markSaved(['model:' + g.key]);   // 清空不是改动
+    openEditor(g);
+  }
+
+  /* 段尾那张「+ 空卡片」：与真卡片同尺寸（同一个 .model-card 基类 → 同一个网格
+     单元、同一条 aspect-ratio），点它 = 原来的「添加模型」。
+     入口从"段头右上角一颗小按钮"挪到卡片流末尾：按钮离用户正在看的卡片隔着半个
+     屏幕，摆在末尾才是"接着往下加一个"。库空着时它也是唯一的入口 */
+  function addCardNode(g) {
+    const card = el('div', 'model-card add');
+    /* 那枚加号不是文字：字体里的"+"在大字号下笔画太粗，改用两根细杆拼
+       （见 main.css 的 .model-add-plus），这里只留个空壳挂着 */
+    card.appendChild(el('span', 'model-add-plus'));
+    card.title = '添加模型：弹出空白编辑框，用来配一个新模型（测通后点「存入模型库」）';
+    card.addEventListener('click', () => beginAdd(g));
+    /* 卡片是 div（真卡片也一样，它们靠鼠标点），但这个入口原来是颗 <button>，
+       键盘能 Tab 到。换形状不该悄悄收掉这条路 —— 补回焦点与回车/空格 */
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
+    card.setAttribute('aria-label', '添加模型');
+    card.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        beginAdd(g);
+      }
+    });
+    return card;
+  }
+
+  /* 库空着时的指引（两种卡片口径共用），摆在网格上方 */
   function libEmpty(g) {
     const empty = el('div', 'model-lib-empty');
-    empty.appendChild(el('div', null, '还没有已测通的模型：点右上角「添加模型」'));
+    empty.appendChild(el('div', null, '还没有已测通的模型：点下面卡片里的 + 开始配置'));
     /* 这一段没有模型ID（见后端 _MODEL_SECTION_UI_FLAGS）：指向「获取模型ID」的
        指引就成了死路，改说该填的三样 —— 测试探的是服务的 /health */
     empty.appendChild(el('div', 'form-hint',
@@ -622,15 +673,27 @@
     return empty;
   }
 
-  /* 段里的卡片网格（两种卡片口径共用外框）：从左到右铺，库空着就给一句提示 */
+  /* 段里的卡片网格（两种卡片口径共用外框）：卡片从左到右铺，末尾恒定挂一张
+     「+ 空卡片」—— 空库时它是唯一的入口，所以不跟着 entries 空不空增删。
+     空库再补一句指引（横幅在上、网格在下）：卡片上那枚加号说不出"接下来该填
+     什么、怎么算通过"，这几句话原来在段头按钮旁边，没理由随按钮一起丢掉 */
+  function libGrid(g, nodes) {
+    const box = el('div', 'model-grid');
+    nodes.forEach(n => box.appendChild(n));
+    box.appendChild(addCardNode(g));
+    if (nodes.length) return box;
+    const wrap = el('div', 'model-lib');
+    wrap.appendChild(libEmpty(g));
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  /* 段里的卡片网格：从左到右铺 */
   function renderLibrary(g) {
     // 文档解析另有一套卡片口径（一张卡片 = 一个模型名，卡片上挂能力徽标）
     if (g.capabilityBadges) return renderCapabilityGrid(g);
     const entries = ((g.library || {}).entries) || [];
-    if (!entries.length) return libEmpty(g);
-    const box = el('div', 'model-grid');
-    entries.forEach(e => box.appendChild(modelCardNode(g, e)));
-    return box;
+    return libGrid(g, entries.map(e => modelCardNode(g, e)));
   }
 
   /* 库里的一条 = 一张方卡片（长宽 6:4）。卡面上三行：模型名（+ active 标记位）、
@@ -685,10 +748,16 @@
       chips.appendChild(c);
       card.appendChild(chips);
     }
-    /* 地址一行：卡片上给"哪台服务"一个印象（重排段没有独立地址，退到模型路径） */
-    const addr = e.endpoint || entryRowValue(e, 'model_dir') || '';
+    /* 地址一行：卡片上给"哪台服务"一个印象。重排段没有独立地址，退到
+       「模型路径/API」那一栏 —— 它是个两义的框（见 isHttpUrl）：
+       填目录 = 本机权重，光摆一个 "models" 谁也看不出那是什么，前头补写
+       "本地路径："；填 http(s) 地址 = 远程重排服务，本身一眼能认，原样显示 */
+    const dir = entryRowValue(e, 'model_dir');
+    const localDir = !e.endpoint && dir && !isHttpUrl(dir);
+    const addr = e.endpoint || dir || '';
     if (addr) {
-      const a = el('div', 'model-card-addr', addr);
+      const a = el('div', 'model-card-addr',
+                   localDir ? '本地路径：' + addr : addr);
       a.title = addr;
       card.appendChild(a);
     }
@@ -766,10 +835,7 @@
 
   function renderCapabilityGrid(g) {
     const entries = ((g.library || {}).entries) || [];
-    if (!entries.length) return libEmpty(g);
-    const box = el('div', 'model-grid');
-    dpCards(entries).forEach(card => box.appendChild(dpCardNode(g, card)));
-    return box;
+    return libGrid(g, dpCards(entries).map(card => dpCardNode(g, card)));
   }
 
   /* 文档解析的一张方卡片 = 一个模型名（同名同地址的若干能力挂在同一张上）。
@@ -861,7 +927,11 @@
      用户自己选），并且清掉 modelEdit —— 不带 id，入库走的必然是**新增**，
      卡片上已有的徽标一枚都不会动。 */
   function addCapabilityChip(g, card) {
-    return libButton('＋ 添加能力', 'badge badge-btn model-cap-add',
+    /* 样式上缩成一枚圆圈加号（见 main.css 的 .model-cap-add），贴着那排能力徽标；
+       圆圈里装不下"添加能力"四个字，那句话挪进 title 与 aria-label。
+       按钮里不留任何文字：那枚加号在 CSS 里画（两根细杆），字体里的"＋"对不准
+       圆心、笔画也粗 */
+    const btn = libButton('', 'badge badge-btn model-cap-add',
       '给「' + card.name + '」再加一项处理能力：弹出的编辑框已填好这张卡片的模型名与'
       + '地址，选一项「处理能力」后点「存入模型库」', () => {
         const first = card.entries[0] || {};
@@ -883,13 +953,15 @@
         ConfigData.markSaved(['model:' + g.key]);
         openEditor(g);
       });
+    btn.setAttribute('aria-label', '给「' + card.name + '」添加一项处理能力');
+    return btn;
   }
 
   /* ── 一段模型库 = 一个贯穿全行的区域 ──────────────────────────────
      模型 tab 从上到下五段（LLM / VLM / Embedding / Rerank / Doc Parse），每段
-     一行标题 + 一片卡片网格，卡片从左到右铺开、装不下就换行。
-     页面上**不再摆编辑表单**：点卡片（文档解析段点能力徽标）、或点段头的
-     「添加模型」，编辑表单才以弹窗形式出现（见 openEditor）。 */
+     一行标题 + 一片卡片网格，卡片从左到右铺开、末尾挂着「+ 空卡片」。
+     页面上**不再摆编辑表单**：点卡片（文档解析段点能力徽标）、或点段尾那张
+     「+ 空卡片」，编辑表单才以弹窗形式出现（见 openEditor）。 */
   function modelSection(g) {
     const sec = el('section', 'model-sec');
     sec.appendChild(libHead(g));
@@ -965,11 +1037,18 @@
       sub = '新增模型：填好参数 → 测试模型 → 存入模型库';
     }
     const mySeq = editorSeq;   // 这一次的序号：被重建/关掉之后就不再是自己
+    /* 表单上方那一行（段名 + 模型名 + 测试/存入两颗按钮）整行撤掉：左边说的
+       "哪一段 · 哪个模型"就是上面标题那句，同一件事说两遍；只把那两颗按钮接出来，
+       交给弹窗摆到 ✕ 左边（见 Partials.modal 的 headerActions） */
+    let headActions = null;
+    const body = groupCard(fg, isSharedLib(g.key) ? SHARED_FORM_TITLE : '',
+      { headSink: node => { headActions = node; } });
     editorModal = Partials.modal({
       type: 'model',
       title: libTitle(g.key),
       subtitle: sub,
-      body: groupCard(fg, isSharedLib(g.key) ? SHARED_FORM_TITLE : ''),
+      headerActions: headActions,
+      body,
       onClose: () => {
         if (mySeq !== editorSeq) return;   // 只是重绘时的重建/拆换，不是用户关的
         editorModal = null;
@@ -981,7 +1060,15 @@
   }
 
   /* ── 模型/服务/高级组卡片 ── */
-  function groupCard(g, titleOverride) {
+  /* opts.headSink：编辑器弹窗（见 openEditorModal）走的那条路 —— 卡片头部那一行
+     **不挂到卡片上**，整块交给这个回调。那一行在弹窗里说的是"哪一段 · 哪个模型"，
+     与弹窗标题重复；弹窗只接它右边那组按钮（测试 / 存入），提到标题行去。
+     （放心丢：模型段的头部只有"段名 + 模型名 + 那两颗按钮"，ⓘ 前提条件与
+     「需重启」徽标只有服务段才带 —— 后端模型段 refresh 全是 None、也不发 hint。
+     哪天模型段也要挂 ⓘ，得先把它接到弹窗头部去，不能顺着这条一起丢掉。）
+     不传 = 照旧整行画在卡片上（服务 / 高级 tab 的卡片都走这条） */
+  function groupCard(g, titleOverride, opts) {
+    const headSink = opts && opts.headSink;
     const card = el('div', 'card perm-card');
     const head = el('header');
     const titleWrap = el('div', 'card-title');
@@ -1176,7 +1263,7 @@
               /* 存完收起弹窗：这次编辑就到此为止了，页面上只该剩"新卡片 / 新徽标"
                  这个结果 —— 留着弹窗反倒挡住刚存进去的那一条。选中态一并退掉
                  （弹窗都没了，卡片不该再描蓝框）。
-                 下次再编必是从卡片 / 能力徽标 / 「添加模型」进来，那几条路都会重新
+                 下次再编必是从卡片 / 能力徽标 / 段尾的「+ 空卡片」进来，那几条路都会重新
                  带上条目 id；文档解析尤其需要带 id（不带就是"新增一项能力"，会被
                  "同名同能力"拒收，见 routes._check_doc_parse_card），
                  而这三条路各自都把 id 设好了 */
@@ -1279,8 +1366,11 @@
     }
     actions.appendChild(save.tag);
     actions.appendChild(save.btn);
-    head.appendChild(actions);
-    card.appendChild(head);
+    if (headSink) headSink(actions);   // 弹窗模式：头部整行不进卡片，只交出按钮
+    else {
+      head.appendChild(actions);
+      card.appendChild(head);
+    }
 
     const rows = el('div', 'perm-rows');
     // 字段顺序 = 用户填写的顺序：模型名 → API 地址 → API Key → 模型ID → 其余参数
@@ -1597,7 +1687,10 @@
   /* 右列表单也走通用 modelCard：行由后端 configParams 下发，「推理设备」在下面按
      单选渲染（跟 bool 参数同一个思路），保存按钮是「存入模型库 / 更新模型库」 */
 
-  /* ── 检索策略（附加到模型面板底部） ── */
+  /* ── 检索策略（摆在「高级」页的末尾，见 setup 里 panel_special 的渲染） ──
+     它不属于任何一段模型库 —— 改的是召回权重、要不要重排、重排阈值，与"用哪个
+     模型"无关。原先挂在模型页最下面，看着像模型的尾巴；归到「高级」页才与它
+     的同类（编排 / 分块 / 提示词那些非连接类配置）在一起 */
   function renderRetrievalBlock() {
     const c = ConfigData.state.config;
     const r = (c && c.retrieval) || {};
@@ -1631,19 +1724,35 @@
     });
     const rerank = el('label', 'path-toggle' + (r.rerankEnabled ? ' on' : ''));
     rerank.innerHTML = '<input type="checkbox" style="display:none"><span>启用重排 (rerank)</span>';
+    /* 重排阈值那一行只在勾了「启用重排」时才出现。开关就地插/拔这一行，**不整页
+       重绘**：这一页还有各配置域的 JSON 编辑框，而它们只在 change（失焦）时才把
+       文本写回数据 —— 重绘会把用户正在敲、还没失焦的那段文本整段抹掉 */
+    let thRow = null;
+    const syncThreshold = () => {
+      if (r.rerankEnabled) {
+        if (!thRow) {
+          thRow = kvRow('重排阈值', textInput(r.rerankThreshold, v => {
+            const f = parseFloat(v);
+            if (!isNaN(f)) { r.rerankThreshold = f; touch(); }
+          }, { type: 'number' }));
+          wWrap.appendChild(thRow);
+        }
+      } else if (thRow) {
+        thRow.remove();
+        thRow = null;
+      }
+    };
     rerank.addEventListener('click', e => {
       e.preventDefault();
       r.rerankEnabled = rerank.classList.toggle('on');
       touch();
-      Partials.refreshPiece('panel_model');   // 重排阈值随开关显隐，需重绘
+      syncThreshold();
+      /* 模型页上那条重排配置的牌面跟着变（勾掉「启用重排」，绿牌 active 得换成
+         灰牌「未启用」），所以那一页要重绘；本页不动，见上面 syncThreshold */
+      Partials.refreshPiece('panel_model');
     });
     wWrap.appendChild(rerank);
-    if (r.rerankEnabled) {
-      wWrap.appendChild(kvRow('重排阈值', textInput(r.rerankThreshold, v => {
-        const f = parseFloat(v);
-        if (!isNaN(f)) { r.rerankThreshold = f; touch(); }
-      }, { type: 'number' })));
-    }
+    syncThreshold();     // 进页面时先按当下的开关摆一次
     box.appendChild(wWrap);
     return box;
   }
@@ -1711,8 +1820,21 @@
     return wrap;
   }
 
+  /* 页头那句说明收进标题旁的 ⓘ：鼠标悬浮即显示、移开即消失（见 infoTip）。
+     文案仍写在模板里（挂在 h1 的 data-info 上），这里只负责搬进气泡 —— 一句话
+     不留两处，改文案只改模板；读走后就地删掉这个属性，免得以后被别的代码当数据读 */
+  function mountPageInfoTip() {
+    const h1 = document.querySelector('#config-page .page-header h1');
+    if (!h1) return;
+    const text = (h1.dataset.info || '').trim();
+    delete h1.dataset.info;
+    if (!text) return;
+    h1.appendChild(infoTip(text));
+  }
+
   /* ── 注册 piece 渲染与数据源 ── */
   function setup() {
+    mountPageInfoTip();
     Partials.registerDataLoader('panel_model', () => ({
       groups: ConfigData.groupsFor('model'),
     }));
@@ -1727,8 +1849,10 @@
 
     Partials.registerPieceRenderer('panel_model', data => {
       /* 模型 tab：从上到下五段模型库（LLM / VLM / Embedding / Rerank / Doc Parse），
-         每段贯穿全行 —— 段头（库名 + 计数 + 添加模型）+ 一片卡片网格，底部为检索策略。
-         编辑表单不在这里：点卡片 / 能力徽标 / 「添加模型」才弹出来（见 modelSection）。 */
+         每段贯穿全行 —— 段头（库名 + 最右的计数徽标）+ 一片卡片网格（末尾一张
+         「+ 空卡片」）。检索策略**不在**这里（它是召回侧的事，与"用哪个模型"
+         无关，见下面 panel_special）。
+         编辑表单不在这里：点卡片 / 能力徽标 / 「+ 空卡片」才弹出来（见 modelSection）。 */
       const wrap = el('div');
       const stack = el('div', 'model-stack');
       /* 五段都是同一个布局，VLM 现在也自出一段（表单仍与 LLM 共用一份，
@@ -1736,16 +1860,24 @@
       const groups = orderModelGroups(data.groups);
       groups.forEach(g => stack.appendChild(modelSection(g)));
       wrap.appendChild(stack);
-      const ret = renderRetrievalBlock();
-      ret.style.marginTop = '16px';
-      wrap.appendChild(ret);
       /* 面板画完再把编辑弹窗同步回来：弹窗挂在 document.body 上，不随这块刷新消失，
          但内容得跟着最新的库与表单基线重建（例：刚存进去的那条要出现在卡片里） */
       syncEditorModal(groups);
       return wrap;
     });
     Partials.registerPieceRenderer('panel_service', data => renderGroupsPanel(data, 3));
-    Partials.registerPieceRenderer('panel_special', renderGroupsPanel);
+    /* 高级页：上面是各配置域的 JSON 卡片（renderGroupsPanel 造的网格：编排 /
+       分块 / 提示词…），末尾接「检索策略」那一块。它必须挂在网格**外面** ——
+       .perm-cards 是网格容器，把卡片塞进去就成了"网格里的一格"，宽度与排列
+       都被网格管着了（见 main.css 的 .perm-cards） */
+    Partials.registerPieceRenderer('panel_special', data => {
+      const wrap = el('div');
+      wrap.appendChild(renderGroupsPanel(data));
+      const ret = renderRetrievalBlock();
+      ret.style.marginTop = '16px';
+      wrap.appendChild(ret);
+      return wrap;
+    });
     Partials.registerPieceRenderer('panel_permissions', renderPermissionsPanel);
     Partials.registerPieceRenderer('panel_system', renderSystemPanel);
   }

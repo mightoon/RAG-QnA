@@ -58,6 +58,7 @@ window.Partials = (function () {
     var header = document.createElement('div');
     header.className = 'modal-header';
     var titleWrap = document.createElement('div');
+    titleWrap.className = 'modal-title';
     var h3 = document.createElement('h3');
     h3.textContent = opts.title || '提示';
     titleWrap.appendChild(h3);
@@ -68,11 +69,22 @@ window.Partials = (function () {
       titleWrap.appendChild(sub);
     }
     header.appendChild(titleWrap);
+    /* headerActions：调用方要塞进标题这一行的操作（一个节点或一组），摆到 ✕
+       左边 —— 与关闭键绑成同一组、"同一水平线"，标题再长也挤不动它。
+       模型编辑弹窗用它把「测试模型 / 更新模型库」从表单里提上来（那边与标题重复） */
+    var headRight = document.createElement('div');
+    headRight.className = 'modal-header-right';
+    if (opts.headerActions) {
+      var acts = Array.isArray(opts.headerActions) ? opts.headerActions
+                                                   : [opts.headerActions];
+      acts.forEach(function (n) { if (n) headRight.appendChild(n); });
+    }
     var closeBtn = document.createElement('button');
     closeBtn.className = 'icon-btn';
     closeBtn.textContent = '✕';
     closeBtn.setAttribute('aria-label', '关闭');
-    header.appendChild(closeBtn);
+    headRight.appendChild(closeBtn);
+    header.appendChild(headRight);
     content.appendChild(header);
     var body = document.createElement('div');
     body.className = 'modal-body';

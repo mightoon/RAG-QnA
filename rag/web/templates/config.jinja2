@@ -1,5 +1,5 @@
 {% extends "base.jinja2" %}
-{% block title %}运行配置 - IQA{% endblock %}
+{% block title %}配置管理 - IQA{% endblock %}
 {% block head_extra %}
 <script>
   window.__CONFIG_INIT__ = {{ config_json | safe }};
@@ -11,13 +11,15 @@
 {% block content %}
 <div class="page-content" id="config-page">
   <div class="page-header">
-    <h1>运行配置</h1>
-    <p class="page-subtitle">可视化配置管理 · 每个模块各自保存、写入配置文件并热应用（无需重启）；未配置的依赖自动降级运行</p>
+    {# 原来占一整行的那句说明收进标题旁的 ⓘ 里（鼠标悬浮即显示、移开即消失，见
+       config-ui.js 的 mountPageInfoTip）：文案挂成 h1 的 data-info，由它搬进气泡，
+       这样"同一句话"只有模板这一处，改文案不必同时改 JS #}
+    <h1 data-info="每个模块各自保存、写入配置文件并热应用（无需重启）；未配置的依赖自动降级运行">配置管理</h1>
   </div>
 
   <div class="config-tabs-bar">
     <div class="config-tabs" id="config-tabs" role="tablist">
-      <button class="tab active" data-ctab="model" role="tab" aria-selected="true">模型</button>
+      <button class="tab active" data-ctab="model" role="tab" aria-selected="true">模型库</button>
       <button class="tab" data-ctab="service" role="tab" aria-selected="false">服务</button>
       <button class="tab" data-ctab="special" role="tab" aria-selected="false">高级</button>
       <button class="tab" data-ctab="permissions" role="tab" aria-selected="false">权限映射</button>
