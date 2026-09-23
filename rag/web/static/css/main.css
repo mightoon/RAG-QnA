@@ -607,6 +607,27 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .model-lib-chips .model-chip{max-width:100%;min-width:0;padding:2px 8px}
 .model-lib-chips .model-chip-name{min-width:0}
 .model-lib-del{color:var(--error)}
+/* 文档解析卡片上的「处理能力」徽标（见 config-ui.js 的 capabilityChip）：
+   徽标本身可点（点它 = 编辑这一项能力，回填到右侧表单），尾巴上的 × 删这项能力。
+   与卡片上其它徽标（纯展示）不同，这里必须给出"可点"的形状：默认描一圈边，
+   悬浮时那圈边消失、整枚徽标转成主色底 —— 有变化才看得出它能点；选中的那枚
+   再描一圈主色（右侧表单里就是它） */
+.model-cap-chip{padding-right:2px;cursor:pointer;gap:2px;
+  border:1px solid var(--border);
+  transition:background var(--anim-fast),color var(--anim-fast),
+             border-color var(--anim-fast)}
+.model-cap-chip:hover{background:var(--primary-light);color:var(--primary);
+  border-color:transparent}
+.model-cap-chip.selected{background:var(--primary-light);color:var(--primary);
+  border-color:var(--primary);box-shadow:0 0 0 1px var(--primary) inset}
+/* 卡片末尾的「＋ 添加能力」（见 config-ui.js 的 addCapabilityChip）：长得像徽标、
+   实际是按钮 —— 给这张卡片再加一条（同一模型名、同一地址，另一项能力） */
+.model-cap-add{flex-shrink:0}
+.model-cap-del{border:0;background:transparent;cursor:pointer;padding:0 4px;
+  font-size:var(--fs-sm);line-height:1;color:inherit;opacity:.55;
+  font-family:inherit;border-radius:8px}
+.model-cap-del:hover:not(:disabled){opacity:1;color:var(--error);
+  background:var(--error-light)}
 /* 长得像徽标、实际可点（「设为 active」）：点完同一个槽位换成绿色 active 徽标 */
 .badge-btn{cursor:pointer;border:1px dashed var(--border);background:transparent;
   color:var(--text-secondary);font-family:inherit;font-weight:var(--fw-medium)}

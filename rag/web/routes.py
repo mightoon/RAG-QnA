@@ -24,8 +24,12 @@ from fastapi.templating import Jinja2Templates
 
 from rag.adapters.registry import AdapterRegistry
 from rag.api.deps import get_current_user, require_admin
-from rag.config.models import (LEGACY_SECTION_ALIASES, MODEL_ENTRY_FIELDS,
-                               ModelEntry, clean_model_ids, is_http_url,
+from rag.config.models import (DOC_PARSE_CAPABILITIES,
+                               LEGACY_SECTION_ALIASES, MODEL_ENTRY_FIELDS,
+                               ModelEntry, clean_model_ids,
+                               doc_parse_capability,
+                               doc_parse_capability_label,
+                               doc_parse_endpoint_path, is_http_url,
                                model_param_fields, new_entry_id,
                                rerank_api_endpoint, resolve_rerank_model_path)
 from rag.config.secrets import (MASK, SENSITIVE_KEYS, is_display_dots,
@@ -253,6 +257,22 @@ _MODEL_SECTIONS = (
      ("display_name", "api_key", "model", "temperature", "max_tokens")),
     ("embedding", "向量模型 (Embedding)",
      ("display_name", "api_key", "model", "dim", "query_prefix")),
+    # 文档解析（Doc-Parse）：一台 PaddleX 服务 + 一项处理能力。
+    # 界面上只填「模型名 → API 地址 → 处理能力」三样：
+    #   - 没有 api_key（PaddleX serving 默认不带鉴权）；
+    #   - **没有「模型ID」这一行**，连带没有「可用模型 / 获取模型ID」那一行（它挂在
+    #     模型ID 行上方，见 config-ui.js 的 injectModelPicker）—— 一台 PaddleX 服务
+    #     按能力拆 endpoint，没有"调用哪个模型"这种选择，条目身份由后端生成的 id
+    #     承担（见 models.new_entry_id）。这几处界面口径由 _MODEL_SECTION_UI_FLAGS
+    #     下发，入库接口也按字段表判断要不要模型ID（见 model_library_upsert）。
+    #   - 「处理能力」是下拉（见 _ENUM_PARAM_OPTIONS），值 → PaddleX 的 endpoint 路径
+    #     （见 models.DOC_PARSE_CAPABILITIES）；「测试模型」测的是服务的 /health
+    # 它与另外几段的库口径也不同（见 model_library_upsert / _entry_view）：
+    # **一张卡片 = 一个模型名（一台 PaddleX 服务）**，同一台服务上的几项能力是这张
+    # 卡片上的几枚徽标（库里的几条配置，同名 + 同地址 + 不同能力），不是什么"多套
+    # 可切换的配置"——所以这一段没有"设为 active"，卡片恒为 active
+    ("doc_parse", "文档解析（Doc-Parse）",
+     ("display_name", "capability")),
 )
 
 # 「模型库」一共四段：上面三段 + 重排模型。它们的库都支持多套已测通的配置并存、
@@ -273,12 +293,36 @@ _MODEL_SECTION_PARAMS = {k: params for k, _, params in _MODEL_SECTIONS}
 _RERANK_PARAMS = ("display_name", "model_dir", "model", "device")
 _MODEL_SECTION_PARAMS["rerank"] = _RERANK_PARAMS
 
+# 模型段的界面口径（按段名下发到前端，不落盘）：有些段缺某些行，不是"字段值为空"
+# 而是**根本不该画**——值空着还能填，行画出来了用户就会以为必须填。
+#   noModelId：没有「模型ID」这一行，连带不画「可用模型 / 获取模型ID」（同段表单里
+#     那个入口挂在模型ID 行上方）。文档解析就是这一类：一台 PaddleX 服务按能力拆
+#     endpoint，没有"调用哪个模型"可选，条目身份由后端生成的 id 承担 —— 前端据此
+#     跳过模型ID 的必填校验、入库时也不带 modelIds（见 config-ui.js 的 buildPayload）
+#   endpointPlaceholder：「API 地址」的占位提示。默认那句写着"留空则降级为内置
+#     Mock"，对本段是错的（文档解析没有 Mock 替身，地址必填）
+#   capabilityBadges：卡片按「模型名」归并 —— 一张卡片摆的是同一个模型名下的几枚
+#     「处理能力」徽标（库里同名的几条配置），点徽标=编辑那条、徽标尾部的 ×=删掉
+#     那项能力（见 config-ui.js 的 renderCapabilityLibrary）；点卡片本身不进编辑
+#     （一张卡片上有多条，点卡片说不清要编哪一条）
+_MODEL_SECTION_UI_FLAGS = {
+    "doc_parse": {
+        "noModelId": True,
+        "capabilityBadges": True,
+        "endpointPlaceholder":
+            "http://host:8080（PaddleX 服务根地址，测试走它的 /health）",
+        "displayNamePlaceholder": "如：PaddleX OCR 服务 / 版面解析服务",
+    },
+}
+
 _PARAM_LABELS = {
     "base_url": "API 地址", "api_key": "API Key", "model": "模型ID",
     "display_name": "模型名",
     "device": "推理设备",                     # 重排模型：Cross-Encoder 加载设备
     # 重排模型：本机权重目录，或远程重排服务地址（两义共用这一栏，故名字写全）
     "model_dir": "模型路径/API",
+    # 文档解析：处理能力 → PaddleX 的一个 endpoint 路径（见 _ENUM_PARAM_OPTIONS）
+    "capability": "处理能力",
     "temperature": "温度", "max_tokens": "最大 Token",
     "timeout": "超时(秒)", "max_concurrency": "并发数", "dim": "向量维度",
     "batch_size": "批大小", "query_prefix": "查询前缀",
@@ -325,6 +369,15 @@ _SECRET_PARAM_KEYS = SENSITIVE_KEYS
 # 服务段绝不传 reveal：同义词表里也有个叫 api_key 的参数，但它走的是"留空/圆点 =
 # 沿用原值"的老路，没有上面那个假象 —— 按**键名**放行会把凭据多送一份到页面，
 # 所以这里由调用点显式决定（见 _normalize_config 的模型段与 _entry_view）。
+
+# 下拉型参数：键 → 选项（值 + 显示文案）。取值只有少数几种、且后端按白名单归一
+# （填错只会静默回落到缺省项）的参数一律给下拉：让用户在合法取值里选，而不是
+# 猜后端认哪几个字符串。选项由后端下发 —— 前端不再维护第二份"有哪些能力"的清单。
+_ENUM_PARAM_OPTIONS: dict[str, list[dict]] = {
+    # 文档解析的处理能力：值就是 PaddleX 的 endpoint 名（见 DOC_PARSE_CAPABILITIES）
+    "capability": [{"v": k, "label": label}
+                   for k, (label, _path) in DOC_PARSE_CAPABILITIES.items()],
+}
 
 # 允许留空的参数：UI 在输入框右侧标注 optional
 # （MySQL 免密账号；ES 未开启安全认证时用户名/密码都不用填）
@@ -511,6 +564,10 @@ def _param_row(k: str, v, group: str | None = None,
            "type": typ, "editable": True,
            "optional": optional,
            "secret": secret}
+    if k in _ENUM_PARAM_OPTIONS:
+        # 下拉的参数：类型改成 enum，并把合法取值一并下发（前端不问第二遍）
+        row["type"] = "enum"
+        row["options"] = _ENUM_PARAM_OPTIONS[k]
     if secret:
         row["value"] = (str(plain_value)
                         if reveal and plain_value is not None
@@ -539,6 +596,18 @@ def _blank_secret_masks(obj):
     return obj
 
 
+def _entry_badge(section: str, e: ModelEntry) -> str:
+    """库条目卡片上的徽标文案：这条配置"能干什么"
+
+    只有文档解析有这一枚：它的卡片上**没有模型ID**（见 _MODEL_SECTION_UI_FLAGS），
+    于是那个位置改摆「处理能力」——一条配置与另一条的区别本来就是"地址 + 能力"，
+    不写出来，同一台服务上的四条曲线（OCR / 版面 / 表格 / 公式）在列表里长得一样。
+    """
+    if section == "doc_parse":
+        return doc_parse_capability_label((e.params or {}).get("capability"))
+    return ""
+
+
 def _entry_view(section: str, e: ModelEntry, active_id: str) -> dict:
     """模型库条目 → 前端视图（endpoint + configParams，与卡片表单同构）
 
@@ -553,7 +622,12 @@ def _entry_view(section: str, e: ModelEntry, active_id: str) -> dict:
         "displayName": e.display_name or e.model or e.base_url,
         "endpoint": e.base_url,
         "testedAt": e.tested_at,
-        "active": bool(e.id) and e.id == active_id,
+        # 文档解析的卡片恒为 active（见 _MODEL_SECTION_UI_FLAGS 的 capabilityBadges）：
+        # 库里每一条都是一项在用的能力，没有"切到哪一条生效"这回事 —— 前端据此永远
+        # 点亮绿牌、也不摆「设为 active」
+        "active": bool(e.id) and (section == "doc_parse" or e.id == active_id),
+        # 卡片徽标（有的段才有，见 _entry_badge）：取代"模型ID"那个位置
+        "badge": _entry_badge(section, e),
         # [0] 是这条配置调用的那个 —— 表单里的「模型ID」输入框填的就是它
         # （configParams 里那行 model 与它同源，见 normalize_entry_models）。
         # 界面只摆这一个（见 config-ui.js 的模型库卡片），列表仍整体返回：
@@ -594,13 +668,22 @@ def _normalize_config(c: ServiceContainer) -> dict:
         # （界面上模型ID 就这一个，见 config-ui.js 的 model 行）；与 endpoint /
         # configParams 同源：表单显示的就是"当前生效的配置"
         active_entry = next((e for e in lib_entries if e.id == active_id), None)
+        # 文档解析的表单不摆"当前生效的那一套"：这一段没有单一生效的配置（每张卡片
+        # 都一直生效，见 _entry_view），编辑一律从点徽标进来 —— 初始表单是一张空白表，
+        # 填完测通即新增一条（与「增加模型」同一个状态，见 config-ui.js 的
+        # clearFormForNew）。若像别的段那样回填，用户会以为改的是库里那一条，
+        # 一保存却是新增，同名同能力会被拒收（见 model_library_upsert）
+        blank_form = key == "doc_parse"
         models.append({
             "key": key, "label": label, "tab": "model", "refresh": None,
             "editable": True, "showTestButton": True,
-            "endpoint": sect.get("base_url", ""),
+            # 界面口径（缺某些行 / 占位提示）：不落盘，见 _MODEL_SECTION_UI_FLAGS
+            **(_MODEL_SECTION_UI_FLAGS.get(key) or {}),
+            "endpoint": "" if blank_form else sect.get("base_url", ""),
             "modelIds": list(active_entry.model_ids) if active_entry else [],
-            "configParams": [_param_row(k, sect.get(k),
-                                        plain_value=plain_sect.get(k),
+            "configParams": [_param_row(k, "" if blank_form else sect.get(k),
+                                        plain_value=(None if blank_form
+                                                     else plain_sect.get(k)),
                                         reveal=True)
                              for k in params if k in sect],
             # 这一段里所有「已测通」的配置。active 的那一条就是上面这些顶层
@@ -1831,7 +1914,11 @@ async def _write_model_section(request: Request, section: str,
     会留下"顶层写着上一个模型、列表里 active 指着新模型"的自相矛盾状态 ——
     运行期不受影响（加载时按 active 重算顶层），但读文件的人会被误导。
     """
-    active = next(e for e in entries if e.id == active_id)
+    # 库里可能一条都不剩：文档解析能把最后一张卡片上的最后一个能力删掉（见
+    # model_library_delete）。此时没有 active 条目可镜像，顶层字段必须一起清空 ——
+    # 留着旧地址的话，下次加载时 models._sync_model_library 会按"顶层还写着地址"
+    # 把它复活成一条 legacy 条目，用户明明删了、刷新页面它又回来了
+    active = next((e for e in entries if e.id == active_id), None)
     if section == "rerank":
         # 重排库的存储位置与另外两段不同：库挂在 retrieval 上，且没有地址/凭据，
         # 只写几个顶层镜像字段（模型名 / 模型路径 / 模型ID / 加载设备）
@@ -1845,10 +1932,11 @@ async def _write_model_section(request: Request, section: str,
         }}
     else:
         sect: dict = {"models": [e.model_dump(mode="json") for e in entries],
-                      "active_id": active_id}
+                      "active_id": active_id if active else ""}
         for k in MODEL_ENTRY_FIELDS:
-            sect[k] = getattr(active, k)
-        sect.update(active.params)
+            sect[k] = getattr(active, k) if active else ""
+        if active:
+            sect.update(active.params)
         update = {section: sect}
 
     cfg_path = _config_file(_container(request))
@@ -1879,6 +1967,45 @@ def _reuse_entries(sect) -> list[ModelEntry]:
     return [ModelEntry.model_validate(e.model_dump()) for e in sect.models]
 
 
+def _norm_endpoint(url: object) -> str:
+    """地址比较用的规范化：只判"是不是同一台服务"，末尾的斜杠不算差别"""
+    return str(url or "").strip().rstrip("/")
+
+
+def _check_doc_parse_card(entries: list[ModelEntry], entry_id: str, name: str,
+                          endpoint: str, cap: str) -> None:
+    """文档解析入库前的校验（卡片 = 模型名，见 _MODEL_SECTIONS 的那段注释）
+
+    1. **不同的模型名必须对应不同的 API 地址**：一张卡片只有一栏地址，两张卡片指着
+       同一台服务就是重复配置（想给那台服务添能力，该加在同一张卡片上）；
+    2. **同名 = 同一张卡片**：地址必须和卡片上已有的一致，否则这张卡片就有两栏地址；
+    3. **同名同能力 = 同一条配置**：拒收 —— 要改的是那一条，不是再加一枚一样的徽标。
+    """
+    others = [e for e in entries if e.id != entry_id]
+    same_name = [e for e in others if (e.display_name or "").strip() == name]
+    if same_name:
+        owner = str(same_name[0].base_url or "").strip()
+        if _norm_endpoint(owner) != _norm_endpoint(endpoint):
+            raise HTTPException(
+                400, f"模型名「{name}」已在库里，指向 {owner or '（空地址）'}："
+                     "同一张卡片只有一个 API 地址，换地址请换个模型名")
+        label = doc_parse_capability_label(cap)
+        if any(doc_parse_capability((e.params or {}).get("capability")) == cap
+               for e in same_name):
+            raise HTTPException(
+                400, f"「{name}」已有「{label}」能力：同一项能力只存一条，"
+                     "要改就点它卡片上那枚徽标")
+        return
+    clash = next((e for e in others
+                  if _norm_endpoint(e.base_url) == _norm_endpoint(endpoint)), None)
+    if clash is not None:
+        raise HTTPException(
+            400, f"API 地址已被模型「{clash.display_name or clash.id}」占用："
+                 "不同的模型名必须对应不同的 API 地址；要给这台服务添能力，"
+                 f"模型名请填「{clash.display_name or clash.id}」"
+                 "（新能力会作为徽标加到它那张卡片上）")
+
+
 @admin_ui_router.post("/model-library/upsert")
 async def model_library_upsert(request: Request,
                                user: UserContext = Depends(require_admin)):
@@ -1904,6 +2031,10 @@ async def model_library_upsert(request: Request,
     # 兜底 model 行：缓存了旧 JS 的页面只发那一行，没有 modelIds
     model_ids = clean_model_ids(body.get("modelIds") or []) \
         or clean_model_ids([(by_key.get("model") or {}).get("value")])
+    # 表单里有没有「模型ID」这一行，由字段表决定，不硬编段名：没有那一行的段
+    # （文档解析：PaddleX 按能力拆 endpoint，见 _MODEL_SECTIONS 的字段表）就既不
+    # 要求它，也不把它写进条目 —— 条目身份由后端生成的 id 承担
+    needs_model_id = "model" in _MODEL_SECTION_PARAMS.get(section, ())
     if not name:
         raise HTTPException(400, "模型名必填：它就是列表里显示、也是你用来认它的名字")
     if section == "rerank":
@@ -1915,22 +2046,29 @@ async def model_library_upsert(request: Request,
                      "或远程重排服务地址（http://host:port/v1）")
     elif not endpoint:
         raise HTTPException(400, "API 地址必填：留空表示本机 Mock 模式，无需入库")
-    if not model_ids:
+    if needs_model_id and not model_ids:
         raise HTTPException(400, "模型ID必填：集合点的地址不足以确定调用哪个模型")
 
     entries = _reuse_entries(sect)
     entry_id = str(body.get("id") or "")
-    # 一张卡片由「模型名 + 在用的那个模型ID」共同确定，不是只看名字：同一台机器上
-    # vLLM 按模型名拆着跑、线上服务商一个 key 下挂好几个模型，都会出现"名字一样、
-    # 模型不同"的两条配置 —— 那是两张卡片，不该拒收
-    dup = next((e for e in entries
-                if e.display_name == name and e.model == model_ids[0]
-                and e.id != entry_id), None)
-    if dup is not None:
-        raise HTTPException(
-            400,
-            f"已有同名同模型「{name} / {model_ids[0]}」：改那一条，"
-            "或换个模型名 / 模型ID")
+    if section == "doc_parse":
+        # 文档解析的一张卡片 = 一个模型名：同名的几条是**同一张卡片上的几枚能力
+        # 徽标**，判据不是"名字 + 模型ID"那套（见 _check_doc_parse_card）
+        _check_doc_parse_card(
+            entries, entry_id, name, endpoint,
+            doc_parse_capability((by_key.get("capability") or {}).get("value")))
+    else:
+        # 一张卡片由「模型名 + 在用的那个模型ID」共同确定，不是只看名字：同一台机器
+        # 上 vLLM 按模型名拆着跑、线上服务商一个 key 下挂好几个模型，都会出现"名字
+        # 一样、模型不同"的两条配置 —— 那是两张卡片，不该拒收
+        dedup_key = model_ids[0] if model_ids else ""
+        dup = next((e for e in entries
+                    if e.display_name == name and e.model == dedup_key
+                    and e.id != entry_id), None)
+        if dup is not None:
+            shown = f"{name} / {dedup_key}" if dedup_key else name
+            raise HTTPException(
+                400, f"已有同名同模型「{shown}」：改那一条，或换个模型名 / 模型ID")
 
     target = next((e for e in entries if e.id and e.id == entry_id), None)
     is_new = target is None
@@ -1954,7 +2092,7 @@ async def model_library_upsert(request: Request,
     target.display_name = name
     target.base_url = endpoint
     target.model_ids = model_ids
-    target.model = model_ids[0]     # 镜像：业务调用的就是列表里的第一个
+    target.model = model_ids[0] if model_ids else ""   # 镜像：业务调用的就是第一个
     target.tested_at = time.strftime("%Y-%m-%d %H:%M:%S")
     # 条目参数必须**完整**：缺项会让"切到这条"变成"这一项沿用上一条的值"，
     # 用户看到的就是"切了模型但温度没跟着变"。界面没给的项用当前段值兜底
@@ -1965,6 +2103,11 @@ async def model_library_upsert(request: Request,
         if k in model_param_fields(section):
             v = _coerce_param(row)
             if v is not None:
+                # 白名单型参数（文档解析的处理能力）：归一后才落盘 —— 落一个
+                # 打不出去的 endpoint 到配置里，要到真正解析时才炸，还看不出是
+                # 谁写坏的（界面下拉只会给合法值，这里防的是手改 YAML / 旧页面）
+                if k == "capability":
+                    v = doc_parse_capability(v)
                 params[k] = v
     if section == "rerank":
         # 模型路径首尾的空白会让拼出来的目录差一个字符（`models ` → `models /xxx`），
@@ -1972,12 +2115,24 @@ async def model_library_upsert(request: Request,
         params["model_dir"] = str(params.get("model_dir") or "").strip()
     target.params = params
 
-    # 库里本来一条都没有 → 它只能当 active（没有第二条可选）；否则按界面的选择
-    activate = bool(body.get("activate")) or not sect.active_id
-    active_id = target.id if activate else sect.active_id
+    if section == "doc_parse":
+        # 文档解析没有"切到哪一条"（卡片恒 active，见 _entry_view）：active_id 只是
+        # 顶层镜像字段的落脚点，谁写在那里都行 —— 库里原来那条还在就继续用它，免得
+        # 每存一项能力就把顶层字段挪一次
+        active_id = (sect.active_id
+                     if any(e.id == sect.active_id for e in entries)
+                     else entries[0].id)
+        # 响应里的 active 给**本次存下的那一条**：前端据此把表单停在用户刚编辑的
+        # 那枚徽标上（见 config-ui.js）。若回 active_id 那条，表单会被弹到库里第一
+        # 张卡片上，用户接着再点一次保存就成了新增一条，被同名同能力拒收
+        active = target
+    else:
+        # 库里本来一条都没有 → 它只能当 active（没有第二条可选）；否则按界面的选择
+        activate = bool(body.get("activate")) or not sect.active_id
+        active_id = target.id if activate else sect.active_id
+        active = next(e for e in entries if e.id == active_id)
 
     result = await _write_model_section(request, section, entries, active_id)
-    active = next(e for e in entries if e.id == active_id)
     return {"ok": True, "section": section, "noop": False,
             "library": _library_view(section, entries, active_id),
             "active": _entry_view(section, active, active_id), **result}
@@ -2015,12 +2170,16 @@ async def model_library_delete(request: Request,
 
     当前 active 的那条不能删：删掉之后业务就没有模型可用了，必须先切到别的。
     这条规则同时保证了"运行期永远能按 active 读到顶层字段"这个前提。
+    文档解析是例外：它没有"当前生效的那一条"（卡片恒 active，见 _entry_view），
+    删一条 = 摘掉某张卡片上的一枚能力徽标，最后一项能力删掉整张卡片也就没了
+    （卡片就是这些条目本身）—— 所以这里不设 active 这道坎，但要保证 active_id
+    仍落在剩下的一条上，顶层镜像才不会指向一个不存在的条目。
     """
     body = await _json_body(request)
     section = str(body.get("section") or "")
     entry_id = str(body.get("id") or "")
     sect = _model_section(request, section)
-    if entry_id and entry_id == sect.active_id:
+    if entry_id and entry_id == sect.active_id and section != "doc_parse":
         raise HTTPException(400, "它是当前生效的模型，不能删除；"
                                  "请先把别的模型设为 active")
     entries = _reuse_entries(sect)
@@ -2028,12 +2187,23 @@ async def model_library_delete(request: Request,
     if len(left) == len(entries):
         raise HTTPException(404, "该模型不在模型库里（可能已被删除），请刷新页面")
 
-    result = await _write_model_section(request, section, left, sect.active_id)
+    active_id = sect.active_id
+    if section == "doc_parse":
+        # 删掉的正是顶层镜像跟着的那条时改跟剩下的第一条；一条不剩就留空
+        # （_write_model_section 会把顶层字段一并清空，见那里的注释）
+        if not any(e.id == active_id for e in left):
+            active_id = left[0].id if left else ""
+        # 响应的 active 给 None（而不是剩下第一条）：表单该显示什么由前端决定 ——
+        # 用户正在编辑的那条若被删了就清空表单，否则原样留着，别被弹到别的徽标上
+        active_view = None
+    else:
+        active_view = _entry_view(section, next(e for e in left
+                                                if e.id == active_id), active_id)
+
+    result = await _write_model_section(request, section, left, active_id)
     return {"ok": True, "section": section, "noop": False,
-            "library": _library_view(section, left, sect.active_id),
-            "active": _entry_view(section, next(e for e in left
-                                                if e.id == sect.active_id),
-                                  sect.active_id), **result}
+            "library": _library_view(section, left, active_id),
+            "active": active_view, **result}
 
 
 def _project_root(request: Request) -> Path:
@@ -2530,6 +2700,14 @@ async def list_model_ids(request: Request,
     kind = str(body.get("kind") or "llm")
     endpoint = str(body.get("endpoint") or "").strip()
     label = str(body.get("label") or kind)
+    if kind == "doc_parse":
+        # 文档解析没有"可选模型"这一概念（一台 PaddleX 服务按能力拆 endpoint，
+        # 见 models.DOC_PARSE_CAPABILITIES），界面上也没有「可用模型」那一行。
+        # 这里明确回绝，免得旧页面 / 直接调接口的调用方走进下面的 /models 分支，
+        # 换回一个 404 被误读成"这台 PaddleX 服务有问题"
+        return {"ok": False, "models": [],
+                "message": "文档解析不用获取模型ID：填好 API 地址后，"
+                           "在「处理能力」里选 OCR / 版面识别 / 表格识别 / 公式识别"}
     if kind == "rerank":
         # 本机 Cross-Encoder：没有服务端可问，候选就是「模型路径/API」那个目录下的
         # 子目录（与「测试模型」同一套扫描，见 health_test）。回目录名即可 ——
@@ -2676,6 +2854,33 @@ async def health_test(request: Request,
                                "（核对「模型路径/API」与「模型ID」）")
                     if models:
                         message += "；该目录下有：" + "、".join(models)
+    # 文档解析（PaddleX）的「测试模型」：只探服务本身 —— GET /health 拿到 200 就算
+    # 通过。处理能力不参与判定（它只决定以后真正解析时打哪个 endpoint，见
+    # models.doc_parse_endpoint_path），所以换个能力不必重测（前端 TEST_IRRELEVANT_KEYS）。
+    # 探的是**表单里的地址**（改了还没保存也能测，与其它模型段同一口径）。
+    elif kind == "doc_parse":
+        if not endpoint:
+            message = ("API 地址为空：先填 PaddleX 服务地址（如 http://host:8080），"
+                       "再点「测试模型」")
+        else:
+            target = endpoint.rstrip("/") + "/health"
+            import httpx
+            try:
+                async with httpx.AsyncClient(
+                        timeout=_MODEL_LIST_TIMEOUT_SEC) as hc:
+                    r = await hc.get(target)
+            except Exception as e:
+                message = f"无法访问 {target}：{str(e)[:150]}"
+            else:
+                if r.status_code == 200:
+                    online = True
+                    cap = _row_value(rows, "capability")
+                    message = (f"{target} 正常回应（HTTP 200）；这条配置将用于"
+                               f"「{doc_parse_capability_label(cap)}」"
+                               f"（{doc_parse_endpoint_path(cap)}）")
+                else:
+                    message = (f"HTTP {r.status_code}：{target} 未就绪。"
+                               f"原始信息：{_resp_body_snippet(r) or '（无响应体）'}")
     # LLM/VLM/Embedding「测试模型」：用表单里的地址 + Key + 模型ID **真发一次请求**
     # （对话模型 → /chat/completions，向量模型 → /embeddings），有正确回应才算通过。
     # 旧口径只 GET 一次 /models，等于只证明"地址通"：模型ID 填错、Key 没权限、

@@ -306,10 +306,56 @@
   /* 改这些字段不必重测模型：它们不参与"连得上吗、这个模型能用吗" ——
      模型名只是卡片上的标识，温度 / 最大 Token 是生成参数，向量维度 / 查询前缀是
      检索侧的用法。改完直接可存，否则用户只想调个温度却被逼着再打一次模型。
+     处理能力（文档解析）也在此列：测试探的是服务的 /health，与选哪项能力无关 ——
+     它决定的是以后真正解析时打哪个 endpoint，换个能力不必重测。
      其余字段（API 地址 / API Key / 模型ID 等）任一改动都会让上一次测试不再为当前
-     值背书 —— 模型ID 尤甚，那正是「测试模型」要验证的东西。 */
+     值背书 —— 模型ID 尤甚，那正是「测试模型」要验证的东西。
+     这张表被 testSignature 用：它划定了"哪些字段参与测试签名"，也就是"改哪些字段
+     要重测"。 */
   const TEST_IRRELEVANT_KEYS = ['display_name', 'temperature', 'max_tokens',
-                                'dim', 'query_prefix'];
+                                'dim', 'query_prefix', 'capability'];
+
+  /* 一套值的「测试签名」：只取与「测试模型」有关的字段（TEST_IRRELEVANT_KEYS 之外
+     的那些），用来回答"表单里此刻这套值，是不是那次测通过的那一套"。
+     门禁（能否「存入模型库」）与「测试模型」按钮的灰/亮都由它判定（见 groupCard），
+     于是两个按钮永远相反：能存 = 这套值在册，没什么可再测的；要测 = 改动动到了
+     测试真正关心的东西（地址 / Key / 模型ID）。
+
+     src 既可以是卡片表单（g），也可以是库条目视图（_entry_view 的产物）—— 两者同构，
+     所以"点徽标进来的这套值"能直接与"库里的那一条"对上。
+
+     rawOf(key) 取输入框**此刻**的文本，凭据必须现读框："框里还摆着圆点 = 没动过"与
+     "被删空 = 主动清空"在状态里都是空串，只有框里的文本分得出（见 secretFormValue）。
+     api_key 例外：模型段下发的是解密后的真值（routes._param_row 的 reveal），框里
+     就是那把钥匙、状态里的值同源，没给框时按状态算即可。 */
+  function testSignature(src, rawOf) {
+    /* 地址按后端 _norm_endpoint 的口径归一：末尾斜杠不算差别 —— 否则"库条目视图里的
+       地址"与"表单里的地址"会因一个尾斜杠而互相认不出来，白白多测一次 */
+    const endpoint = String(src.endpoint == null ? '' : src.endpoint)
+      .trim().replace(/\/+$/, '');
+    const parts = [endpoint, String((src.modelIds || [])[0] || '')];
+    (src.configParams || []).forEach(p => {
+      if (TEST_IRRELEVANT_KEYS.indexOf(p.key) >= 0) return;
+      if (!p.secret) {
+        parts.push(p.key + '=' + String(p.value == null ? '' : p.value));
+        return;
+      }
+      const dots = (p.hasValue && typeof p.valueLen === 'number')
+        ? '•'.repeat(p.valueLen) : '';
+      const raw = rawOf ? rawOf(p.key) : null;
+      if (p.key === 'api_key') {
+        parts.push(p.key + '=v:' + (raw != null ? String(raw)
+          : String(p.value == null ? '' : p.value)));
+        return;
+      }
+      // 其余凭据的真值不下发：框里那串圆点 = 没动过（留空沿用这条自己的钥匙）
+      const v = raw != null ? String(raw) : dots;
+      if (v === dots || (v !== '' && /^•+$/.test(v))) parts.push(p.key + '=u');
+      else if (v === '') parts.push(p.key + '=c');
+      else parts.push(p.key + '=v:' + v);
+    });
+    return parts.join('\u0001');
+  }
 
   /* 单选行（如 CPU/GPU 设备选择） */
   function radioRow(labelText, name, options, value, onChange) {
@@ -340,6 +386,40 @@
     return row;
   }
 
+  /* 下拉单选行（值多到单选按钮排不下，如「处理能力」的四项）。
+     选项由后端下发（见 routes._ENUM_PARAM_OPTIONS）：取值只有后端认的那几种，
+     前端不另抄一份清单 —— 抄了就会和后端漂移，最后表现为"选了下拉里的某项、
+     它却静默回落成缺省值"。传给 onChange 的是选项的 v（配置里存的值）。 */
+  function selectRow(labelText, options, value, onChange) {
+    const row = el('div', 'perm-row');
+    const lab = el('label', 'form-label');
+    lab.style.minWidth = '130px';
+    lab.style.margin = '0';
+    lab.textContent = labelText;
+    row.appendChild(lab);
+    const sel = el('select', 'form-input');
+    sel.style.maxWidth = '300px';
+    (options || []).forEach(o => {
+      const opt = el('option', null, o.label == null ? o.v : o.label);
+      opt.value = o.v;
+      sel.appendChild(opt);
+    });
+    const cur = String(value == null ? '' : value);
+    if (cur) sel.value = cur;
+    else {
+      /* 值还没定（新填一张卡片、或点了「＋ 添加能力」）：表头补一个空选项当占位。
+         不给的话浏览器会停在读到的第一项上，而状态里其实是空串 —— 用户以为
+         选好了，保存下去却是"没选"（见 buildPayload 里对处理能力的必填校验） */
+      const ph = el('option', null, '请选择');
+      ph.value = '';
+      sel.insertBefore(ph, sel.firstChild);
+      sel.value = '';
+    }
+    sel.addEventListener('change', () => onChange(sel.value));
+    row.appendChild(sel);
+    return row;
+  }
+
   /* ══ 模型库（模型 tab 左列）══════════════════════════════════
      "配好一个就覆盖掉上一个"是原来的行为：用户手上有线上 DeepSeek、内网 vLLM、
      本机 Ollama 时，换回来就得重填地址和 key。这里把每个「已测通」的配置列出来，
@@ -348,7 +428,8 @@
   /* 左列里「被点中的那条」的 id（按段）。选中 = 右侧表单现在显示的是它、入库时会
      更新它（没选中则是新增一条）。放这里而不是挂在 g 上：g 是回传给后端的配置载荷，
      掺进 _editingId 这类纯界面状态会被一起写进配置文件 */
-  const modelEdit = { llm: '', vlm: '', embedding: '', rerank: '' };
+  const modelEdit = { llm: '', vlm: '', embedding: '', rerank: '',
+                      doc_parse: '' };
 
   function libButton(text, cls, title, onClick) {
     const b = el('button', cls, text);
@@ -379,6 +460,13 @@
     const row = (entry.configParams || []).find(p => p.key === key);
     return row ? String(row.value == null ? '' : row.value) : '';
   };
+
+  /* 表单里「处理能力」当前选中项的显示文案（下拉选项里的 label），只用于提示 */
+  function capabilityLabelOf(g) {
+    const row = (g.configParams || []).find(p => p.key === 'capability') || {};
+    const opt = (row.options || []).find(o => o.v === String(row.value || ''));
+    return (opt && opt.label) || String(row.value || '');
+  }
 
   /* 条目 → 表单：逐行覆盖值，标签/类型/是否凭据沿用现有行。
      条目少一行（历史条目缺项）就保留表单现值，免得点一下卡片输入框平白少一个 */
@@ -444,6 +532,9 @@
                 'warning');
     } else if (opts && opts.activated) {
       showToast('已生效：' + name + '（问答等业务立即改用这一套）', 'success');
+    } else if (opts && opts.alwaysActive) {
+      // 文档解析：库里每项能力都在用，没有「设为 active」这一步（见 _entry_view）
+      showToast('已存入模型库：' + name + '（文档解析的每项能力都直接生效）', 'success');
     } else if (opts && opts.deleted) {
       showToast('已从模型库删除：' + name, 'success');
     } else {
@@ -457,7 +548,7 @@
      （槽位名就是后端那套段名的 key；重排段虽挂在 retrieval 上，但接口层用
      routes._RerankStore 伪装成了同样的"段"，这里是同一个标题口径） */
   const LIB_TAGS = { llm: 'LLM', vlm: 'VLM', embedding: 'Embedding',
-                     rerank: 'Rerank' };
+                    rerank: 'Rerank', doc_parse: 'Doc Parse' };
   const libTitle = key => (LIB_TAGS[key] ? '模型库 · ' + LIB_TAGS[key] : '模型库');
 
   /* ── 右列表单的"共用"：LLM 与 VLM 两块模型库只留一份填空框 ──
@@ -487,13 +578,11 @@
     return libsOfCard(g).find(x => x.key === sharedFormKey) || g;
   }
 
-  function renderLibrary(g) {
-    const lib = g.library || { activeId: '', entries: [] };
-    const entries = lib.entries || [];
-    const box = el('div', 'model-lib');
+  /* 库的标题行（两种卡片口径共用）：库名 + 「N 个已测通」 + 最右边的「增加模型」 */
+  function libHead(g, countText) {
     const head = el('div', 'model-lib-head');
     head.appendChild(el('span', 'model-lib-title', libTitle(g.key)));
-    head.appendChild(el('span', 'badge badge-default', entries.length + ' 个已测通'));
+    head.appendChild(el('span', 'badge badge-default', countText));
     /* 「增加模型」贴在这一行的最右边：点一下 = 右侧表单清空 + 退出选中态，
        于是接下来填的是一套新配置（入库走新增）；不点它也能直接改现有条目。
        没有条目时它也照旧摆着 —— 总得有个"从空白开始填"的入口 */
@@ -509,15 +598,34 @@
       });
     add.style.marginLeft = 'auto';   // 靠这一行最右
     head.appendChild(add);
-    box.appendChild(head);
+    return head;
+  }
+
+  /* 库空着时的提示（两种卡片口径共用） */
+  function libEmpty(g) {
+    const empty = el('div', 'model-lib-empty');
+    empty.appendChild(el('div', null, '还没有已测通的模型'));
+    /* 这一段没有模型ID（见后端 _MODEL_SECTION_UI_FLAGS）：指向「获取模型ID」的
+       指引就成了死路，改说该填的三样 —— 测试探的是服务的 /health */
+    empty.appendChild(el('div', 'form-hint',
+      g.noModelId
+        ? '在右侧填好「模型名」「API 地址」并选好「处理能力」'
+          + ' → 点「测试模型」（测服务的 /health）→ 通过后点「存入模型库」'
+        : '在右侧填好参数（模型ID 可点「获取模型ID」从服务端列表里选）'
+          + ' → 点「测试模型」→ 通过回应后点「存入模型库」'));
+    return empty;
+  }
+
+  function renderLibrary(g) {
+    // 文档解析另有一套卡片口径（一张卡片 = 一个模型名，卡片上挂能力徽标）
+    if (g.capabilityBadges) return renderCapabilityLibrary(g);
+    const lib = g.library || { activeId: '', entries: [] };
+    const entries = lib.entries || [];
+    const box = el('div', 'model-lib');
+    box.appendChild(libHead(g, entries.length + ' 个已测通'));
 
     if (!entries.length) {
-      const empty = el('div', 'model-lib-empty');
-      empty.appendChild(el('div', null, '还没有已测通的模型'));
-      empty.appendChild(el('div', 'form-hint',
-        '在右侧填好参数（模型ID 可点「获取模型ID」从服务端列表里选）'
-        + ' → 点「测试模型」→ 通过回应后点「存入模型库」'));
-      box.appendChild(empty);
+      box.appendChild(libEmpty(g));
       return box;
     }
 
@@ -623,6 +731,150 @@
     return box;
   }
 
+  /* ── 文档解析（Doc-Parse）的卡片：一张卡片 = 一个模型名 ──────────────
+     与别的段相比，这里的"一条配置"不是一张卡片，而是卡片上的一枚徽标 ——
+     一台 PaddleX 服务上的一项能力 = 库里的一条（同名 + 同地址 + 不同能力，
+     见后端 routes._check_doc_parse_card）。所以：
+       - 卡片按模型名归并，标题就是模型名，恒为 active（后端同样恒报 active：
+         这一段没有"切到哪一条生效"，每张卡片上的能力都在用，见 _entry_view）；
+       - **点徽标** = 编辑那一项能力（模型名 / 地址 / 能力回填到右侧表单）；
+         点卡片本身不进编辑 —— 一张卡片上挂着好几条，点卡片说不清要编哪一条；
+       - 徽标尾部的 × = 删掉那一项能力；删掉最后一项，整张卡片自然就没了
+         （卡片就是这些条目本身，库里一条不剩，卡片也就不画了）；
+       - 徽标行末尾的「＋ 添加能力」= 给这张卡片再加一条（同一个模型名、同一个
+         地址），见 addCapabilityChip —— 加第二项能力必须从这里进，否则会改到
+         已有那条身上（"第一枚徽标不见了"就是这么来的）。
+     三段注释里的"徽标"指的就是 .model-cap-chip（样式见 main.css）。 */
+  function renderCapabilityLibrary(g) {
+    const lib = g.library || { activeId: '', entries: [] };
+    const entries = lib.entries || [];
+    // 按模型名归并成卡片，保持条目在库里的先后（新加的能力排在卡片末尾）
+    const cards = [];
+    entries.forEach(e => {
+      const name = e.displayName || e.endpoint || '';
+      let card = cards.find(c => c.name === name);
+      if (!card) { card = { name, entries: [] }; cards.push(card); }
+      card.entries.push(e);
+    });
+
+    const box = el('div', 'model-lib');
+    /* 计数说清"几张卡片、几项能力"：这一段库里的一条 = 一项能力，不是一张卡片，
+       照别的段写「N 个已测通」会被读成"N 张卡片" */
+    box.appendChild(libHead(g, cards.length + ' 张卡片 · ' + entries.length + ' 项能力'));
+
+    if (!entries.length) {
+      box.appendChild(libEmpty(g));
+      return box;
+    }
+
+    cards.forEach(card => {
+      const item = el('div', 'model-lib-item active');
+      const line = el('div', 'model-lib-line');
+      line.appendChild(el('span', 'model-lib-name', card.name));
+      /* 这张卡片的地址不进卡面（和别的段一致：点徽标即可回填到右侧核对），
+         但摆一行 title 让人悬停就能看见 —— 卡片是按名字认的，地址才是"哪台服务" */
+      item.title = card.name + '：' + (card.entries[0].endpoint || '');
+      const acts = el('div', 'model-lib-acts');
+      // 这一段没有「设为 active」，也没有「删除整张卡片」的按钮：删除按能力粒度
+      // 走徽标尾部的 ×（见下），删到一项不剩卡片自己就消失了
+      acts.appendChild(el('span', 'badge badge-success', 'active'));
+      line.appendChild(acts);
+      item.appendChild(line);
+
+      const chips = el('div', 'model-lib-chips');
+      card.entries.forEach(e => {
+        chips.appendChild(capabilityChip(g, card, e, card.entries.length === 1));
+      });
+      // 末尾那枚「＋」：给这**一张卡片**再加一条（见 addCapabilityChip）
+      chips.appendChild(addCapabilityChip(g, card));
+      item.appendChild(chips);
+      box.appendChild(item);
+    });
+    return box;
+  }
+
+  /* 卡片上的一枚能力徽标：点它编辑这条配置，尾部的 × 删掉这项能力 */
+  function capabilityChip(g, card, e, onlyOne) {
+    const selected = modelEdit[g.key] === e.id;
+    const chip = el('span', 'badge badge-default model-cap-chip'
+      + (selected ? ' selected' : ''));
+    chip.title = '点击编辑模型信息：' + card.name + ' · ' + e.badge
+      + '（地址 ' + (e.endpoint || '空') + '）'
+      + (selected ? ' —— 右侧表单里正编辑的就是这一项' : '');
+    chip.appendChild(el('span', 'model-chip-name', e.badge));
+    /* × 删的是"这一项能力"（库里的一条）。删最后一项 = 整张卡片消失，文案得把
+       后果说清 —— 用户点的是徽标尾巴上的小叉，别让他以为只是收起一项 */
+    chip.appendChild(libButton('×', 'model-cap-del',
+      onlyOne ? '删掉「' + e.badge + '」：这是这张卡片最后一项能力，删掉整张卡片就没了'
+              : '删掉「' + e.badge + '」这一项能力',
+      ev => {
+        ev.stopPropagation();      // 别顺带触发徽标的"编辑"
+        if (!window.confirm('删除「' + card.name + '」的「' + e.badge + '」能力？\n\n'
+          + (onlyOne ? '这是这张卡片最后一项能力，删掉后整张卡片就没了。'
+                     : '只删掉这一项能力，同一张卡片上的其它能力不受影响。')
+          + '\n地址：' + (e.endpoint || '（空）'))) return;
+        libAction(ev.currentTarget, async () => {
+          const w = await ConfigData.deleteModel(g.key, e.id);
+          /* 正在编辑的就是被删的这条 → 表单清成空白表，准备配下一项；编辑的是
+             别的徽标就原样留着（这一段后端不回 active，正是为了让前端自己定，
+             见 model_library_delete）。
+             清空前后的基线对齐同「增加模型」：清掉一条不该亮「未保存」 */
+          if (modelEdit[g.key] === e.id) {
+            modelEdit[g.key] = '';
+            clearFormForNew(g);
+            ConfigData.markSaved(['model:' + g.key]);
+          }
+          modelSavedToast(w, { name: card.name + ' · ' + e.badge, deleted: true });
+        });
+      }));
+    chip.addEventListener('click', () => {
+      modelEdit[g.key] = e.id;
+      backfillFromEntry(g, e);
+      ConfigData.markSaved(['model:' + g.key]);   // 只是选中看一眼，不算改动
+      Partials.refreshPiece('panel_model');
+    });
+    return chip;
+  }
+
+  /* ── 卡片末尾那枚「＋ 添加能力」：给这**一张卡片**再加一条 ──────────────
+     同一个模型名、同一个地址（一张卡片就是一台服务），另一项能力 —— 也就是
+     给"这张卡片的徽标行"添第二枚、第三枚徽标。
+
+     为什么非要有这枚按钮：卡片上第一条之外的条目，以前只能靠两条路加，两条都
+     会把用户带偏 ——
+       · 「增加模型」把表单清空重填：模型名与地址得照着卡片重抄一遍，而这一段
+         卡片是**按模型名认的**、地址还得与同名条目一致，抄歪一个字符就被后端
+         当成"另一个模型名 + 占用中的地址"拒收（见 routes._check_doc_parse_card）；
+       · 点开已有一枚徽标改「处理能力」：改的是**那一条自己**，徽标换了个名字 ——
+         看着就是"第二枚出现了，第一枚不见了"。
+     这里把该沿用的沿用（模型名与地址照抄卡片），该空的空着（处理能力留空，等
+     用户自己选），并且清掉 modelEdit —— 不带 id，入库走的必然是**新增**，
+     卡片上已有的徽标一枚都不会动。 */
+  function addCapabilityChip(g, card) {
+    return libButton('＋ 添加能力', 'badge badge-btn model-cap-add',
+      '给「' + card.name + '」再加一项处理能力：右侧表单已填好这张卡片的模型名与'
+      + '地址，选一项「处理能力」后点「存入模型库」', () => {
+        const first = card.entries[0] || {};
+        modelEdit[g.key] = '';      // 不带 id = 入库走新增，不动卡片上已有的徽标
+        /* 逐行照抄卡片上第一条：模型名、地址（卡片级的，整张卡片共用），以及
+           将来可能多出来的其它行 —— 唯独"处理能力"必须留空让用户自己选，
+           抄过来的话一保存就是"同名 + 同地址 + 同能力"，后端直接拒收 */
+        (g.configParams || []).forEach(p => {
+          if (p.key === 'capability') { p.value = ''; return; }
+          if (p.secret) return;     // 凭据不照抄：留空 = 沿用这条自己的钥匙
+          const src = (first.configParams || []).find(x => x.key === p.key);
+          if (src) p.value = src.value;
+        });
+        if (!g.noEndpoint) g.endpoint = first.endpoint || '';
+        /* 预填/留空都不算"改动"：清掉「未保存」，免得用户以为已经改过什么
+           （同 clearFormForNew 的做法）。门禁随后由签名判定 —— 地址沿用的是
+           卡片上那个已测通的地址，所以「测试模型」是灰的（没什么可测的），
+           选好能力就能直接「存入模型库」 */
+        ConfigData.markSaved(['model:' + g.key]);
+        Partials.refreshPiece('panel_model');
+      });
+  }
+
   /* 模型卡片 = 左列模型库 + 右列配置表单
      表单缩到右边而不是占满整宽：它只是"填参数、测试、入库"的入口，
      真正要经常看的是左边"有哪些已测通的、当前用哪个"。 */
@@ -687,7 +939,32 @@
     // 模型段必须测通才能入库（后端同样校验）：库里只该有"连得上"的配置
     const needTest = isModel || g.saveGate === 'test';
     const actions = el('div', 'card-actions');
-    let tested = false;         // 本卡片当前表单值是否已测通
+    /* 凭据行的输入框引用（按字段名）：提交前要读框里**当前**的文本 ——
+       "没动过（框里还摆着圆点）"与"被删空（= 主动清空）"只差那一串点，
+       而渲染刻意不往状态里写，所以只能现读框（见 secretFormValue）。
+       声明得早：下面的门禁与「测试模型」的灰/亮都要读它算签名 */
+    const secretInputs = {};
+    const rowByKey = k => (g.configParams || []).find(p => p.key === k) || {};
+    /* ── 门禁：表单里此刻这套值，有没有被测通过（见 testSignature）────────
+       问的不是"这次会话里点过测试没有"，而是"这套值在不在册"：
+       · 建卡片时表单里那套值天然在册 —— 各段表单显示的本来就是已落盘的配置，
+         点徽标/点卡片进来的更是入库时测通过的（后端只收测过的，见
+         model_library_upsert）；
+       · 于是只改与测试无关的东西（模型名、处理能力…）照样能存：不必为改个名字
+         再打一次服务（TEST_IRRELEVANT_KEYS）；
+       · 真动了地址 / Key / 模型ID，签名就不是在册的那套了 → 拦下，测通后新的
+         那套也进册（verifiedSigs）；改回原样又对上了，门禁自己放行。
+       「测试模型」按钮与它共用这把尺子，两个按钮的灰/亮因此永远相反，不会出现
+       "能存却让先测"或"要测却没得测"。 */
+    const curSig = () => testSignature(g,
+      k => (secretInputs[k] ? secretInputs[k].value : null));
+    /* 文档解析的空白表（连地址都没有）不算"在册"：那正是"要新增一张卡片"，
+       必须先测通。否则点完「增加模型」、只填个模型名，门禁就放行了。其它段
+       允许留空地址（降级内置 Mock），"没地址"也是一套可用配置，不在此列 */
+    const pristine = !!g.capabilityBadges && !String(g.endpoint || '').trim();
+    const verifiedSigs = pristine ? [] : [curSig()];
+    const verified = () => verifiedSigs.indexOf(curSig()) >= 0;
+    let refreshTest = () => {};   // 「测试模型」的灰/亮（按钮建出来后才接上实现）
 
     /* 保存只提交本卡片所在的这一个分组 */
     const buildPayload = () => {
@@ -725,7 +1002,21 @@
           err.validation = true;
           throw err;
         }
-        if (!inUse) {
+        // 文档解析：处理能力必填 —— 它是这一段配置的"身份"（一台服务按能力拆
+        // endpoint，库里同名同地址的条目就靠它区分，见 routes._check_doc_parse_card）。
+        // 下拉里那个空占位（selectRow 给空值补的「请选择」）就是它：不校验的话
+        // 空串会被后端归一成缺省能力，用户以为选了另一项、其实存出一条重的
+        const capRow = (g.configParams || []).find(p => p.key === 'capability');
+        if (capRow && !String(capRow.value || '').trim()) {
+          const err = new Error((g.label || g.key) +
+            '：处理能力必选 —— 这张卡片要加的是哪一项能力');
+          err.validation = true;
+          throw err;
+        }
+        // 有的段根本没有「模型ID」这一项（文档解析：一台 PaddleX 服务按能力拆
+        // endpoint，没有"调用哪个模型"可选）。后端按同一判据放行（见
+        // model_library_upsert 的 needs_model_id），条目身份由它生成的 id 承担
+        if (!inUse && !g.noModelId) {
           const err = new Error((g.label || g.key) +
             '：模型ID必填 —— 直接手填，或点上面的「获取模型ID」从返回的列表里选用');
           err.validation = true;
@@ -746,22 +1037,37 @@
         return {
           id: editingId,
           endpoint: ep,
-          modelIds: [inUse],     // 只有框里那个：这条配置就调用它
+          // 只有框里那个：这条配置就调用它。没有模型ID 的段发空数组（后端也不读）
+          modelIds: g.noModelId ? [] : [inUse],
           configParams: params,
-          verified: true,        // 走到这里必然测过：按钮被 needTest 的 gate 挡住
-          activate: !!editingId && editingId === (g.library || {}).activeId,
+          // 走到这里，当前这套值必然在册（否则按钮被 gate 挡住）：要么刚测通，
+          // 要么这次改的没动到测试关心的字段（模型名 / 处理能力…）
+          verified: true,
+          // 文档解析的每张卡片都恒生效（见后端 _entry_view）：没有"切过去"这回事，
+          // 后端也不看这个字段（它按段自己处理 active，见 model_library_upsert）
+          activate: g.capabilityBadges ? true
+            : (!!editingId && editingId === (g.library || {}).activeId),
         };
       }
       return ConfigData.groupPayload(g);
     };
+    /* 表单还没填够（缺模型名 / 地址 / 模型ID / 处理能力）时也别亮「存入模型库」：
+       点了只会弹一条校验错。拿 buildPayload 试一次就够 —— 必填规则只此一份，
+       不在这里再抄一遍清单（它抛的就是下面按钮要提示的那句话） */
+    const payloadOk = () => {
+      try { buildPayload(); return true; }
+      catch (e) { return false; }
+    };
     const save = moduleSaveControls(path, buildPayload,
-      () => !needTest || tested, g.label || g.key,
+      () => !needTest || (verified() && payloadOk()), g.label || g.key,
       isModel ? {
         label: modelEdit[g.key] ? '更新模型库' : '存入模型库',
         buttonTitle: '只把这段模型配置存入模型库，不影响其它服务',
         errTtl: MODEL_ERR_TTL,     // 入库失败：报错 3 秒自动关
-        // 挡住的是哪一步：模型卡片要过了「测试模型」才能真正调用
-        gateHint: '先「测试模型」，有正确回应后才能保存',
+        /* 挡住的是哪一步：要么表单还没填够，要么改动动到了测试真正关心的东西
+           （地址 / Key / 模型ID）—— 前者填全即可，后者得重测 */
+        gateHint: '先把模型名 / API 地址 / 模型ID 填全，再「测试模型」；'
+          + '有正确回应后才能保存',
         /* 改了模型参数（地址 / Key / 模型ID…）又还没重新测通时，那颗灰着的
            「更新模型库」换成可点的「放弃修改」—— 此刻保存做不了，按钮能给的
            唯一动作就是"别存了"。点一下把表单倒回基线（当前生效的那套，或点开的
@@ -782,8 +1088,19 @@
             .find(p => p.key === 'display_name') || {}).value || '';
           return ConfigData.upsertModel(g.key, payload)
             .then(w => {
-              modelEdit[g.key] = '';    // 入库即取消选中（表单成了新的"已保存"）
-              modelSavedToast(w, { name: String(name).trim(), activated: willActivate });
+              /* 文档解析的选中态是**那一枚能力徽标**（不是"某一张卡片"），存完得停在
+                 它上面：表单里就是它、徽标还得是选中态。若照别的段那样清掉选中，
+                 表单会被弹回库里第一条，用户接着再点一次保存就成了新增一条，
+                 被"同名同能力"拒收（见 routes._check_doc_parse_card） */
+              modelEdit[g.key] = g.capabilityBadges
+                ? String(((w.res || {}).active || {}).id || editingId) : '';
+              modelSavedToast(w, {
+                name: g.capabilityBadges
+                  ? String(name).trim() + ' · ' + capabilityLabelOf(g)
+                  : String(name).trim(),
+                activated: willActivate,
+                alwaysActive: !!g.capabilityBadges,
+              });
               return w;
             });
         },
@@ -791,30 +1108,46 @@
         saved: () => {},
       } : null);
 
-    /* 字段被改动 → 上次那次"测通"不再为当前值背书，保存重新变灰。
-       传 key 是为了放行 TEST_IRRELEVANT_KEYS 那几个（改模型名/温度/最大 Token 后
-       不必重测）；不带 key 的调用一律按"影响测试"处理 —— 漏传只是多测一次，
-       方向安全 */
-    const touch = key => {
-      if (needTest && tested
-          && TEST_IRRELEVANT_KEYS.indexOf(key) < 0) tested = false;
+    /* 字段被改动 → 重算两颗按钮：改的是模型名 / 处理能力这种"测试不关心"的，
+       门禁照样放行，「存入模型库」亮起来（改完直接可存）；改到地址 / Key / 模型ID
+       就不在册了，「存入模型库」退回「放弃修改」、「测试模型」重新可点。
+       谁算"测试关心"由 testSignature 说了算（TEST_IRRELEVANT_KEYS），
+       这里不再逐个字段判断 —— 表单是**一套**值，一个签名就够 */
+    const touch = () => {
       ConfigData.markDirty();
       save.refresh();
+      refreshTest();
     };
 
     // 「模型ID」输入框引用（仅模型卡片）：「获取模型ID」的徽标点一下要写回它
     let modelIdInput = null;
-    /* 凭据行的输入框引用（按字段名）：提交前要读框里**当前**的文本 ——
-       "没动过（框里还摆着圆点）"与"被删空（= 主动清空）"只差那一串点，
-       而渲染刻意不往状态里写，所以只能现读框 */
-    const secretInputs = {};
-    const rowByKey = k => (g.configParams || []).find(p => p.key === k) || {};
     if (g.showTestButton) {
       /* 模型卡片上是「测试模型」：后端会拿地址 + Key + 模型ID 真发一次请求，
          有正确回应才算通过（不是只看地址通不通）。其它服务卡片的「测试连接」
          仍是可达性探测，文案与语义都保持不变 */
       const testLabel = isModel ? '测试模型' : '测试连接';
       const t = el('button', 'btn btn-ghost btn-sm', testLabel);
+      /* 灰/亮 = "当前这套值还值不值得测"：在册说明这套地址 / Key / 模型ID 已经验证
+         过（改的只是模型名、处理能力这种测试不关心的东西）—— 那时该做的是
+         「存入模型库」，不必再打一次服务；改了地址它就重新亮起来。服务卡片
+         （needTest 为假）的「测试连接」不设门禁，照旧随时可点 */
+      refreshTest = () => {
+        const done = needTest && verified();     // 这套值已经测通过 → 没什么可测的
+        // 还没填地址（新填的一张卡片）：也没什么可测的，别给个空地址就发请求
+        const blank = isModel && !g.noEndpoint
+          && !String(g.endpoint || '').trim();
+        t.disabled = done;
+        /* 待测时换成主色实心：地址 / Key / 模型ID 一改，"该点这个了"一眼看得见
+           （这一段没有"再测一次"入口，按钮的灰/亮就是"测不测"的唯一信号） */
+        t.classList.toggle('btn-primary', needTest && !done);
+        t.classList.toggle('btn-ghost', !needTest || done);
+        t.title = done
+          ? (blank ? '还没填 API 地址'
+                   : '这套值已经测通过（API 地址 / Key / 模型ID 没变）：'
+                     + '改过其中任一项才需要重测')
+          : '拿这套 API 地址 + Key + 模型ID 真发一次请求，有正确回应才算通过';
+      };
+      refreshTest();
       t.addEventListener('click', async () => {
         t.disabled = true;
         t.textContent = '测试中…';
@@ -834,21 +1167,24 @@
           if (r.online) {
             // 通过：只说"模型可用"，成功提示自动消失
             showToast(r.message || '模型可用', 'success');
-            tested = true;
+            /* 测通 = 当前这套值进册：门禁随之放行（改的若是模型名/处理能力，
+               本来也放行），「测试模型」自己变灰 —— 这套值验证过了 */
+            if (!verified()) verifiedSigs.push(curSig());
           } else {
             // 不通过：给出具体原因（鉴权 / 模型ID不存在 / 路径不对）；
             // 模型卡片上的报错 3 秒自动关，服务卡片的仍常驻
             showToast(r.message || '测试失败', 'error', isModel ? MODEL_ERR_TTL : 0);
-            tested = false;
           }
           save.refresh();
+          refreshTest();
         } catch (e) {
           t.textContent = '✗ 失败';
           showToast('测试失败：' + e.message, 'error', isModel ? MODEL_ERR_TTL : 0);
-          tested = false;
           save.refresh();
+          refreshTest();
         } finally {
-          setTimeout(() => { t.disabled = false; t.textContent = testLabel; }, 3000);
+          // 复原按钮文字：可不可点仍由"这套值在不在册"决定（见 refreshTest）
+          setTimeout(() => { t.textContent = testLabel; refreshTest(); }, 3000);
         }
       });
       actions.appendChild(t);
@@ -872,9 +1208,12 @@
       // 后端也不再下发 endpoint 键。所以这里不画，卡片上就没有那行
       if (endpointDone || g.noEndpoint || g.endpoint === undefined) return;
       endpointDone = true;
+      // 占位提示按段由后端下发（g.endpointPlaceholder）：默认那句的"留空则降级为
+      // 内置 Mock"对文档解析是错的 —— 它没有 Mock 替身，地址必填
       rows.appendChild(kvRow('API 地址', textInput(g.endpoint, v => {
-        g.endpoint = v; touch('base_url');
-      }, { placeholder: 'http://host:port/v1（留空则降级为内置 Mock）' }), true));
+        g.endpoint = v; touch();     // 地址变了 → 门禁立刻认出来（见 testSignature）
+      }, { placeholder: g.endpointPlaceholder ||
+                        'http://host:port/v1（留空则降级为内置 Mock）' }), true));
     };
     /* 「获取模型ID」：这一行不是配置项，而是"拿上面填的 API 地址与 API Key（可空）
        去问服务端有哪些模型"的入口 —— 拉回来的模型以徽标列出，点一个就填进下面的
@@ -883,6 +1222,9 @@
     let pickerDone = false;
     const injectModelPicker = () => {
       if (pickerDone || !isModel) return;
+      // 这一段没有「模型ID」这一行（文档解析，见后端 _MODEL_SECTION_UI_FLAGS）：
+      // 连"问服务端有哪些模型"这件事都不成立，那一行自然也不画
+      if (g.noModelId) return;
       pickerDone = true;
       // 重排模型没有服务端可问：这一步是"列一下上面「模型路径/API」那个目录里有
       // 哪些权重目录"，所以按钮名与提示都按本地目录说（后端 list-models 的 rerank
@@ -930,7 +1272,7 @@
               const mr = rowByKey('model');
               if (mr) mr.value = id;      // 「测试模型」/ 入库读的是这一行
               if (modelIdInput) modelIdInput.value = id;
-              touch('model');             // 换了模型ID → 上次那次测试不再为它背书
+              touch();     // 换了模型ID → 上次那次测试不再为它背书
             });
           showToast(r.message || '已获取模型列表', 'info');
         } catch (e) {
@@ -961,7 +1303,15 @@
           'svc-device-' + g.key,
           [{ v: 'cpu', label: 'CPU' }, { v: 'cuda', label: 'GPU (CUDA)' }],
           String(p.value || 'cpu').toLowerCase() === 'cuda' ? 'cuda' : 'cpu',
-          v => { p.value = v; touch(p.key); }));
+          v => { p.value = v; touch(); }));
+        return;
+      }
+      // 枚举型（后端下发了 options）一律给下拉：合法取值只有几项、且后端按白名单
+      // 归一，手填一个不在列表里的字符串只会静默回落成缺省值 —— 用户看到的就是
+      // "填了但没生效"。选项与取值都由后端给，前端只负责画
+      if (p.type === 'enum' && (p.options || []).length) {
+        rows.appendChild(selectRow(p.label || p.key, p.options, p.value,
+          v => { p.value = v; touch(); }));
         return;
       }
       // bool 型一律给单选，不让人手填 true/false：
@@ -973,7 +1323,7 @@
           'svc-bool-' + g.key + '-' + p.key,
           [{ v: 'true', label: pair[0] }, { v: 'false', label: pair[1] }],
           on ? 'true' : 'false',
-          v => { p.value = v; touch(p.key); }));
+          v => { p.value = v; touch(); }));
         // 字段级说明另起一行
         if (BOOL_FIELD_HINTS[p.key]) {
           rows.appendChild(hintLine(BOOL_FIELD_HINTS[p.key]));
@@ -1014,7 +1364,7 @@
           const t = String(v || '').trim();
           g.modelIds = t ? [t] : [];   // 清空 = 还没填，保存会被必填校验拦下
           p.value = t;
-          touch('model');     // 换了模型ID → 上次那次「测试模型」不再为它背书
+          touch();     // 换了模型ID → 上次那次「测试模型」不再为它背书
         }, {
           // 重排的模型ID 是「模型路径/API」下的目录名（本机权重）或服务认的模型名
           // （远程重排），两种都不拖路径 —— 路径/地址那一半在那一行里填；
@@ -1026,7 +1376,11 @@
         rows.appendChild(kvRow(p.label || p.key, input, true));
         return;
       }
-      if (p.key === 'display_name') opts.placeholder = '如：DeepSeek 线上 / 内网 vLLM';
+      if (p.key === 'display_name') {
+        // 占位提示按段下发（见 _MODEL_SECTION_UI_FLAGS）：默认那句举的是对话服务的例子
+        opts.placeholder = g.displayNamePlaceholder
+          || '如：DeepSeek 线上 / 内网 vLLM';
+      }
       if (p.key === 'model_dir') {
         // 「模型路径/API」两义（后端按 is_http_url 分流）：占位符把两种写法都摆出来
         opts.placeholder =
@@ -1035,7 +1389,9 @@
       // api_key 的框里是真值；其余凭据行摆的是圆点占位，状态里仍是空串 ——
       // "没动过"靠提交时现读框里的文本判定（见 secretFormValue / secretInputs）
       const input = textInput(initial, v => {
-        p.value = v; touch(p.key);
+        /* 改模型名 = 只改卡片上的标识：不在测试签名里，门禁照样放行（见
+           testSignature 与 TEST_IRRELEVANT_KEYS）—— 改完直接可存，不必重测 */
+        p.value = v; touch();
         // 标题上的牌子与输入框是同一份值，必须同帧刷新
         if (p.key === 'display_name') syncNameTag();
       }, opts);

@@ -69,7 +69,54 @@ _MODEL_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
     # 它不是顶层的一个"段"（存储挂在 retrieval 上，见 _sync_rerank_library），
     # 但沿用同一套条目结构与参数表 —— 三个模型库接口才能原样复用
     "rerank": ("model_dir", "device"),
+    # 文档解析（Doc-Parse）：条目级参数只有「处理能力」一项 —— 它就是 PaddleX
+    # 服务上的一个 endpoint 路径（见 DOC_PARSE_CAPABILITIES）。这一段**没有模型ID**：
+    # 一台 PaddleX 服务按能力拆成不同 endpoint，没有"调用哪个模型"这种选择，
+    # 条目身份由后端生成的 id 承担（见 new_entry_id）—— 界面上也就没有那一行。
+    # 同名的几条 = 同一张卡片（同一个模型名）上的几枚能力徽标，见 DocParseConfig
+    "doc_parse": ("capability",),
 }
+
+
+# ═══════════════════════════════════════════════════════════
+# 文档解析（Doc-Parse）：PaddleX 服务的一项「处理能力」
+# ═══════════════════════════════════════════════════════════
+#
+# PaddleX 的 serving 把不同任务拆成不同 endpoint，同一个服务地址换一段路径就是
+# 另一种能力。所以"这一条配置是什么"= 地址 + 能力，没有一个 model 字段可填：
+#   ocr                 → /ocr                  （文字识别）
+#   layout-parsing      → /layout-parsing       （版面识别）
+#   table-recognition   → /table-recognition    （表格识别）
+#   formula-recognition → /formula-recognition  （公式识别）
+# 键刻意就用 endpoint 名（而不是另外发明 ocr/layout/table/formula）：配置里读到
+# 一个键就知道要打哪个地址，不必再回来查这张表。
+DOC_PARSE_CAPABILITIES: dict[str, tuple[str, str]] = {
+    "ocr": ("OCR", "/ocr"),
+    "layout-parsing": ("版面识别", "/layout-parsing"),
+    "table-recognition": ("表格识别", "/table-recognition"),
+    "formula-recognition": ("公式识别", "/formula-recognition"),
+}
+DOC_PARSE_DEFAULT_CAPABILITY = "ocr"
+
+
+def doc_parse_capability(value: Any) -> str:
+    """处理能力 → 白名单内的键（空值 / 非法值一律回落 ocr）
+
+    手改 YAML 写成别的字符串、或旧客户端发来一个不认识的值时，归一到一个**确实
+    存在**的 endpoint 上：静默回落比"配了一个打不出去的路径"更好排查。
+    """
+    key = str(value or "").strip()
+    return key if key in DOC_PARSE_CAPABILITIES else DOC_PARSE_DEFAULT_CAPABILITY
+
+
+def doc_parse_endpoint_path(value: Any) -> str:
+    """处理能力 → 运行期真正要打的 endpoint 路径（如 /ocr）"""
+    return DOC_PARSE_CAPABILITIES[doc_parse_capability(value)][1]
+
+
+def doc_parse_capability_label(value: Any) -> str:
+    """处理能力 → 界面上显示的中文名（如「版面识别」），给卡片徽标用"""
+    return DOC_PARSE_CAPABILITIES[doc_parse_capability(value)][0]
 
 # 存量配置（YAML 里还没有 models 段）自动升级出来的那条的 id。刻意用固定串而非
 # 随机值：界面的「更改」要按 id 找回同一条，随机 id 每加载一次就换一个，用户
@@ -416,6 +463,49 @@ class EmbeddingConfig(BaseModel):
         return self
 
 
+class DocParseConfig(BaseModel):
+    """文档解析（Doc-Parse）：PaddleX 服务配置段
+
+    与另外几段共用同一套模型库存储（一段 models + active_id，见 _sync_model_library），
+    界面上只填三样：模型名、API 地址、处理能力（见 DOC_PARSE_CAPABILITIES）。三处与
+    LLM/Embedding 段不同：
+
+    1. **没有模型ID**：PaddleX 把不同任务拆成不同 endpoint，没有"调用哪个模型"
+       这种选择，条目身份由后端生成的条目 id 承担（见 new_entry_id）—— 界面上的
+       「模型ID」行、「获取模型ID/可用模型」行都不存在（见 routes._MODEL_SECTIONS
+       里本段的字段表与 _MODEL_SECTION_UI_FLAGS）。
+    2. api_key / model 两个字段保留，只为与 MODEL_ENTRY_FIELDS 的镜像口径对齐
+       （_sync_model_library 会把 active 条目的这几个字段无条件写回段顶层）：
+       PaddleX serving 默认不带鉴权，界面上不展示 api_key，model 恒为空。
+    3. **卡片 = 模型名**：同名的多条就是同一张卡片上的几枚「处理能力」徽标（一台
+       PaddleX 服务上的一项能力 = 库里的一条），不是"多套可切换的配置"。所以这一段
+       没有"切 active"这回事，卡片恒为 active（见 routes._entry_view），同名条目的
+       地址必须一致、同名同能力只存一条（见 routes._check_doc_parse_card）。
+
+    「测试模型」测的是服务的 /health（PaddleX serving 的存活探针）—— 测通即可入库。
+    """
+
+    display_name: str = ""
+    base_url: str = ""
+    api_key: str = ""                   # 保留仅为镜像口径；界面上不展示
+    model: str = ""                     # 本段没有模型ID，恒为空
+    capability: str = DOC_PARSE_DEFAULT_CAPABILITY
+    # 模型库与当前生效的那一条（语义同 LLMConfig，见 _sync_model_library）
+    models: list[ModelEntry] = Field(default_factory=list)
+    active_id: str = ""
+
+    @field_validator("capability")
+    @classmethod
+    def _normalize_capability(cls, v: str) -> str:
+        """非法能力值归一（手改 YAML 写成别的 → 回落 ocr，与界面下拉的取值一致）"""
+        return doc_parse_capability(v)
+
+    @model_validator(mode="after")
+    def _sync_library(self):
+        _sync_model_library(self, "doc_parse")
+        return self
+
+
 class VectorStoreConfig(BaseModel):
     adapter: str = "milvus"                 # milvus / qdrant / pgvector
     enabled: bool = True
@@ -699,6 +789,8 @@ class AppConfig(BaseModel):
     # 视觉模型（图片理解）：配置页里与 llm 共用一份表单，存储仍是独立的段
     vlm: VLMConfig = Field(default_factory=VLMConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    # 文档解析（Doc-Parse）：PaddleX 服务（OCR / 版面 / 表格 / 公式），一段一库
+    doc_parse: DocParseConfig = Field(default_factory=DocParseConfig)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     fulltext: FullTextConfig = Field(default_factory=FullTextConfig)
     # 元数据库：段名 meta（历史名 mysql_meta 仍可读，见 LEGACY_SECTION_ALIASES）
