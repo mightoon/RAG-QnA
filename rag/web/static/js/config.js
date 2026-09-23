@@ -9,6 +9,10 @@
   let currentTab = 'model';
 
   function switchTab(tab) {
+    /* 切走模型页时先收起那颗编辑弹窗：它挂在 document.body 上（不随面板刷新消失），
+       留着会盖在刚切过去的这一页上 —— 弹窗里编的是模型页的东西，看不见它就读不懂 */
+    if (currentTab === 'model' && tab !== 'model'
+        && window.ConfigUI && ConfigUI.closeEditor) ConfigUI.closeEditor();
     currentTab = tab;
     qsa('#config-tabs .tab').forEach(t => {
       const on = t.dataset.ctab === tab;

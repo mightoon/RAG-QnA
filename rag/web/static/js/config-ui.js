@@ -493,16 +493,6 @@
     g.modelIds = (entry.modelIds || []).slice(0, 1);
   }
 
-  /* 表单回到"当前生效的配置"（取消选中时用） */
-  function restoreFormFromActive(g) {
-    const entries = (g.library || {}).entries || [];
-    const act = entries.find(e => e.active) || entries[0];
-    if (!act) return;
-    if (!g.noEndpoint) g.endpoint = act.endpoint;
-    g.modelIds = (act.modelIds || []).slice(0, 1);
-    g.configParams = JSON.parse(JSON.stringify(act.configParams || []));
-  }
-
   /* 「增加模型」：把右侧表单清成一张空白表 —— 行都留着（标签/类型/是否凭据沿用
      原有那套），只是值全空，于是接下来填的是一套**新**配置，入库走"新增"而不是
      覆盖某一条（有无 id 决定新增还是更新，见 buildPayload）。
@@ -544,57 +534,73 @@
     Partials.refreshPiece('panel_model');    // 左列表 + 右表单都要重绘
   }
 
-  /* 左列标题带上槽位名：三块模型库上下叠着，都只写「模型库」就分不清谁是谁
+  /* 段标题带上槽位名：五段模型库上下排着，都只写「模型库」就分不清谁是谁
      （槽位名就是后端那套段名的 key；重排段虽挂在 retrieval 上，但接口层用
      routes._RerankStore 伪装成了同样的"段"，这里是同一个标题口径） */
   const LIB_TAGS = { llm: 'LLM', vlm: 'VLM', embedding: 'Embedding',
-                    rerank: 'Rerank', doc_parse: 'Doc Parse' };
+                   rerank: 'Rerank', doc_parse: 'Doc Parse' };
   const libTitle = key => (LIB_TAGS[key] ? '模型库 · ' + LIB_TAGS[key] : '模型库');
+  /* 段的**显示**顺序（自上而下）。后端给的顺序是 llm / vlm / embedding /
+     doc_parse，重排段挂在 retrieval 上、由载荷循环末尾单独追加（见 routes.
+     _normalize_config），所以排在最后。界面上要求重排紧跟在向量模型之后、
+     文档解析垫底，就在这一层排序 —— 不动后端发送顺序，也不动下拉里别的
+     消费者（保存、校验都还按后端那套走）。表里没有的段排在已知段之后。 */
+  const MODEL_SECTION_ORDER = ['llm', 'vlm', 'embedding', 'rerank', 'doc_parse'];
+  const sectionRank = key => {
+    const i = MODEL_SECTION_ORDER.indexOf(key);
+    return i < 0 ? MODEL_SECTION_ORDER.length : i;
+  };
+  const orderModelGroups = groups => (groups || []).slice()
+    .sort((a, b) => sectionRank(a.key) - sectionRank(b.key));
 
-  /* ── 右列表单的"共用"：LLM 与 VLM 两块模型库只留一份填空框 ──
+  /* ── 编辑表单的"共用"：LLM 与 VLM 两段只留一份填空框 ──
      这两段本来就是同一种东西（OpenAI 兼容的对话服务：地址 + Key + 模型ID + 一组
-     运行参数），差别只在业务上谁去吃图。若各出一张卡片、各带一份一模一样的表单，
-     用户分不清该填哪一个、写进哪一段。所以 VLM 只作为左列的第二个库挂在 LLM 卡片
-     里（见 modelCard），右边只有一份表单：**点哪一块的卡片，表单就是编哪一段**，
-     段名跟着切（modelEdit、markSaved 的键、入库的 section 全是它）。
-     不是"两份表单轮流显隐"——那样填到一半的值会在切换时凭空消失。
+     运行参数），差别只在业务上谁去吃图。若各弹一份一模一样的表单，用户分不清该填
+     哪一个、写进哪一段。所以弹窗里的表单只有一份：**点哪一段的卡片/「添加模型」，
+     表单就是编哪一段**，段名跟着切（modelEdit、markSaved 的键、入库的 section
+     全是它）。不是"两份表单轮流显隐"——那样填到一半的值会在切换时凭空消失。
      表单标题对这两段统一写「大模型」（后端段标签仍是「LLM 大模型」「VLM 视觉
      模型」，只用在报错与灰牌上），另挂一枚段名徽标说明此刻在编哪一段。 */
   const SHARED_FORM_LIBS = ['llm', 'vlm'];
-  const SHARED_FORM_OWNER = 'llm';        // 卡片挂在谁身上（VLM 不自出一张卡）
+  const SHARED_FORM_OWNER = 'llm';
   const SHARED_FORM_TITLE = '大模型';
   let sharedFormKey = SHARED_FORM_OWNER;  // 此刻表单在编哪一段
   const isSharedLib = key => SHARED_FORM_LIBS.indexOf(key) >= 0;
 
-  /* 挂在同一张卡片上的库：owner → [自己, VLM]，其余段 → [自己] */
+  /* 共用表单的两段：一段 → [自己, 另一段]，其余段 → [自己] */
   function libsOfCard(g) {
-    if (g.key !== SHARED_FORM_OWNER) return [g];
+    if (!isSharedLib(g.key)) return [g];
     return [g].concat((ConfigData.groupsFor('model') || []).filter(
       x => x !== g && isSharedLib(x.key)));
   }
 
-  /* 此刻表单该编的那一段（点过 VLM 卡片就是 VLM，否则是卡片本来那一段） */
+  /* 此刻表单该编的那一段（点过 VLM 那段就是 VLM，否则是本段自己） */
   function sharedFormGroup(g) {
     return libsOfCard(g).find(x => x.key === sharedFormKey) || g;
   }
 
-  /* 库的标题行（两种卡片口径共用）：库名 + 「N 个已测通」 + 最右边的「增加模型」 */
-  function libHead(g, countText) {
-    const head = el('div', 'model-lib-head');
-    head.appendChild(el('span', 'model-lib-title', libTitle(g.key)));
-    head.appendChild(el('span', 'badge badge-default', countText));
-    /* 「增加模型」贴在这一行的最右边：点一下 = 右侧表单清空 + 退出选中态，
-       于是接下来填的是一套新配置（入库走新增）；不点它也能直接改现有条目。
-       没有条目时它也照旧摆着 —— 总得有个"从空白开始填"的入口 */
-    const add = libButton('增加模型', 'btn btn-ghost btn-sm',
-      '清空右侧表单，用来配一个新模型（测通后点「存入模型库」）', () => {
+  /* 段头（两种卡片口径共用）：段名 + 计数 + 最右边的「添加模型」 */
+  function libHead(g) {
+    const entries = ((g.library || {}).entries) || [];
+    const head = el('div', 'model-sec-head');
+    head.appendChild(el('span', 'model-sec-title', libTitle(g.key)));
+    /* 计数说清"几张卡片、几项能力"：这一段库里的一条 = 一项能力、不是一张卡片，
+       照别的段写「N 个已测通」会被读成"N 张卡片" */
+    head.appendChild(el('span', 'badge badge-default', g.capabilityBadges
+      ? dpCards(entries).length + ' 张卡片 · ' + entries.length + ' 项能力'
+      : entries.length + ' 个已测通'));
+    /* 「添加模型」贴在这一行的最右边：点一下 = 弹出空白编辑框，接下来填的是一套
+       新配置（入库走新增）；不点它也能直接点卡片改现有条目。没有条目时它也照旧
+       摆着 —— 总得有个"从空白开始填"的入口 */
+    const add = libButton('添加模型', 'btn btn-ghost btn-sm',
+      '弹出空白编辑框，用来配一个新模型（测通后点「存入模型库」）', () => {
         // 共用一份表单时（LLM / VLM）：先把表单切到本段，再清空 —— 否则清的是
         // 另一段的值，看着像"点了没反应"
         if (isSharedLib(g.key)) sharedFormKey = g.key;
         modelEdit[g.key] = '';
         clearFormForNew(g);
         ConfigData.markSaved(['model:' + g.key]);   // 清空不是改动
-        Partials.refreshPiece('panel_model');
+        openEditor(g);
       });
     add.style.marginLeft = 'auto';   // 靠这一行最右
     head.appendChild(add);
@@ -604,131 +610,131 @@
   /* 库空着时的提示（两种卡片口径共用） */
   function libEmpty(g) {
     const empty = el('div', 'model-lib-empty');
-    empty.appendChild(el('div', null, '还没有已测通的模型'));
+    empty.appendChild(el('div', null, '还没有已测通的模型：点右上角「添加模型」'));
     /* 这一段没有模型ID（见后端 _MODEL_SECTION_UI_FLAGS）：指向「获取模型ID」的
        指引就成了死路，改说该填的三样 —— 测试探的是服务的 /health */
     empty.appendChild(el('div', 'form-hint',
       g.noModelId
-        ? '在右侧填好「模型名」「API 地址」并选好「处理能力」'
+        ? '在弹窗里填好「模型名」「API 地址」并选好「处理能力」'
           + ' → 点「测试模型」（测服务的 /health）→ 通过后点「存入模型库」'
-        : '在右侧填好参数（模型ID 可点「获取模型ID」从服务端列表里选）'
+        : '在弹窗里填好参数（模型ID 可点「获取模型ID」从服务端列表里选）'
           + ' → 点「测试模型」→ 通过回应后点「存入模型库」'));
     return empty;
   }
 
+  /* 段里的卡片网格（两种卡片口径共用外框）：从左到右铺，库空着就给一句提示 */
   function renderLibrary(g) {
     // 文档解析另有一套卡片口径（一张卡片 = 一个模型名，卡片上挂能力徽标）
-    if (g.capabilityBadges) return renderCapabilityLibrary(g);
-    const lib = g.library || { activeId: '', entries: [] };
-    const entries = lib.entries || [];
-    const box = el('div', 'model-lib');
-    box.appendChild(libHead(g, entries.length + ' 个已测通'));
+    if (g.capabilityBadges) return renderCapabilityGrid(g);
+    const entries = ((g.library || {}).entries) || [];
+    if (!entries.length) return libEmpty(g);
+    const box = el('div', 'model-grid');
+    entries.forEach(e => box.appendChild(modelCardNode(g, e)));
+    return box;
+  }
 
-    if (!entries.length) {
-      box.appendChild(libEmpty(g));
-      return box;
-    }
+  /* 库里的一条 = 一张方卡片（长宽 6:4）。卡面上三行：模型名（+ active 标记位）、
+     模型ID、地址；左下角空着，右下角是「删除」。
+     点卡片 = 弹出这张卡片的编辑框（见 openEditor），原来的"回填到右侧表单"就是
+     这里的事 —— 只是右侧没了，表单搬进了弹窗。 */
+  function modelCardNode(g, e) {
+    const selected = modelEdit[g.key] === e.id;
+    const card = el('div', 'model-card' + (selected ? ' selected' : ''));
 
-    entries.forEach(e => {
-      const selected = modelEdit[g.key] === e.id;
-      const item = el('div', 'model-lib-item'
-        + (e.active ? ' active' : '') + (selected ? ' selected' : ''));
-      const line = el('div', 'model-lib-line');
-      line.appendChild(el('span', 'model-lib-name', e.displayName));
+    const top = el('div', 'model-card-top');
+    top.appendChild(el('span', 'model-card-name', e.displayName));
 
-      /* 标记位：active 是绿牌，不是 active 时这里就是「设为 active」。点完列表
-         重绘，同一个位置变成绿牌 —— 标记与按钮共用一个槽，卡片不会跳。
-         地址与 key 不进列表：它们占行宽又不常看，点卡片即可回填到右侧核对 */
-      const acts = el('div', 'model-lib-acts');
-      if (e.active && g.notEnabled) {
-        /* 重排模型特有：这一条确实是 active，但「检索策略」里的「启用重排」没勾上，
-           它压根不参与召回 —— 绿牌 active 在这里就成了谎话，换成灰牌说明原因
-           （文案由后端给，见 _normalize_config 的 notEnabled） */
-        const b = el('span', 'badge badge-default', '未启用');
-        b.title = g.notEnabled;
-        acts.appendChild(b);
-      } else if (e.active) {
-        acts.appendChild(el('span', 'badge badge-success', 'active'));
-      } else {
-        // 设为 active：只改"业务用哪一套"，条目本身不动
-        acts.appendChild(libButton('设为 active', 'badge badge-btn',
-          '让问答等业务改用它（立即热应用）',
-          ev => libAction(ev.currentTarget, async () => {
-            const w = await ConfigData.activateModel(g.key, e.id);
-            if (w.res && w.res.noop) {
-              showToast('「' + e.displayName + '」已经是当前生效的模型', 'info');
-              Partials.refreshPiece('panel_model');
-              return;
-            }
-            modelSavedToast(w, { name: e.displayName, activated: true });
-          })));
-      }
-
-      const del = libButton('删除', 'btn btn-ghost btn-sm model-lib-del',
-        e.active ? '当前生效的模型不能删除：请先把别的设为 active'
-                 : '从模型库移除这一条（不影响正在生效的模型）',
-        ev => {
-          if (e.active) {
-            showToast('「' + e.displayName + '」是当前生效的模型，不能删除；'
-              + '请先把别的模型设为 active', 'warning', MODEL_ERR_TTL);
+    /* 标记位：active 是绿牌，不是 active 时这里就是「设为 active」。点完重绘，
+       同一个位置变成绿牌 —— 标记与按钮共用一个槽，卡片不会跳 */
+    const acts = el('div', 'model-lib-acts');
+    if (e.active && g.notEnabled) {
+      /* 重排模型特有：这一条确实是 active，但「检索策略」里的「启用重排」没勾上，
+         它压根不参与召回 —— 绿牌 active 在这里就成了谎话，换成灰牌说明原因
+         （文案由后端给，见 _normalize_config 的 notEnabled） */
+      const b = el('span', 'badge badge-default', '未启用');
+      b.title = g.notEnabled;
+      acts.appendChild(b);
+    } else if (e.active) {
+      acts.appendChild(el('span', 'badge badge-success', 'active'));
+    } else {
+      // 设为 active：只改"业务用哪一套"，条目本身不动
+      acts.appendChild(libButton('设为 active', 'badge badge-btn',
+        '让问答等业务改用它（立即热应用）',
+        ev => libAction(ev.currentTarget, async () => {
+          const w = await ConfigData.activateModel(g.key, e.id);
+          if (w.res && w.res.noop) {
+            showToast('「' + e.displayName + '」已经是当前生效的模型', 'info');
+            Partials.refreshPiece('panel_model');
             return;
           }
-          if (!window.confirm('从模型库删除「' + e.displayName + '」？\n\n'
-            + '只删掉这一条配置，不影响正在生效的模型。')) return;
-          libAction(ev.currentTarget, async () => {
-            if (modelEdit[g.key] === e.id) modelEdit[g.key] = '';
-            const w = await ConfigData.deleteModel(g.key, e.id);
-            modelSavedToast(w, { name: e.displayName, deleted: true });
-          });
-        });
-      acts.appendChild(del);
-      line.appendChild(acts);
-      item.appendChild(line);
+          modelSavedToast(w, { name: e.displayName, activated: true });
+        })));
+    }
+    top.appendChild(acts);
+    card.appendChild(top);
 
-      /* 点卡片 = 把这一条回填到右侧表单（原先卡片上那个「更改」按钮干的事）：
-         要改哪一项就在右边改，改完照旧「测试模型」→「更新模型库」。
-         选中态只在卡片上描一圈蓝框（见 .model-lib-item.selected），卡上不写
-         "编辑中"、右侧也不摆横幅与「取消编辑」—— 退出选中就再点一下这张卡片，
-         表单回到当前生效的那套。
-         回填后立刻把本模块的基线对齐到这条配置：只是"选中看一眼"不算改动，
-         「未保存」不该因为点了一下卡片就亮起来（真改了字段才由 touch() 点亮） */
-      item.classList.add('clickable');
-      item.title = selected
-        ? '已选中（右侧表单就是它）；再点一下取消选中'
-        : '点一下：把这条配置回填到右侧表单'
-          + '（改完测试通过后点「更新模型库」）';
-      item.addEventListener('click', ev => {
-        if (ev.target.closest('button')) return;   // 卡上的按钮各管各的
-        // 共用一份表单时（LLM / VLM）：表单切到本段。点 VLM 的卡片就是在编 VLM，
-        // 点 LLM 的就是编 LLM —— 段名（modelEdit 的键、入库的 section）始终是 g.key
-        if (isSharedLib(g.key)) sharedFormKey = g.key;
-        if (selected) {
-          modelEdit[g.key] = '';
-          restoreFormFromActive(g);
-        } else {
-          modelEdit[g.key] = e.id;
-          backfillFromEntry(g, e);
+    /* 卡面上只摆一个模型ID：就是这条配置调用的那个（表单里「模型ID」框里的值，
+       后端条目里的 model_ids[0]）。它和模型名一起，是区分两条配置的全部信息 */
+    const inUse = (e.modelIds && e.modelIds[0]) || entryRowValue(e, 'model');
+    if (inUse) {
+      const chips = el('div', 'model-lib-chips');
+      const c = el('span', 'model-chip static active');
+      // 是不是业务在用的还取决于这条是否 active
+      c.title = inUse + (e.active ? '（业务正在用它）' : '（这条配置调用它）');
+      c.appendChild(el('span', 'model-chip-name', inUse));
+      chips.appendChild(c);
+      card.appendChild(chips);
+    }
+    /* 地址一行：卡片上给"哪台服务"一个印象（重排段没有独立地址，退到模型路径） */
+    const addr = e.endpoint || entryRowValue(e, 'model_dir') || '';
+    if (addr) {
+      const a = el('div', 'model-card-addr', addr);
+      a.title = addr;
+      card.appendChild(a);
+    }
+
+    /* 底行靠右：删除就在卡片右下方（active 那条不能删：业务正在用它） */
+    const foot = el('div', 'model-card-foot');
+    foot.appendChild(libButton('删除', 'btn btn-ghost btn-sm model-lib-del',
+      e.active ? '当前生效的模型不能删除：请先把别的设为 active'
+               : '从模型库移除这一条（不影响正在生效的模型）',
+      ev => {
+        if (e.active) {
+          showToast('「' + e.displayName + '」是当前生效的模型，不能删除；'
+            + '请先把别的模型设为 active', 'warning', MODEL_ERR_TTL);
+          return;
         }
-        ConfigData.markSaved(['model:' + g.key]);
-        Partials.refreshPiece('panel_model');
-      });
+        if (!window.confirm('从模型库删除「' + e.displayName + '」？\n\n'
+          + '只删掉这一条配置，不影响正在生效的模型。')) return;
+        libAction(ev.currentTarget, async () => {
+          /* 正在弹窗里编的就是这条：它没了，弹窗也就没有对象了 —— 收起，
+             别让用户对着一个已删除条目的表单继续点「更新模型库」 */
+          if (modelEdit[g.key] === e.id) {
+            modelEdit[g.key] = '';
+            closeEditor();
+          }
+          const w = await ConfigData.deleteModel(g.key, e.id);
+          modelSavedToast(w, { name: e.displayName, deleted: true });
+        });
+      }));
+    card.appendChild(foot);
 
-      /* 卡片上只摆一个模型ID：就是这条配置调用的那个（表单里「模型ID」框里的值，
-         后端条目里的 model_ids[0]）。它和模型名一起，是区分两条配置的全部信息 ——
-         地址、key 都得点卡片回填才看得到，卡片才排得下多条 */
-      const inUse = (e.modelIds && e.modelIds[0]) || entryRowValue(e, 'model');
-      if (inUse) {
-        const chips = el('div', 'model-lib-chips');
-        const c = el('span', 'model-chip static active');
-        // 是不是业务在用的还取决于这条是否 active
-        c.title = inUse + (e.active ? '（业务正在用它）' : '（这条配置调用它）');
-        c.appendChild(el('span', 'model-chip-name', inUse));
-        chips.appendChild(c);
-        item.appendChild(chips);
-      }
-      box.appendChild(item);
+    /* 点卡片 = 弹出这条的编辑框：要改哪一项就在弹窗里改，改完照旧
+       「测试模型」→「更新模型库」。
+       回填后立刻把本模块的基线对齐到这条配置：只是"选中看一眼"不算改动，
+       「未保存」不该因为点了一下卡片就亮起来（真改了字段才由 touch() 点亮） */
+    card.title = selected ? '正在编辑这一条：' + e.displayName
+                          : '点击编辑模型信息：' + e.displayName;
+    card.addEventListener('click', ev => {
+      if (ev.target.closest('button')) return;   // 卡上的按钮各管各的
+      // 共用一份表单时（LLM / VLM）：表单切到本段。点 VLM 的卡片就是在编 VLM，
+      // 点 LLM 的就是编 LLM —— 段名（modelEdit 的键、入库的 section）始终是 g.key
+      modelEdit[g.key] = e.id;
+      backfillFromEntry(g, e);
+      ConfigData.markSaved(['model:' + g.key]);
+      openEditor(g);
     });
-    return box;
+    return card;
   }
 
   /* ── 文档解析（Doc-Parse）的卡片：一张卡片 = 一个模型名 ──────────────
@@ -737,7 +743,7 @@
      见后端 routes._check_doc_parse_card）。所以：
        - 卡片按模型名归并，标题就是模型名，恒为 active（后端同样恒报 active：
          这一段没有"切到哪一条生效"，每张卡片上的能力都在用，见 _entry_view）；
-       - **点徽标** = 编辑那一项能力（模型名 / 地址 / 能力回填到右侧表单）；
+       - **点徽标** = 弹出编辑框编那一项能力（模型名 / 地址 / 能力）；
          点卡片本身不进编辑 —— 一张卡片上挂着好几条，点卡片说不清要编哪一条；
        - 徽标尾部的 × = 删掉那一项能力；删掉最后一项，整张卡片自然就没了
          （卡片就是这些条目本身，库里一条不剩，卡片也就不画了）；
@@ -745,52 +751,58 @@
          地址），见 addCapabilityChip —— 加第二项能力必须从这里进，否则会改到
          已有那条身上（"第一枚徽标不见了"就是这么来的）。
      三段注释里的"徽标"指的就是 .model-cap-chip（样式见 main.css）。 */
-  function renderCapabilityLibrary(g) {
-    const lib = g.library || { activeId: '', entries: [] };
-    const entries = lib.entries || [];
-    // 按模型名归并成卡片，保持条目在库里的先后（新加的能力排在卡片末尾）
+
+  /* 按模型名把库里的条目归并成卡片，保持条目在库里的先后（新加的能力排在末尾） */
+  function dpCards(entries) {
     const cards = [];
-    entries.forEach(e => {
+    (entries || []).forEach(e => {
       const name = e.displayName || e.endpoint || '';
       let card = cards.find(c => c.name === name);
       if (!card) { card = { name, entries: [] }; cards.push(card); }
       card.entries.push(e);
     });
+    return cards;
+  }
 
-    const box = el('div', 'model-lib');
-    /* 计数说清"几张卡片、几项能力"：这一段库里的一条 = 一项能力，不是一张卡片，
-       照别的段写「N 个已测通」会被读成"N 张卡片" */
-    box.appendChild(libHead(g, cards.length + ' 张卡片 · ' + entries.length + ' 项能力'));
+  function renderCapabilityGrid(g) {
+    const entries = ((g.library || {}).entries) || [];
+    if (!entries.length) return libEmpty(g);
+    const box = el('div', 'model-grid');
+    dpCards(entries).forEach(card => box.appendChild(dpCardNode(g, card)));
+    return box;
+  }
 
-    if (!entries.length) {
-      box.appendChild(libEmpty(g));
-      return box;
+  /* 文档解析的一张方卡片 = 一个模型名（同名同地址的若干能力挂在同一张上）。
+     卡片底行那排能力徽标就是"这条配置有哪些能力"，每枚尾巴上的 × 删掉那一项 ——
+     没有整卡片的删除按钮：删除按能力粒度走，删到一项不剩卡片自己就消失 */
+  function dpCardNode(g, card) {
+    const item = el('div', 'model-card dp');
+    const top = el('div', 'model-card-top');
+    top.appendChild(el('span', 'model-card-name', card.name));
+    const acts = el('div', 'model-lib-acts');
+    // 这一段没有「设为 active」：每一张卡片上的能力都在用（见上方注释）
+    acts.appendChild(el('span', 'badge badge-success', 'active'));
+    top.appendChild(acts);
+    item.appendChild(top);
+
+    const addr = card.entries[0].endpoint || '';
+    if (addr) {
+      const a = el('div', 'model-card-addr', addr);
+      a.title = addr;
+      item.appendChild(a);
     }
 
-    cards.forEach(card => {
-      const item = el('div', 'model-lib-item active');
-      const line = el('div', 'model-lib-line');
-      line.appendChild(el('span', 'model-lib-name', card.name));
-      /* 这张卡片的地址不进卡面（和别的段一致：点徽标即可回填到右侧核对），
-         但摆一行 title 让人悬停就能看见 —— 卡片是按名字认的，地址才是"哪台服务" */
-      item.title = card.name + '：' + (card.entries[0].endpoint || '');
-      const acts = el('div', 'model-lib-acts');
-      // 这一段没有「设为 active」，也没有「删除整张卡片」的按钮：删除按能力粒度
-      // 走徽标尾部的 ×（见下），删到一项不剩卡片自己就消失了
-      acts.appendChild(el('span', 'badge badge-success', 'active'));
-      line.appendChild(acts);
-      item.appendChild(line);
-
-      const chips = el('div', 'model-lib-chips');
-      card.entries.forEach(e => {
-        chips.appendChild(capabilityChip(g, card, e, card.entries.length === 1));
-      });
-      // 末尾那枚「＋」：给这**一张卡片**再加一条（见 addCapabilityChip）
-      chips.appendChild(addCapabilityChip(g, card));
-      item.appendChild(chips);
-      box.appendChild(item);
+    const chips = el('div', 'model-lib-chips');
+    card.entries.forEach(e => {
+      chips.appendChild(capabilityChip(g, card, e, card.entries.length === 1));
     });
-    return box;
+    // 末尾那枚「＋」：给这**一张卡片**再加一条（见 addCapabilityChip）
+    chips.appendChild(addCapabilityChip(g, card));
+    item.appendChild(chips);
+
+    // 点卡片不进编辑（说不清要编哪一条），只给一句说明；编辑走徽标
+    item.title = card.name + '：' + (addr || '') + '\n点徽标即可编辑那一项能力';
+    return item;
   }
 
   /* 卡片上的一枚能力徽标：点它编辑这条配置，尾部的 × 删掉这项能力 */
@@ -800,7 +812,7 @@
       + (selected ? ' selected' : ''));
     chip.title = '点击编辑模型信息：' + card.name + ' · ' + e.badge
       + '（地址 ' + (e.endpoint || '空') + '）'
-      + (selected ? ' —— 右侧表单里正编辑的就是这一项' : '');
+      + (selected ? ' —— 弹窗里正编辑的就是这一项' : '');
     chip.appendChild(el('span', 'model-chip-name', e.badge));
     /* × 删的是"这一项能力"（库里的一条）。删最后一项 = 整张卡片消失，文案得把
        后果说清 —— 用户点的是徽标尾巴上的小叉，别让他以为只是收起一项 */
@@ -814,16 +826,14 @@
                      : '只删掉这一项能力，同一张卡片上的其它能力不受影响。')
           + '\n地址：' + (e.endpoint || '（空）'))) return;
         libAction(ev.currentTarget, async () => {
-          const w = await ConfigData.deleteModel(g.key, e.id);
-          /* 正在编辑的就是被删的这条 → 表单清成空白表，准备配下一项；编辑的是
-             别的徽标就原样留着（这一段后端不回 active，正是为了让前端自己定，
-             见 model_library_delete）。
-             清空前后的基线对齐同「增加模型」：清掉一条不该亮「未保存」 */
+          /* 正在弹窗里编的就是被删的这条 → 收起弹窗（对象没了）；编的是别的徽标
+             就原样留着（这一段后端不回 active，正是为了让前端自己定，
+             见 model_library_delete） */
           if (modelEdit[g.key] === e.id) {
             modelEdit[g.key] = '';
-            clearFormForNew(g);
-            ConfigData.markSaved(['model:' + g.key]);
+            closeEditor();
           }
+          const w = await ConfigData.deleteModel(g.key, e.id);
           modelSavedToast(w, { name: card.name + ' · ' + e.badge, deleted: true });
         });
       }));
@@ -831,7 +841,7 @@
       modelEdit[g.key] = e.id;
       backfillFromEntry(g, e);
       ConfigData.markSaved(['model:' + g.key]);   // 只是选中看一眼，不算改动
-      Partials.refreshPiece('panel_model');
+      openEditor(g);
     });
     return chip;
   }
@@ -852,7 +862,7 @@
      卡片上已有的徽标一枚都不会动。 */
   function addCapabilityChip(g, card) {
     return libButton('＋ 添加能力', 'badge badge-btn model-cap-add',
-      '给「' + card.name + '」再加一项处理能力：右侧表单已填好这张卡片的模型名与'
+      '给「' + card.name + '」再加一项处理能力：弹出的编辑框已填好这张卡片的模型名与'
       + '地址，选一项「处理能力」后点「存入模型库」', () => {
         const first = card.entries[0] || {};
         modelEdit[g.key] = '';      // 不带 id = 入库走新增，不动卡片上已有的徽标
@@ -871,28 +881,103 @@
            卡片上那个已测通的地址，所以「测试模型」是灰的（没什么可测的），
            选好能力就能直接「存入模型库」 */
         ConfigData.markSaved(['model:' + g.key]);
-        Partials.refreshPiece('panel_model');
+        openEditor(g);
       });
   }
 
-  /* 模型卡片 = 左列模型库 + 右列配置表单
-     表单缩到右边而不是占满整宽：它只是"填参数、测试、入库"的入口，
-     真正要经常看的是左边"有哪些已测通的、当前用哪个"。 */
-  function modelCard(g) {
-    const body = el('div', 'model-card-body');
-    const libs = libsOfCard(g);
-    /* 一块库就照旧直接摆进左列；两块（LLM + VLM）要先套一层列容器 ——
-       它们是同一列里上下叠着的两块 .model-lib，不是网格里的两个格子 */
-    const box = libs.length > 1 ? el('div', 'model-lib-col') : body;
-    libs.forEach(x => box.appendChild(renderLibrary(x)));
-    if (box !== body) body.appendChild(box);
+  /* ── 一段模型库 = 一个贯穿全行的区域 ──────────────────────────────
+     模型 tab 从上到下五段（LLM / VLM / Embedding / Rerank / Doc Parse），每段
+     一行标题 + 一片卡片网格，卡片从左到右铺开、装不下就换行。
+     页面上**不再摆编辑表单**：点卡片（文档解析段点能力徽标）、或点段头的
+     「添加模型」，编辑表单才以弹窗形式出现（见 openEditor）。 */
+  function modelSection(g) {
+    const sec = el('section', 'model-sec');
+    sec.appendChild(libHead(g));
+    sec.appendChild(renderLibrary(g));
+    return sec;
+  }
 
-    const right = el('div', 'model-form-col');
-    // 表单跟着"最后点的那块库"走；只有一块库的卡片就是它自己
-    const fg = libs.length > 1 ? sharedFormGroup(g) : g;
-    right.appendChild(groupCard(fg, libs.length > 1 ? SHARED_FORM_TITLE : ''));
-    body.appendChild(right);
-    return body;
+  /* ── 编辑弹窗 ──────────────────────────────────────────────────────
+     表单本体没变（还是 groupCard 那一份），只是搬进了弹窗：页面上不再有
+     "左侧库 + 右侧表单"的对开布局，看库就是看库，改哪一条就把哪一条弹出来。
+
+     弹窗不挂在面板里 —— 面板每 part.refreshPiece('panel_model') 一次就整块重建，
+     挂在里面会被随手抹掉。它挂在 document.body 上，开关状态是这个模块的状态
+     （editorOpen），每次重绘末尾由 syncEditorModal 同步：该开的补齐、该关的拆掉。 */
+  let editorOpen = '';      // 弹窗开着时 = 正在编的那一段的 key（'' = 关着）
+  let editorModal = null;   // 当前弹窗句柄（Partials.modal 的返回值）
+  let editorSeq = 0;        // 重建计数：旧句柄靠它认出"自己已经过期"
+
+  /* 拆掉当前弹窗但**不动** editorOpen（重绘前的清理）：
+     editorSeq 先自增，旧句柄随后的 onClose 就会认不出自己、不再改状态 */
+  function closeEditorModal() {
+    const m = editorModal;
+    editorModal = null;
+    editorSeq += 1;
+    if (m) m.close();
+  }
+
+  /* 关掉编辑弹窗（切走 tab 时由 config.js 调；面板自己那条路走 onClose）。
+     顺手把选中态退掉：卡片上那圈蓝框说的是"弹窗里正在编的就是它"，
+     弹窗都关了就不该再指着哪一张。
+     这里**不重绘面板**：面板这次重绘由调用方负责（config.js 随后会重绘切过去的
+     那一块），而切回来时 switchTab 本来就会重绘模型面板 */
+  function closeEditor() {
+    const key = editorOpen;
+    if (!key && !editorModal) return;
+    editorOpen = '';
+    closeEditorModal();
+    if (key) modelEdit[key] = '';
+  }
+
+  /* 打开编辑弹窗：记下"正在编哪一段"，重绘面板 —— 卡片的选中态与弹窗都由这次
+     重绘同步（见 syncEditorModal）。共用一份表单的两段（LLM / VLM）先把表单切到
+    本段：点 VLM 的卡片就是在编 VLM，点 LLM 的就是编 LLM */
+  function openEditor(g) {
+    if (isSharedLib(g.key)) sharedFormKey = g.key;
+    editorOpen = g.key;
+    Partials.refreshPiece('panel_model');
+  }
+
+  /* 面板每次重绘的末尾调它：按 editorOpen 把弹窗补齐。
+     一律先拆后建 —— 只有重建才能拿到最新的库（刚存进去的那条、刚删掉的那条）
+     和最新的表单基线 */
+  function syncEditorModal(groups) {
+    closeEditorModal();
+    if (!editorOpen) return;
+    const g = (groups || []).find(x => x.key === editorOpen);
+    if (!g) { editorOpen = ''; return; }   // 这一段没了（权限/配置变了）
+    openEditorModal(g);
+  }
+
+  function openEditorModal(g) {
+    // 共用一份表单的两段（LLM / VLM）：表单跟着"最后点的那段"走
+    const fg = isSharedLib(g.key) ? sharedFormGroup(g) : g;
+    const entryId = modelEdit[g.key] || '';
+    const entry = (((g.library || {}).entries) || []).find(e => e.id === entryId);
+    /* 副标题说清"编的是谁"：这一段库里的一条。文档解析再带上能力名 ——
+       同一张卡片上挂着好几项能力，只写模型名分不出在编哪一项 */
+    let sub;
+    if (entry) {
+      sub = '正在编辑：' + (entry.displayName || '（未命名）')
+        + (entry.badge ? ' · ' + entry.badge : '');
+    } else {
+      sub = '新增模型：填好参数 → 测试模型 → 存入模型库';
+    }
+    const mySeq = editorSeq;   // 这一次的序号：被重建/关掉之后就不再是自己
+    editorModal = Partials.modal({
+      type: 'model',
+      title: libTitle(g.key),
+      subtitle: sub,
+      body: groupCard(fg, isSharedLib(g.key) ? SHARED_FORM_TITLE : ''),
+      onClose: () => {
+        if (mySeq !== editorSeq) return;   // 只是重绘时的重建/拆换，不是用户关的
+        editorModal = null;
+        editorOpen = '';
+        modelEdit[g.key] = '';             // 选中态退掉，卡片不再描蓝框
+        Partials.refreshPiece('panel_model');
+      },
+    });
   }
 
   /* ── 模型/服务/高级组卡片 ── */
@@ -1088,12 +1173,15 @@
             .find(p => p.key === 'display_name') || {}).value || '';
           return ConfigData.upsertModel(g.key, payload)
             .then(w => {
-              /* 文档解析的选中态是**那一枚能力徽标**（不是"某一张卡片"），存完得停在
-                 它上面：表单里就是它、徽标还得是选中态。若照别的段那样清掉选中，
-                 表单会被弹回库里第一条，用户接着再点一次保存就成了新增一条，
-                 被"同名同能力"拒收（见 routes._check_doc_parse_card） */
-              modelEdit[g.key] = g.capabilityBadges
-                ? String(((w.res || {}).active || {}).id || editingId) : '';
+              /* 存完收起弹窗：这次编辑就到此为止了，页面上只该剩"新卡片 / 新徽标"
+                 这个结果 —— 留着弹窗反倒挡住刚存进去的那一条。选中态一并退掉
+                 （弹窗都没了，卡片不该再描蓝框）。
+                 下次再编必是从卡片 / 能力徽标 / 「添加模型」进来，那几条路都会重新
+                 带上条目 id；文档解析尤其需要带 id（不带就是"新增一项能力"，会被
+                 "同名同能力"拒收，见 routes._check_doc_parse_card），
+                 而这三条路各自都把 id 设好了 */
+              editorOpen = '';
+              modelEdit[g.key] = '';
               modelSavedToast(w, {
                 name: g.capabilityBadges
                   ? String(name).trim() + ' · ' + capabilityLabelOf(g)
@@ -1638,24 +1726,22 @@
     Partials.registerDataLoader('panel_system', () => ({}));
 
     Partials.registerPieceRenderer('panel_model', data => {
-      // 模型 tab：从上到下几个块（LLM + VLM / Embedding / Rerank），底部为检索策略。
-      // 前几块用 modelCard：左列模型库 + 右列配置表单
+      /* 模型 tab：从上到下五段模型库（LLM / VLM / Embedding / Rerank / Doc Parse），
+         每段贯穿全行 —— 段头（库名 + 计数 + 添加模型）+ 一片卡片网格，底部为检索策略。
+         编辑表单不在这里：点卡片 / 能力徽标 / 「添加模型」才弹出来（见 modelSection）。 */
       const wrap = el('div');
       const stack = el('div', 'model-stack');
-      /* 四段模型库（LLM / VLM / 向量 / 重排）都是同一张卡片：段描述由后端下发，
-         重排段也在 data.groups 里（key='rerank'）。
-         VLM 自己不出卡片 —— 它与 LLM 共用右侧那份表单，作为左列的第二个库挂在
-         LLM 卡片里（见 modelCard），「模型库 · VLM」就贴在「模型库 · LLM」下头 */
-      const groups = data.groups || [];
-      const hasOwner = groups.some(x => x.key === SHARED_FORM_OWNER);
-      groups.forEach(g => {
-        if (hasOwner && g.key !== SHARED_FORM_OWNER && isSharedLib(g.key)) return;
-        stack.appendChild(modelCard(g));
-      });
+      /* 五段都是同一个布局，VLM 现在也自出一段（表单仍与 LLM 共用一份，
+         点哪一段的卡片表单就编哪一段，见 sharedFormGroup） */
+      const groups = orderModelGroups(data.groups);
+      groups.forEach(g => stack.appendChild(modelSection(g)));
       wrap.appendChild(stack);
       const ret = renderRetrievalBlock();
       ret.style.marginTop = '16px';
       wrap.appendChild(ret);
+      /* 面板画完再把编辑弹窗同步回来：弹窗挂在 document.body 上，不随这块刷新消失，
+         但内容得跟着最新的库与表单基线重建（例：刚存进去的那条要出现在卡片里） */
+      syncEditorModal(groups);
       return wrap;
     });
     Partials.registerPieceRenderer('panel_service', data => renderGroupsPanel(data, 3));
@@ -1664,5 +1750,6 @@
     Partials.registerPieceRenderer('panel_system', renderSystemPanel);
   }
 
-  window.ConfigUI = { setup };
+  /* closeEditor：切走模型页时由 config.js 调（收起编辑弹窗，见上） */
+  window.ConfigUI = { setup, closeEditor };
 })();

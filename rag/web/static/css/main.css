@@ -257,6 +257,10 @@ table.params-table input[type=checkbox]{width:16px;height:16px}
 .modal-sub{font-size:var(--fs-xs);color:var(--text-tertiary);font-weight:400;margin-top:2px}
 .modal-body{padding:20px;overflow-y:auto}
 .modal-footer{display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid var(--border)}
+/* 模型编辑弹窗（config-ui.js 传 type:'model'）：里面是那份完整的模型表单（地址 /
+   Key / 模型ID / 获取模型ID 的候选徽标 / 测试与保存按钮），520px 摆不下 —— 宽一档，
+   仍靠 max-height 与 .modal-body 的滚动兜住矮屏 */
+.modal-content.modal-model{max-width:780px}
 .modal-content.modal-warning .modal-header{border-bottom-color:var(--warning)}
 .modal-content.modal-danger .modal-header{border-bottom-color:var(--error)}
 .modal-text{font-size:var(--fs-sm);color:var(--text-secondary);line-height:1.7}
@@ -549,7 +553,10 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .perm-row input{flex:1}
 .perm-row.admin-row input{border-color:var(--warning);background:var(--warning-light)}
 .perm-remove{flex-shrink:0}
-.model-stack{display:flex;flex-direction:column;gap:16px}
+/* 模型 tab：五大区域（LLM / VLM / Embedding / Rerank / Doc Parse）从上到下排，
+   每段贯穿全行，段内的模型卡片从左到右铺开（见 config-ui.js 的 modelSection）。
+   页面上不再摆编辑表单 —— 点卡片、点能力徽标、点段头的「添加模型」才弹出编辑框 */
+.model-stack{display:flex;flex-direction:column;gap:20px}
 /* 候选模型徽标：一排在按钮后面铺开（rerank 的扫描结果用它铺在卡片下方） */
 .model-chip-box{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);
   display:flex;flex-wrap:wrap;gap:6px;min-width:0}
@@ -563,50 +570,63 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 .model-chip.static{cursor:default}
 .model-chip.static:hover{border-color:var(--border)}
 .model-chip-name{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* 模型 tab：左列模型库 + 右列配置表单。
-   表单缩到右边：它只是"填参数 → 测试 → 入库"的入口，参数也没几行，占满整宽时
-   右边大半是空白；而用户真正要看的是左边"有哪些已测通的、当前用哪个" */
-.model-card-body{display:grid;grid-template-columns:minmax(280px,400px) minmax(0,1fr);
-  gap:16px;align-items:start}
-.model-form-col{min-width:0}
-/* 共用一份表单的两块模型库（LLM / VLM）上下叠在左列：两块 .model-lib 与单独一张
-   卡片里的库完全同款，这里只负责纵向排布与间距；宽度由 .model-card-body 的第一列
-   定，所以它自己不设宽（min-width:0 防长模型ID把列撑破） */
-.model-lib-col{display:flex;flex-direction:column;gap:12px;min-width:0}
-.model-lib{border:1px solid var(--border);border-radius:var(--radius-md);
-  padding:12px 14px;background:var(--bg-base)}
-.model-lib-head{display:flex;align-items:center;gap:8px;margin-bottom:4px}
-.model-lib-title{font-weight:var(--fw-medium);color:var(--text-primary)}
+/* 一段模型库 = 一个贯穿全行的区域：段头（库名 + 计数 + 添加模型）+ 卡片网格 */
+.model-sec{display:flex;flex-direction:column;gap:12px}
+.model-sec-head{display:flex;align-items:center;gap:8px;
+  padding-bottom:8px;border-bottom:1px solid var(--border)}
+.model-sec-title{font-weight:var(--fw-semibold);color:var(--text-primary);
+  font-size:var(--fs-md)}
 .model-lib-empty{padding:18px 4px;text-align:center;color:var(--text-secondary);
-  font-size:var(--fs-sm)}
-.model-lib-item{border:1px solid var(--border);border-radius:var(--radius-sm);
-  padding:10px 12px;background:var(--bg-surface);margin-top:10px}
-/* active（业务正在用的那条）不靠边框表态：卡片上那块绿色「active」牌子就是它的标记。
-   原来这里还有一圈主色边框 + 浅蓝外圈，于是"当前生效但没被点中"的卡片看着也像被选中了；
-   蓝框从此只属于 .selected（见下）—— 两个信号不再抢同一个样式 */
-/* 点卡片 = 把这条配置回填到右侧表单（卡片上不再有「更改」按钮）：整卡片可点，
-   hover 时底色微亮 + 边框转主色（active 那条本身已是主色边框，底色变化仍看得见） */
-.model-lib-item.clickable{cursor:pointer;
-  transition:background var(--anim-fast),border-color var(--anim-fast)}
-.model-lib-item.clickable:hover{background:var(--bg-hover);border-color:var(--primary)}
-/* 选中（右侧表单就是它）：蓝色实线框 + 浅蓝底。原来那圈黄色虚线加「编辑中」字样的
-   写法已去掉 —— 选中只看框，卡片上不写状态字。
-   边框由 1px 变 2px，内边距跟着各减 1px 补回来：选中时卡片尺寸不跳、列表不抖 */
-.model-lib-item.selected{border:2px solid var(--primary);background:var(--primary-light);
-  padding:9px 11px}
-/* 一行装下「模型名 + 标记位 + 删除」：不换行，名字过长就省略号。
-   卡片上只有模型名和模型ID（地址、key 要点卡片回填才看得到），
-   这样一条卡片很矮，左列才装得下多条 */
-.model-lib-line{display:flex;align-items:center;gap:6px;flex-wrap:nowrap}
-.model-lib-name{font-weight:var(--fw-medium);color:var(--text-primary);
-  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  font-size:var(--fs-sm);border:1px dashed var(--border);border-radius:var(--radius-md)}
+/* 卡片从左到右铺满整行：auto-fill 让列数随窗口宽度走，顺序永远是"先左后右、
+   再换行"，与库里的先后一致 */
+.model-grid{display:grid;gap:14px;
+  grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+/* 一张卡片 = 库里的一个模型（文档解析：一个模型名）。形状方一点：长宽 6:4 ——
+   卡面上只有"叫谁 + 调哪个模型 + 哪台服务"三行短字，方卡片铺成一片比细长条整齐。
+   刻意不写 overflow:hidden：文档解析卡片上多挂几项能力时让它自然长高，
+   总比把徽标裁掉强（内容不多时仍是 6:4） */
+.model-card{aspect-ratio:6/4;display:flex;flex-direction:column;gap:6px;
+  padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-md);
+  background:var(--bg-surface);min-width:0;cursor:pointer;
+  transition:background var(--anim-fast),border-color var(--anim-fast),
+             box-shadow var(--anim-fast)}
+/* 点卡片 = 弹出这张卡片的编辑框（见 config-ui.js 的 openEditor）：hover 给可点的形状 */
+.model-card:hover{background:var(--bg-hover);border-color:var(--primary)}
+/* 选中（弹窗里正在编的就是它）：蓝框 + 浅蓝底，与弹窗里那份表单对上号。
+   与 .model-card:hover 同色系，不靠"边框变粗"表态 —— 尺寸不跳、网格不抖 */
+.model-card.selected{border-color:var(--primary);background:var(--primary-light);
+  box-shadow:0 0 0 3px var(--primary-light)}
+/* 卡面第一行：模型名 + 标记位（绿色 active 徽标 / 「设为 active」按钮，共用一个槽） */
+.model-card-top{display:flex;align-items:center;gap:6px;min-width:0}
+.model-card-name{font-weight:var(--fw-medium);color:var(--text-primary);
+  flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+/* 卡面上的地址：只给"哪台服务"一个印象，长了省略号收尾（完整地址在 title 里） */
+.model-card-addr{font-size:var(--fs-xs);color:var(--text-tertiary);
+  font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+/* 卡片底行：贴着卡片下沿、靠右 —— 「删除」就在右下角（文档解析卡片这里是那排
+   能力徽标，每枚尾巴上的 × 就是删除，同样落在卡片底部） */
+.model-card-foot{display:flex;align-items:center;gap:6px;margin-top:auto;
+  justify-content:flex-end}
 .model-lib-acts{display:flex;align-items:center;gap:2px;flex-shrink:0;margin-left:auto}
-/* 卡片上的模型ID（这条配置调用谁）；左列不宽，压紧内边距。
+/* 卡片上的模型ID（这条配置调用谁）：一个只读 chip。
    单个ID再长也不许把卡片撑宽：省略号收尾，完整ID在 title 里 */
-.model-lib-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;min-width:0}
+.model-lib-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;min-width:0}
 .model-lib-chips .model-chip{max-width:100%;min-width:0;padding:2px 8px}
 .model-lib-chips .model-chip-name{min-width:0}
+/* 文档解析卡片：那排能力徽标（＋「＋ 添加能力」）贴到卡片底部，每枚尾巴上的 ×
+   就是删除 —— 与别的卡片上右下角那颗「删除」落在同一处 */
+.model-card.dp .model-lib-chips{margin-top:auto}
 .model-lib-del{color:var(--error)}
+/* 编辑弹窗里那份表单本体就是 .perm-card（groupCard 造的），而弹窗自己就是"编辑器"：
+   里面再描一圈边框、再垫一层底色，就成了"弹窗里套一张卡片"。一律抹平 ——
+   四周留白交给 .modal-body 的 padding。
+   选择器写成三段是为了压过 .perm-card:focus-within（点输入框就亮一圈主色底）；
+   否则在弹窗里那圈光晕会像凭空冒出来的一圈框 */
+.modal-model .modal-body .perm-card{border:none;border-radius:0;box-shadow:none;
+  background:transparent;padding:0}
 /* 文档解析卡片上的「处理能力」徽标（见 config-ui.js 的 capabilityChip）：
    徽标本身可点（点它 = 编辑这一项能力，回填到右侧表单），尾巴上的 × 删这项能力。
    与卡片上其它徽标（纯展示）不同，这里必须给出"可点"的形状：默认描一圈边，
@@ -863,8 +883,8 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 @media (max-width:1024px){
   .doc-layout{grid-template-columns:1fr}
   .doc-side-panel{position:static}
-  /* 窄屏：模型库与表单改上下排（左右并排会把表单压得比参数名还窄） */
-  .model-card-body{grid-template-columns:1fr}
+  /* 窄屏：模型卡片放宽（两列挤成"细长条"就不好看了，交给 auto-fill 自己减列） */
+  .model-grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
 }
 @media (max-width:900px){
   .sidebar{display:none}
