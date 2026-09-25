@@ -7,13 +7,15 @@
 #
 # 可用入库步骤：
 #   detect_format  格式自检（magic bytes/解码验证，防伪装扩展名）
-#   parse          文档解析（按扩展名路由，PDF 内含 OCR）
+#   layout_parse   版面解析服务（PaddleX /layout-parsing；未配置则记降级，不影响入库）
+#   parse          文档解析（按扩展名路由；扫描页 OCR 优先走 doc_parse 服务）
+#   region_enhance 引擎区域补内容（figure 按框裁图；按能力做表格/公式识别）
 #   quality_parse  解析质量报告汇总（扫描件 OCR 置信度/空页率/乱码率/文档系数）
 #   reorder_columns 双栏版面重排（bbox 驱动的顺序校正）
 #   outline        OutlineBuilder：标题层级 → section_path（TOC先行校验）
+#   table_extract  表格原始数据入 MySQL table_data（PDF/Word/Excel/PPT 的表格）
+#   vlm_caption    图片 VLM 描述生成（多模态；**必须在 chunk 之前**）
 #   chunk          父子分块（文本/表格/图片题注/代码 分派）
-#   table_extract  表格原始数据入 MySQL table_data
-#   vlm_caption    图片 VLM 描述生成（多模态）
 #   enrich         LLM 批量生成摘要/关键词/实体
 #   embed          向量化（bge-m3）
 #   write          两阶段写入（MySQL→ES→Milvus→Graph，检查点断点续写）
@@ -47,47 +49,53 @@ ingest_workflows:
     - verify
     - finalize
 
-  # PDF 三型（解析器预检 scan_type 后路由）
-  pdf_text:
+  # PDF 三型共用**同一条链**（保留 pdf_text/pdf_scanned/pdf_hybrid 三个键名只为
+  # 兼容既有客户配置与路由可见性；用 YAML 锚点保证三者不会各自漂移）。
+  #
+  # 为什么不按"文字/扫描/混合"拆成三条不同的链：
+  #   ① 逐页分流在解析器里做（每页判"有没有文本层"再决定要不要 OCR），链路上的
+  #      差异只剩 quality_parse —— 而"文字型文档其实含扫描页"恰恰是最常见的形态，
+  #      拆开就意味着这批文档拿不到 OCR 置信度/空页率报告（静默的质量黑洞）。
+  #   ② 拆开就依赖一个**文档级预检**去猜整篇的类型，猜错即整条链走错（旧实现里
+  #      pdf_hybrid 甚至永远走不到）。
+  # 步骤顺序上的三条约束（改动前踩过的坑，勿随意调整）：
+  #   · layout_parse 在 parse 之前：阅读顺序/区域类型交给版面服务；
+  #   · region_enhance / table_extract 在 chunk 之前：ChunkStep 依赖
+  #     ctx.tables 的 chunk_id 回填与元素顺序；
+  #   · **vlm_caption 必须在 chunk 之前**：ChunkStep 读的是 raw_data["vlm_caption"]，
+  #     排在 chunk 之后等于图片描述永远进不了 chunk（旧顺序就是错的）。
+  pdf_text: &pdf_ingest
     - detect_format
-    - parse
-    - reorder_columns   # 双栏版面重排（有 bbox 时生效）
+    - layout_parse       # 版面服务（PaddleX /layout-parsing；未配置则记降级）
+    - parse              # 逐页解析：文字层优先，扫描页 OCR（doc_parse 服务优先）
+    - region_enhance     # 引擎 figure/表格/公式区域按能力补内容（裁图/识别）
+    - quality_parse      # OCR 置信度/空页率/乱码率/文档系数
+    - reorder_columns    # 兜底：无版面服务时按 bbox 近似重排
+    - table_extract      # 表格原始数据入 MySQL table_data（含 PDF 内的表格）
     - outline
+    - vlm_caption        # 图片 VLM 描述（走 config.vlm 段，在 chunk 之前）
     - chunk
-    - vlm_caption       # PDF 内嵌图片 VLM 描述（enable_vlm 开关）
     - enrich
     - embed
     - write
     - verify
     - finalize
-  pdf_scanned:
-    - detect_format
-    - parse
-    - quality_parse      # OCR 置信度/空页率检查
-    - reorder_columns
-    - outline
-    - chunk
-    - vlm_caption
-    - enrich
-    - embed
-    - write
-    - verify
-    - finalize
-  pdf_hybrid:
-    - detect_format
-    - parse
-    - quality_parse
-    - reorder_columns
-    - outline
-    - chunk
-    - vlm_caption
-    - enrich
-    - embed
-    - write
-    - verify
-    - finalize
+  pdf_scanned: *pdf_ingest
+  pdf_hybrid: *pdf_ingest
 
-  docx: *default_ingest
+  # Word：内嵌图片已由解析器取出（package part），需要 vlm_caption 才有意义
+  docx:
+    - detect_format
+    - parse
+    - table_extract
+    - outline
+    - vlm_caption
+    - chunk
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
 
   # Excel：表格原始数据单独入库（供精确数值查询）
   xlsx:
@@ -101,15 +109,31 @@ ingest_workflows:
     - verify
     - finalize
 
-  pptx: *default_ingest
+  # PPT：每页独立 chunk，备注并入文本流；内嵌图片同样需要 vlm_caption
+  pptx:
+    - detect_format
+    - parse
+    - table_extract
+    - outline
+    - vlm_caption
+    - chunk
+    - enrich
+    - embed
+    - write
+    - verify
+    - finalize
   md: *default_ingest
   txt: *default_ingest
   html: *default_ingest
 
-  # 图片：OCR + VLM 描述
+  # 图片：OCR（doc_parse）+ VLM 描述
+  # 注：layout_parse 对本格式只做"有则用之"——图片走 /layout-parsing，
+  #     未配置时该步静默跳过（不产生降级告警）。
   image:
     - detect_format
+    - layout_parse
     - parse
+    - quality_parse      # 图片 OCR 置信度也进质量报告（原先只有空页率/乱码率）
     - vlm_caption
     - chunk
     - enrich

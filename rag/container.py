@@ -17,10 +17,11 @@ from rag.adapters.base import (
     FullTextSearchAdapter, KnowledgeGraphAdapter, LLMAdapter,
     MetaStoreAdapter, StorageAdapter, SynonymAdapter, VectorStoreAdapter,
 )
+from rag.adapters.layout import configure_layout_adapter
 from rag.adapters.redis_cache import (
     REDIS_HEALTH_BUDGET_SEC, make_client, redis_failure_reason,
 )
-from rag.adapters.registry import AdapterRegistry
+from rag.adapters.registry import AdapterNotFoundError, AdapterRegistry
 from rag.config.models import AppConfig
 from rag.observability.logging import get_logger
 from rag.vector_space import judge_space, space_tag, tag_label
@@ -36,11 +37,29 @@ class CoreDependencyError(RuntimeError):
 _CORE_FALLBACKS: dict[str, tuple[str, str]] = {
     "llm": ("llm", "mock"),
     "embedding": ("embedding", "mock"),
+    # 视觉模型与 LLM 同协议（多模态对话），未配置时同样降级为本地替身；
+    # 但入库侧会先问 vlm_ready()，未配置时不发请求（见 VLMCaptionStep）
+    "vlm": ("llm", "mock"),
     "meta": ("meta", "memory"),
     "auth": ("auth", "dev"),
     "storage": ("storage", "local_fs"),
     "synonym": ("synonym", "none"),
 }
+
+# 走 HTTP 的对话/向量段：base_url 为空即视为「未配置」（不当作本地实现）。
+# 原先这个判断把段名硬编码成 ("llm", "embedding")，加 vlm 时容易漏改一处 ——
+# 收成一个常量，构造期与单段热应用共用同一份口径。
+_HTTP_CHAT_SECTIONS = frozenset({"llm", "embedding", "vlm"})
+
+# 段名 → 注册表类型（仅列两者不同的）。
+# vlm 与 llm 是同一种适配器契约（OpenAI 兼容对话），注册表里只有 "llm" 类型；
+# 用段名去 create/drop 会查不到实现，也会让单例缓存清不干净。
+_CORE_FALLBACK_TYPE: dict[str, str] = {"vlm": "llm"}
+
+# 这些**注册表类型**被多个配置段共用 → 构造时必须绕开单例缓存。
+# 注册表键是 (类型, 名)，llm 与 vlm 会撞在 ("llm","openai_compatible") 上：
+# 后构造的那一段会直接拿到前一段的实例（它的 base_url/model 都是别人的）。
+_SHARED_REG_TYPES = frozenset({"llm"})
 
 # 本地实现（无需 base_url，不算“未配置”）
 _LOCAL_IMPL = {"mock", "memory", "dev", "local_fs", "none"}
@@ -59,6 +78,8 @@ SECTION_ADAPTERS: dict[str, tuple[str, str, bool]] = {
     "synonym": ("synonym", "synonym", False),
     "llm": ("llm", "llm", False),
     "embedding": ("embedding", "embedding", False),
+    # 视觉模型：与 llm 同适配器类型（都是 OpenAI 兼容对话服务），单独一段
+    "vlm": ("vlm", "llm", True),
 }
 
 # 段名 → 该段涉及的全部 degraded 键。历史原因同一组件存在两套键
@@ -74,6 +95,7 @@ SECTION_DEGRADED_KEYS: dict[str, tuple[str, ...]] = {
     "synonym": ("synonym",),
     "llm": ("llm",),
     "embedding": ("embedding",),
+    "vlm": ("vlm",),
     "redis": ("redis",),
 }
 
@@ -94,7 +116,7 @@ _OPTIONAL_LABELS = {"vector": "向量库", "fulltext": "全文检索",
 # 名单，迟早会和这里对不上，然后在界面上表现成"显示在自动重连、其实没人重试"。
 RECOVERABLE_SECTIONS: tuple[str, ...] = (
     "meta", "vector_store", "fulltext", "knowledge_graph",
-    "business_data", "redis", "llm", "embedding",
+    "business_data", "redis", "llm", "embedding", "vlm",
 )
 
 # 后台自愈循环的间隔 / 同一段两次重试的最小间隔。每次重试都是真建连 + 真探测，
@@ -157,6 +179,20 @@ class ServiceContainer:
             "embedding", config.embedding.adapter, config.embedding,
             unconfigured=(not (config.embedding.base_url or "").strip()
                           and config.embedding.adapter not in _LOCAL_IMPL))
+        # 视觉模型（图片理解）：与 llm 同构的 OpenAI 兼容对话服务，只是消息能带图。
+        # reg_type="llm" —— 注册表里没有 "vlm" 类型（它是"哪一段在用 llm 契约"），
+        # 传段名会 AdapterNotFoundError。未配置时降级为内置 mock，但 VLMCaptionStep
+        # 会先问 vlm_ready()，未配置就不发请求（mock 的"假描述"会被检索、被当事实引用）。
+        self.vlm: LLMAdapter = self._create_core(
+            "vlm", config.vlm.adapter, config.vlm,
+            unconfigured=(not (config.vlm.base_url or "").strip()
+                          and config.vlm.adapter not in _LOCAL_IMPL),
+            reg_type="llm", uncached=True)
+        # 图片能力探测结果：None=未探测 / True=能收图 / False=不收图（如文本模型）
+        self._vision_ok: bool | None = None
+        # 文档解析能力探测结果：能力名 → (ok, 原因)。启动时不主动探（会拖慢启动），
+        # 由入库步骤用 doc_parse_ready() 惰性触发，或配置页保存后由自检触发。
+        self._doc_parse_probe: dict[str, tuple[bool, str]] = {}
         self.meta: MetaStoreAdapter = self._create_core(
             "meta", config.meta.adapter, config.meta)
         self.auth: AuthAdapter = self._create_core(
@@ -194,6 +230,10 @@ class ServiceContainer:
         if self.business is not None:
             self.business.set_llm(self.llm)
 
+        # 版面引擎适配器：进程级单例，按 `doc_parse.layout_engine` 选定。
+        # 放在建解析器**之前**：解析器在 to_thread 里跑，它读的是这份生效口径。
+        configure_layout_adapter(config)
+
         # 文档解析器集合：{扩展名: 实例}
         self.parsers: dict[str, DocParserAdapter] = \
             AdapterRegistry.create_parsers(config)
@@ -221,10 +261,16 @@ class ServiceContainer:
 
     @staticmethod
     def _try_create(adapter_type: str, name: str, config,
-                    enabled: bool = True):
+                    enabled: bool = True, uncached: bool = False):
         if not enabled:
             return None
         try:
+            if uncached:
+                klass = AdapterRegistry.get_class(adapter_type, name)
+                if klass is None:
+                    raise AdapterNotFoundError(
+                        f"适配器未注册: {adapter_type}/{name}")
+                return klass(config)
             return AdapterRegistry.create(adapter_type, name, config)
         except Exception as e:
             log.warning("optional_adapter_unavailable",
@@ -232,15 +278,34 @@ class ServiceContainer:
             return None
 
     def _create_core(self, adapter_type: str, name: str, config,
-                     unconfigured: bool = False):
-        """核心适配器构造：失败/未配置 → 降级为本地实现，绝不抛错阻断启动"""
+                     unconfigured: bool = False, reg_type: str | None = None,
+                     uncached: bool = False):
+        """核心适配器构造：失败/未配置 → 降级为本地实现，绝不抛错阻断启动
+
+        reg_type：**适配器注册表**里的类型，默认与 adapter_type（配置段名）相同，
+        但两者可以不同 —— vlm 段复用 "llm" 类型的实现（同一种 OpenAI 兼容对话
+        契约），拿段名 "vlm" 去查注册表会直接 AdapterNotFoundError。
+
+        uncached：**绕开注册表单例缓存**。注册表键是 (类型, 名)，于是共用同一类型的
+        两个段（llm 与 vlm）会撞在同一个键上 —— vlm 段**直接拿到 LLM 的实例**，
+        base_url/model 全指向主模型（实测：vlm 的带图探测打到了 api.deepseek.com，
+        报 400）。这不是"缓存失效"，是键的粒度不足以区分两个段；两段各有各的配置，
+        必须各建一个实例。**保存配置后的单段热应用也必须走这条**，否则 vlm 段会拿回
+        刚被 drop 掉的旧 LLM 实例。
+        """
+        rtype = reg_type or adapter_type
         try:
             if unconfigured:
                 raise ValueError("未配置（base_url 为空）")
             # 注：元数据库不做跨适配器的引擎/连接缓存 —— 每次构造都持有
             # 自己的引擎（见 rag/adapters/meta_mysql.py），代价是"重建适配器"
             # 即真实建连，换来的是探测结果永远反映此刻服务端的真实状态（TS-014）
-            return AdapterRegistry.create(adapter_type, name, config)
+            if uncached:
+                klass = AdapterRegistry.get_class(rtype, name)
+                if klass is None:
+                    raise AdapterNotFoundError(f"适配器未注册: {rtype}/{name}")
+                return klass(config)
+            return AdapterRegistry.create(rtype, name, config)
         except Exception as e:
             fb_type, fb_name = _CORE_FALLBACKS.get(
                 adapter_type, (adapter_type, "mock"))
@@ -252,7 +317,8 @@ class ServiceContainer:
                         fallback=fb_name, error=str(e))
             import rag.adapters.mocks  # noqa: F401        触发 mock 注册
             import rag.adapters.meta_memory  # noqa: F401  触发内存 meta 注册
-            return AdapterRegistry.create(adapter_type, fb_name, config)
+            fb_rtype = _CORE_FALLBACK_TYPE.get(adapter_type, fb_type)
+            return AdapterRegistry.create(fb_rtype, fb_name, config)
 
     @staticmethod
     def _apply_noconnection(config: AppConfig) -> None:
@@ -659,7 +725,7 @@ class ServiceContainer:
         attr, atype, optional = spec
         cfg = getattr(self.config, section)
         name = str(getattr(cfg, "adapter", "") or "")
-        unconfigured = (atype in ("llm", "embedding")
+        unconfigured = (atype in _HTTP_CHAT_SECTIONS
                         and not (getattr(cfg, "base_url", "") or "").strip()
                         and name not in _LOCAL_IMPL)
         # 先清降级记录：重建失败会由 _create_core / _selfcheck 重新登记
@@ -671,14 +737,34 @@ class ServiceContainer:
             self._space_state.clear()
             self._space_logged.clear()
             self.degraded.pop("vector_space", None)
-        # 必须摘掉本段单例，否则 create 会直接返回带旧配置的旧实例
-        old = AdapterRegistry.drop(atype, name)
-        if optional:
-            new = self._try_create(atype, name, cfg,
-                                   getattr(cfg, "enabled", True))
+        # 必须摘掉本段单例，否则 create 会直接返回带旧配置的旧实例。
+        # 用 reg_type（注册表类型）而不是段名：vlm 段的实例注册在 "llm" 类型下，
+        # 按键 (类型, 名) 才能清到它，否则保存后仍然跑着旧配置。
+        rtype = _CORE_FALLBACK_TYPE.get(atype, atype)
+        uncached = rtype in _SHARED_REG_TYPES
+        if not uncached:
+            old = AdapterRegistry.drop(rtype, name)
         else:
-            new = self._create_core(atype, name, cfg, unconfigured=unconfigured)
+            # 共用注册类型的段（vlm）：不能按 (类型,名) drop —— 那是 llm 的键，
+            # 会把主模型实例一起摘掉；而 drop 也清不掉 vlm 自己那个（它本就没进缓存）
+            old = getattr(self, attr, None)
+        if optional:
+            new = self._try_create(rtype, name, cfg,
+                                   getattr(cfg, "enabled", True),
+                                   uncached=uncached)
+        else:
+            new = self._create_core(atype, name, cfg, unconfigured=unconfigured,
+                                    reg_type=rtype, uncached=uncached)
+        if new is None and atype in _HTTP_CHAT_SECTIONS:
+            # optional 段构造失败会返回 None，而 vlm 是"核心但可选"的混合定位：
+            # 置 None 会让 VLMCaptionStep 的 vlm_ready() 直接判"未构造"（可接受），
+            # 但 llm/embedding 绝不能置空，故这里只兜底到本地替身，保持启动口径一致
+            # （替身走缓存：它是无状态实现，多段共用一份实例没有副作用）
+            new = self._create_core(atype, name, cfg, unconfigured=True,
+                                    reg_type=rtype, uncached=False)
         setattr(self, attr, new)
+        if section == "vlm":
+            self._vision_ok = None         # 换了视觉模型 → 上一轮的探测结论作废
         if atype == "business_data" and new is not None:
             new.set_llm(self.llm)          # 业务数据要借 LLM 改写查询
         elif atype == "llm" and self.business is not None:
@@ -691,6 +777,39 @@ class ServiceContainer:
     async def _selfcheck_section(self, section: str) -> None:
         """只给这一段做健康检查与结构校准（口径/文案同 initialize）"""
         import asyncio
+
+        if section == "doc_parse":
+            # 保存文档解析配置后立刻验证**每条能力**：探真实端点 + 校验响应字段根名。
+            # 用 /health 会给出假绿（PaddleX 每个服务都有它，能力选错照样 200）。
+            self._doc_parse_probe.clear()
+            cfg = self.config.doc_parse
+            caps: list[str] = []
+            for entry in list(cfg.models or []):
+                cap = str((entry.params or {}).get("capability") or "").strip()
+                if cap and cap not in caps:
+                    caps.append(cap)
+            for cap in caps:
+                ok, reason = await self.probe_doc_parse(cap)
+                log.info("doc_parse_probe", capability=cap, ok=ok,
+                         reason=reason[:160])
+            return
+
+        if section == "vlm":
+            # 视觉模型的自检 = **带图探测**，不是"地址通不通"。
+            # 配置页保存这一段后立刻给出"能不能看图"的结论：把文本模型配进 vlm 段
+            # 是最容易犯的错，而它只在入库时以"描述为空/为假"的形式静默暴露。
+            if not (self.config.vlm.base_url or "").strip():
+                self.degraded["vlm"] = (
+                    "视觉模型未配置 base_url，图片理解已跳过"
+                    "（入库仍会成功，只是图无法被检索）")
+                self._vision_ok = None
+                return
+            ok, reason = await self.probe_vision()
+            if not ok:
+                self.degraded["vlm"] = (
+                    f"视觉模型不可用：{reason}；图片理解将被跳过"
+                    "（入库仍会成功，只是图无法被检索）")
+            return
 
         if section == "meta":
             cfg = self.config.meta
@@ -994,6 +1113,171 @@ class ServiceContainer:
         """读侧门禁：先同步指纹再给结论（用于按 collection 判定的检索路径）"""
         _, read_ok, _ = await self.sync_vector_space(collection)
         return read_ok
+
+    # ── 文档解析能力门禁 ────────────────────────────────────
+
+    def doc_parse_ready(self, internal: str) -> str | None:
+        """某项文档解析能力能不能用：None=可以，非空=降级原因
+
+        与 `vlm_ready` 同一套口径：入库步骤先问这里，拿到原因就不发请求 ——
+        "没配"与"配错"都不该以 404/超时 的形式在解析链路里炸开，也不该被静默跳过
+        （静默跳过会让人以为版面引擎在生效）。原因同时进 degraded，监控页可见。
+        """
+        from rag.adapters.doc_parse import (doc_parse_capability_for,
+                                            resolve_base_url)
+        cap = doc_parse_capability_for(self.config, internal)
+        if not cap:
+            return (f"未配置「{internal}」能力的服务地址（配置页 → 文档解析）")
+        cached = self._doc_parse_probe.get(cap)
+        if cached is not None and not cached[0]:
+            return cached[1]
+        return None
+
+    def note_doc_parse_failure(self, cap: str, reason: str) -> None:
+        """记下一次能力探测失败，后续文档不再重复请求同一端点
+
+        为什么值得缓存：`--pipeline` 配错时每篇 PDF 都要等一次超时/404 才降级，
+        而结论在下次改配置之前不会变（保存 doc_parse 段会清这份缓存）。
+        """
+        self._doc_parse_probe[cap] = (False, reason)
+        self.degraded[f"doc_parse:{cap}"] = f"「{cap}」不可用：{reason[:200]}"
+
+    async def probe_doc_parse(self, cap: str) -> tuple[bool, str]:
+        """真打一次能力端点并用响应字段根名校验产线（与「测试解析」同口径）
+
+        PaddleX 每个服务都有 /health，只探存活会给出**假绿**：能力选错时
+        /health 照样 200，直到入库 404。所以这里探真实端点 + 校验字段根名。
+
+        缓存策略：**只缓存确定性结论**。瞬时故障（5xx/超时/连不上）不缓存 ——
+        否则一次抖动会被放大成"整个进程周期内不再尝试该能力"。
+        """
+        from rag.adapters.doc_parse import make_client
+        try:
+            client = make_client(self.config, cap)
+        except Exception as e:
+            return False, str(e)
+        ok, reason, definitive = await client.probe()
+        if ok:
+            self._doc_parse_probe[cap] = (True, reason)
+            self.degraded.pop(f"doc_parse:{cap}", None)
+        elif definitive:
+            self._doc_parse_probe[cap] = (False, reason)
+            self.degraded[f"doc_parse:{cap}"] = f"「{cap}」不可用：{reason}"
+        else:
+            # 可恢复故障：登记给监控页看，但不写进"跳过"缓存，下次调用会重试
+            self.degraded[f"doc_parse:{cap}"] = f"「{cap}」暂时不可用：{reason}"
+        return ok, reason
+
+    # ── 视觉模型门禁 ────────────────────────────────────────
+    def vlm_ready(self) -> str | None:
+        """图片理解能不能用：返回 None=可以，非空字符串=跳过原因
+
+        为什么必须有这道门禁：vlm 段未配置时 _create_core 会把实例降级成**内置
+        mock**，而 mock 的 generate() 会返回一段像模像样的假描述 —— 那段文字会进
+        向量库、被检索、被当成事实引用，比"没有描述"坏得多。所以入库侧发请求前
+        必须先问这里，把"跳过"做成一件**有意为之且可区分**的事（与写侧门禁
+        vector_write_blocked 同一套口径）。
+        """
+        if self.vlm is None:
+            return "视觉模型(vlm)未构造"
+        if not (self.config.vlm.base_url or "").strip():
+            return "视觉模型(vlm)未配置 base_url"
+        if AdapterRegistry.name_of("llm", self.vlm) in _LOCAL_IMPL:
+            return "视觉模型(vlm)仍是本地降级实现(mock)"
+        if self._vision_ok is False:
+            return "视觉模型不支持图片输入（带图请求被拒或返回空）"
+        return None
+
+    async def probe_vision(self) -> tuple[bool, str]:
+        """真发一次**带图**请求，验证这个地址真能看图
+
+        为什么不能只探 /models 或发一句纯文字 ping：那只能证明"地址通、钥能对话"。
+        把文本模型配进 vlm 段（本项目的实际风险）时两种探法都会通过，图像能力要等
+        入库才暴露 —— 而入库侧的失败是静默的（描述为空/为假），属于 TS-009「只校验
+        路径存在 → 假绿」同一族缺陷。
+
+        三处口径都来自实测踩坑，别改回去：
+          · 探测图用**有字有框**的正常尺寸 PNG：1×1 这类退化输入在部分服务上会踩到
+            边角路径（早期用 1×1 时 layout 产线直接 422）；
+          · max_tokens 给够（见下）：推理模型会把小上限全用在思考过程上，返回
+            HTTP 200 但 content 为 null —— 那会被误读成"不支持图片"；
+          · **5xx / 连接抖动要重试**：PaddleX/vLLM 冷启动时首个请求偶发 500，
+            实测重发即 200。不重试就会把一次抖动登记成"视觉模型不可用"，
+            之后入库一直跳过图片描述（且没人知道原因已经过期）。
+        """
+        import asyncio
+
+        if self.vlm is None:
+            return False, "视觉模型(vlm)未构造"
+        if not (self.config.vlm.base_url or "").strip():
+            return False, "未配置 base_url"
+        from rag.adapters.doc_parse import _probe_image_b64
+        pixel = _probe_image_b64()
+        # 探针图上固定画着 "RAG doc-parse probe / PROBE OK 0123456789"（白底黑字）：
+        # 让模型**复述图上的文字**，比问"什么颜色"更能证明它真的看见了图
+        # —— 颜色可能靠猜，文字猜不出来。
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "图里写了什么？只输出图上的文字。"},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{pixel}"}},
+            ]}]
+        delays = (1.0, 3.0)
+        last_status: int | None = None
+        for attempt in range(len(delays) + 1):
+            try:
+                # 用 wait_for 而不是 asyncio.timeout：后者是 3.11+ 才有的 API，
+                # 本仓库跑在 3.10（见 requirements），直接调用会 AttributeError。
+                gen_ex = getattr(self.vlm, "generate_ex", None)
+                if gen_ex is not None:
+                    out = await asyncio.wait_for(
+                        # task="vision" → 按策略关闭思考：探针要的是"能不能读图"，
+                        # 不是"想得多深"；关掉后判定更稳、也不再被思考吃满额度
+                        gen_ex(messages, task="vision", max_tokens=1024),
+                        timeout=60)
+                    content = out.get("content") or ""
+                    reasoning = out.get("reasoning") or ""
+                else:                                  # 兼容没有扩展视图的实现
+                    content = await asyncio.wait_for(
+                        self.vlm.generate(messages, task="vision",
+                                          max_tokens=1024),
+                        timeout=60)
+                    reasoning = ""
+                # 判定用 content + reasoning：推理模型可能把答案写在思考里、
+                # 正文为空 —— "正文为空"不等于"它没看见图"。
+                blob = f"{content} {reasoning}".lower()
+                self._vision_ok = ("probe" in blob) or ("0123456789" in blob)
+                if self._vision_ok:
+                    return True, "视觉模型可接收图片输入并读出图中文字"
+                if content.strip() or reasoning.strip():
+                    return False, ("模型有回复但读不出探测图上的文字"
+                                   "（该模型可能不是多模态视觉模型）")
+                return False, ("带图请求成功但没有任何回复内容"
+                               "（可能是推理模型上限太小，或该模型不是多模态）")
+            except Exception as e:
+                resp = getattr(e, "response", None)
+                status = getattr(resp, "status_code", None)
+                last_status = status
+                retryable = (status is None) or (500 <= status < 600)
+                body = ""
+                if resp is not None:
+                    try:
+                        body = (resp.text or "")[:200].replace("\n", " ")
+                    except Exception:
+                        body = ""
+                if not retryable or attempt >= len(delays):
+                    self._vision_ok = False if status and 400 <= status < 500 else None
+                    # 4xx 时把服务端原话照抄出来：它已经说清缺什么（参数越界/模型名
+                    # 不对/图片格式），比我们自己猜准得多 —— 实测曾把
+                    # "temperature must be in [0, 2]" 的 400 猜成"不是多模态模型"。
+                    detail = f" HTTP {status}" if status else ""
+                    return False, (f"带图请求失败：{type(e).__name__}{detail}: "
+                                   f"{body or str(e)[:150]}")
+                log.warning("vlm_probe_retry", attempt=attempt + 1,
+                            status=status, error=str(e)[:120])
+                await asyncio.sleep(delays[attempt])
+        return False, f"带图请求失败（已重试）：HTTP {last_status}"
 
     async def vector_write_blocked(self, collection: str) -> str | None:
         """写侧门禁：返回非空字符串 = 本次应跳过写入，内容即可读原因

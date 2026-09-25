@@ -163,20 +163,30 @@ window.Partials = (function () {
       if (input) ok.disabled = true;
       footer.appendChild(cancel);
       footer.appendChild(ok);
+      /* ⚠ 只允许 settle 一次，且**按钮的意图优先于关闭事件**。
+         历史缺陷（影响全站所有确认框）：原来写的是
+             ok.addEventListener('click', function () { m.close(); resolve(true); });
+         而 close() 会回调 onClose → resolve(false) —— Promise 只认第一次 settle，
+         于是**点「确认」永远得到 false**：删除、彻底删除、恢复、重试…每一个
+         需要用户点"是"的操作都被静默取消（取消按钮反而"正常"，因为它本来就返回 false，
+         所以这个 bug 一直没被看出来）。
+         修法：先 decide(结果) 再 close()，onClose 只在"没决定过"时才兜底为 false。 */
+      var settled = false;
+      function decide(v) { if (!settled) { settled = true; resolve(v); } }
       var m = buildModal({
         title: opts.title || '确认', body: body, footer: footer,
         type: opts.type === 'danger' ? 'danger' : 'warning',
-        onClose: function () { resolve(false); }
+        onClose: function () { decide(false); }
       });
-      if (!m) { resolve(false); return; }
-      cancel.addEventListener('click', function () { m.close(); resolve(false); });
+      if (!m) { decide(false); return; }
+      cancel.addEventListener('click', function () { decide(false); m.close(); });
       if (input) {
         input.addEventListener('input', function () {
           ok.disabled = input.value.trim() !== opts.confirmWord;
         });
         setTimeout(function () { input.focus(); }, 50);
       }
-      ok.addEventListener('click', function () { m.close(); resolve(true); });
+      ok.addEventListener('click', function () { decide(true); m.close(); });
     });
   }
 

@@ -1,10 +1,13 @@
 {% macro status_badge(status) %}
+  {# 取值表必须覆盖后端 IngestStatus 的全部真实状态（rag/models.py）。
+     历史缺陷：这里写的是 queued/uploading/indexing —— 后端从不产生这三个值，
+     而真实的活动态 pending/chunking/writing 没有映射，徽标就退化成英文原样输出。 #}
   {% set cls = {'done':'success','failed':'error','partial':'warning','deleted':'muted',
-                'queued':'info','parsing':'info','embedding':'info','uploading':'info',
-                'indexing':'info','retrying':'warning','superseded':'muted'} %}
+                'pending':'info','parsing':'info','chunking':'info','embedding':'info',
+                'writing':'info','retrying':'warning','superseded':'muted'} %}
   {% set label = {'done':'已完成','failed':'失败','partial':'部分完成','deleted':'回收站',
-                  'queued':'排队中','parsing':'解析中','embedding':'向量化','uploading':'上传中',
-                  'indexing':'索引中','retrying':'重试中','superseded':'已覆盖'} %}
+                  'pending':'排队中','parsing':'解析中','chunking':'分块中','embedding':'向量化',
+                  'writing':'写入中','retrying':'重试中','superseded':'已覆盖'} %}
   <span class="badge badge-{{ cls.get(status, 'muted') }}">{{ label.get(status, status) }}</span>
 {% endmacro %}
 
@@ -15,6 +18,41 @@
   {%- else -%}{{ '%.1f' | format(n / 1048576) }} MB{%- endif -%}
 {% endmacro %}
 
+{# ── 图标：简约线条（只描边、不填充、透明底）────────────────────
+   16×16 网格上画，描边属性统一在 CSS（.icon-act svg *）里给，
+   这里只负责路径，换图标不用碰样式。 #}
+{% macro icon(name) %}
+  <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    {%- if name == 'detail' -%}
+      <circle cx="8" cy="8" r="6.2"/><path d="M8 7.4v4"/><path d="M8 5.05h.01"/>
+    {%- elif name == 'reingest' -%}
+      {# 齿轮（重解析 = 按当前口径重跑一遍："过一遍机器"的直觉符号）：
+         外圈 + 轮毂 + 8 根齿，全部是同心/径向的直线与圆，1.6px 线条下不会糊成一团。
+         齿从 r=5 伸到 r=7（画布 16×16，中心 8,8），留 1 单位边距给描边宽度。 #}
+      <circle cx="8" cy="8" r="5"/><circle cx="8" cy="8" r="2.1"/>
+      <path d="M13 8h2M8 13v2M3 8H1M8 3V1M11.54 11.54l1.41 1.41M4.46 11.54 3.05 12.95M4.46 4.46 3.05 3.05M11.54 4.46l1.41-1.41"/>
+    {%- elif name == 'download' -%}
+      <path d="M8 2.6v7.4"/><path d="M5.1 7.2 8 10.1l2.9-2.9"/><path d="M3.3 13.3h9.4"/>
+    {%- elif name == 'delete' -%}
+      <path d="M3.4 4.7h9.2"/><path d="M6.4 4.7V3.1h3.2v1.6"/>
+      <path d="M5.1 4.7 5.7 13h4.6l.6-8.3"/><path d="M7 7.2v3.4"/><path d="M9 7.2v3.4"/>
+    {%- elif name == 'restore' -%}
+      <path d="M2.6 8a5.4 5.4 0 1 0 1.7-3.9"/><path d="M2.6 2.5v3.3h3.3"/>
+    {%- endif -%}
+  </svg>
+{% endmacro %}
+
+{# 一个图标按钮 + 悬浮文字。`sub` 是可选的第二行说明（悬停才看得到，不占版面）。 #}
+{% macro icon_act(action, doc_id, tip, icon_name, sub='', filename='', danger=false) %}
+  <button type="button" class="icon-act{% if danger %} danger{% endif %}"
+          data-doc-action="{{ action }}" data-doc-id="{{ doc_id }}"
+          {% if filename %}data-filename="{{ filename }}"{% endif %}
+          aria-label="{{ tip }}">
+    {{ icon(icon_name) }}
+    <span class="icon-tip">{{ tip }}{% if sub %}<span class="icon-tip-sub">{{ sub }}</span>{% endif %}</span>
+  </button>
+{% endmacro %}
+
 {% macro docs_table(data, archived) %}
   {% if data is none %}
     <div class="table-empty">加载中…</div>
@@ -22,34 +60,78 @@
     <div class="table-empty">{{ '回收站为空' if archived else '暂无文档，点击上方按钮上传' }}</div>
   {% else %}
   <table class="data-table">
+    {# 列序（用户要求）：文档名 → 上传时间 → 类型 → 集合 → 状态 → 分块 → 大小 → 操作。
+       · 第一列**只放文档名**：类型与其它说明文字不再挤在文件名下方 —— 文件名一多行，
+         每行的可用宽度就被吃掉，同名文件更难区分。
+       · 第二列是**上传时间**且不换行：文件名允许重复，时间才是分辨"哪一次上传"的依据。
+       · 类型单独成列（原先是文件名下的一行小字）。
+       · 回收站多一列勾选框（放在文档名**前面**）且第二列改为**删除时间**：
+         在回收站里"我刚删的是哪一篇"才是要回答的问题。 #}
     <thead><tr>
-      <th>文档</th><th>集合</th><th>状态</th><th>分块</th><th>大小</th><th>上传时间</th><th style="width:220px">操作</th>
+      {% if archived %}
+      <th class="col-check"><input type="checkbox" id="trash-select-all" aria-label="全选"></th>
+      {% endif %}
+      <th>文档名</th><th>{{ '删除时间' if archived else '上传时间' }}</th><th>类型</th>
+      <th>集合</th><th>状态</th><th>分块</th><th>大小</th>
+      <th class="th-actions">操作</th>
     </tr></thead>
     <tbody>
       {% for doc in data.docs %}
       <tr data-doc-id="{{ doc.doc_id }}">
-        <td>
-          <div class="doc-title-main">{{ doc.filename }}</div>
-          <div class="doc-title-sub">{{ doc.file_type or '' }}{% if doc.error %} · <span class="text-error">{{ doc.error[:60] }}</span>{% endif %}</div>
+        {% if archived %}
+        {# 勾选 = 选中"要彻底删除的文档"：不勾选时任何按钮都不会碰到数据库 #}
+        <td class="col-check">
+          <input type="checkbox" class="js-trash-check" value="{{ doc.doc_id }}"
+                 aria-label="选择 {{ doc.filename }}">
         </td>
+        {% endif %}
+        <td class="cell-name" title="{{ doc.filename }}">{{ doc.filename }}</td>
+        <td class="nowrap">
+          {{ ((doc.deleted_at or doc.created_at) or '')[:16].replace('T', ' ') or '—' }}
+        </td>
+        <td>{{ (doc.file_type or '') | upper or '—' }}</td>
         <td>{{ doc.collection }}</td>
-        <td>{{ status_badge(doc.status) }}</td>
+        {# 解析/质量说明不再写在文件名下方：有错误时只留一个红色标记，
+           完整文字挂在 title 上（悬停可见），既不占版面也不丢信息 #}
+        {# 状态列不摆任何附加标记：质量备注与"实时状态"都挂在悬停提示里。
+           `doc.live` = 这个状态来自**正在运行的任务**（文档行自己只会 pending→done，
+           中间阶段由任务提供，见 routes._active_status_by_doc）。#}
+        {% if archived %}
+          {# 回收站里显示**删除前**的状态：用户要据此判断"恢复出来是什么"。
+             老数据没记 prev_status（本次改动之前删的），如实写"未知"而不是猜一个。 #}
+          <td title="{{ '恢复后回到该状态' if doc.prev_status else '删除前的状态未记录（旧数据）；恢复时按有无分块判断' }}">
+            {% if doc.prev_status %}{{ status_badge(doc.prev_status) }}
+            {% else %}<span class="badge badge-muted">未知</span>{% endif %}
+          </td>
+        {% else %}
+          {% set tips = [] %}
+          {% if doc.live %}{% set _ = tips.append('实时状态：正在处理中（跟随任务阶段变化）') %}{% endif %}
+          {% if doc.error %}{% set _ = tips.append('质量备注：' ~ doc.error) %}{% endif %}
+          <td{% if tips %} title="{{ tips | join('；') }}"{% endif %}>
+            {{ status_badge(doc.status) }}
+          </td>
+        {% endif %}
         <td>{{ doc.chunk_count if doc.chunk_count is not none else '—' }}</td>
-        <td>{{ fmt_size(doc.file_size) }}</td>
-        <td>{{ (doc.created_at or '')[:16].replace('T', ' ') }}</td>
+        <td class="nowrap">{{ fmt_size(doc.file_size) }}</td>
         <td>
+          <div class="icon-actions">
           {% if archived %}
-          <button class="btn btn-ghost btn-xs" data-doc-action="restore" data-doc-id="{{ doc.doc_id }}">恢复</button>
-          <button class="btn btn-ghost btn-xs text-error" data-doc-action="permanent"
-                  data-doc-id="{{ doc.doc_id }}" data-filename="{{ doc.filename }}">永久删除</button>
+            {{ icon_act('restore', doc.doc_id, '恢复', 'restore',
+                        '放回文档列表，内容原样（不重新解析）') }}
+            {{ icon_act('permanent', doc.doc_id, '彻底删除', 'delete',
+                        '清除向量库 / 全文索引 / 图谱 / 对象存储 / 元数据，不可恢复',
+                        filename=doc.filename, danger=true) }}
           {% else %}
-          <button class="btn btn-ghost btn-xs" data-doc-action="open" data-doc-id="{{ doc.doc_id }}">详情</button>
-          <button class="btn btn-ghost btn-xs" data-doc-action="reingest" data-doc-id="{{ doc.doc_id }}">重建</button>
-          <button class="btn btn-ghost btn-xs" data-doc-action="download"
-                  data-doc-id="{{ doc.doc_id }}" data-filename="{{ doc.filename }}">下载</button>
-          <button class="btn btn-ghost btn-xs text-error" data-doc-action="delete"
-                  data-doc-id="{{ doc.doc_id }}" data-filename="{{ doc.filename }}">删除</button>
+            {{ icon_act('open', doc.doc_id, '详情', 'detail') }}
+            {{ icon_act('reingest', doc.doc_id, '重解析', 'reingest',
+                        '按当前解析口径重跑这篇文档：沿用原文档，覆盖更新全文索引/向量库/元数据，不产生新文档或重复块') }}
+            {{ icon_act('download', doc.doc_id, '下载', 'download',
+                        '从对象存储下载上传时的原始文件', filename=doc.filename) }}
+            {{ icon_act('delete', doc.doc_id, '删除', 'delete',
+                        '移入回收站（可恢复）；在回收站勾选后才彻底清除各数据库',
+                        filename=doc.filename, danger=true) }}
           {% endif %}
+          </div>
         </td>
       </tr>
       {% endfor %}

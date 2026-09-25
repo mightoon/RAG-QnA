@@ -19,10 +19,11 @@ import asyncio
 import math
 import threading
 from collections import OrderedDict
+from pathlib import Path
 
 from rag.config.models import (is_http_url, rerank_api_endpoint,
                                resolve_rerank_model_path)
-from rag.models import RetrievedChunk
+from rag.models import RetrievedChunk, RetrievalPath
 from rag.observability.logging import get_logger
 from rag.pipeline.base import PipelineStep, StepRegistry, StepError
 from rag.pipeline.context import QueryContext
@@ -44,7 +45,38 @@ def _default_route_cfg(services) -> dict:
                   "top_k": unified,
                   "hops": r.graph_hops},
         "ephemeral": {"top_k": r.ephemeral_top_k or unified},
+        # 结构化路（NL2SQL）：top_k 对它是"要不要参与合并"，不是条数上限 ——
+        # 一条 SQL 的结果就是一个整体（一张结果表），拆开反而没法作答
+        "structured": {"top_k": 3},
     }
+
+
+def _rows_to_markdown(rows: list[dict], max_cell: int = 80) -> str:
+    """查询结果 → Markdown 表（进上下文的那份文本）
+
+    刻意不塞 JSON：模型在 Markdown 表上读数值更稳（键名重复、层级嵌套都会让
+    它算错列）。单元格截断到 max_cell，避免一个长文本字段吃掉整个上下文预算。
+    """
+    if not rows:
+        return ""
+    headers: list[str] = []
+    for row in rows:
+        for k in row:
+            if k not in headers:
+                headers.append(str(k))
+    if not headers:
+        return ""
+
+    def cell(v) -> str:
+        s = "" if v is None else str(v)
+        s = s.replace("|", "\\|").replace("\n", " ")
+        return s if len(s) <= max_cell else s[:max_cell - 1] + "…"
+
+    lines = ["| " + " | ".join(headers) + " |",
+             "| " + " | ".join("---" for _ in headers) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(cell(row.get(h)) for h in headers) + " |")
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -259,6 +291,8 @@ class RetrieveStep(PipelineStep):
                 "graph": lambda: self._graph(ctx, route_cfg.get("graph", {})),
                 "ephemeral": lambda: self._ephemeral(ctx, filter_base,
                                                       route_cfg["ephemeral"]),
+                "structured": lambda: self._structured(
+                    ctx, route_cfg.get("structured", {"top_k": 3})),
             }[name]()
             chunks = await asyncio.wait_for(coro, timeout=timeout)
             ctx.candidates[name] = chunks
@@ -398,6 +432,76 @@ class RetrieveStep(PipelineStep):
             max_depth=2)
         return docs[: cfg.get("top_k", 10)]
 
+    async def _structured(self, ctx: QueryContext, cfg: dict
+                          ) -> list[RetrievedChunk]:
+        """结构化路（NL2SQL）：能"算"出来的数就别去猜文档段落
+
+        文档里的数字是**历史快照**（某月报表），业务库里的才是**当前真值**。
+        "去年毛利率多少"这类问题靠文档检索只能命中一张可能过期的表，而 NL2SQL 能
+        直接查出答案 —— 这条路以前是空的：`enabled_paths()` 会把 structured 报成
+        可用（配置页/检索路选择器都能勾），`query_retrieve` 里却没有任何执行者，
+        勾了等于没勾（一个查不出东西、也不报错的检索路）。
+
+        三道硬门禁，缺一不可：
+          ① 适配器在线 + `enable_structured`（`enabled_paths` 已判，这里再判实例，
+             避免别处直接调本步骤时绕过）；
+          ② 生成的 SQL 必须过 `validate_sql`：只允许单条 SELECT + 表白名单，
+             拒掉 UNION/DML/DDL —— **提示词不是安全边界，校验才是**；
+          ③ 任何一步失败都只**返回空并留痕**（`ctx.meta["structured_skip"]`），
+             不影响其它检索路：结构化路挂掉不该让整个问答失败，但用户在溯源里
+             要能看出"这条路没参与、为什么没参与"。
+        """
+        s = ctx.services
+        plan = ctx.plan
+        if getattr(s, "business", None) is None:
+            return []
+        if not s.config.retrieval.enable_structured:
+            return []
+        top_k = int(cfg.get("top_k", 3) or 3)
+        question = plan.standalone_query or plan.original_query or ""
+        if not question.strip():
+            return []
+        try:
+            sql = await s.business.nl2sql(
+                question, plan.constraints,
+                {"intent": getattr(plan.intent, "value", "") or "",
+                 "keywords": (plan.keywords or [])[:10]})
+            if not sql:
+                ctx.meta["structured_skip"] = "未能生成 SQL（问题不适合业务库回答）"
+                log.info("structured_no_sql")
+                return []
+            if not s.business.validate_sql(sql):
+                # 生成出越权 SQL：一定要留痕（可能是注入尝试，也可能是模型跑偏）
+                ctx.meta["structured_skip"] = "生成的 SQL 未通过安全校验，已丢弃"
+                log.warning("structured_sql_rejected", sql=sql[:200])
+                return []
+            rows = await s.business.execute(sql)
+        except Exception as e:                              # noqa: BLE001
+            # 业务库/LLM 任一环节异常：只降级这条路，不能让整个问答 500
+            ctx.meta["structured_skip"] = f"结构化查询失败（{type(e).__name__}）"
+            log.warning("structured_failed", error=f"{type(e).__name__}: {e}"[:200])
+            return []
+        if not rows:
+            ctx.meta["structured_empty"] = True
+            log.info("structured_empty_result")
+            return []
+        ctx.meta["structured_sql"] = sql
+        ctx.meta["structured_rows"] = rows
+        text = _rows_to_markdown(rows)
+        return [RetrievedChunk(
+            chunk_id=f"structured:{abs(hash(sql)) & 0xFFFFFFFF:08x}",
+            doc_id="__business_data__",
+            text=text,
+            # 分数给到 1.0：这是**精确算出来的事实**，不该在 RRF 里被近似检索
+            # 的段落挤掉（它的不确定性来自 SQL 是否正确，而不是召回是否充分）
+            score=1.0,
+            source_path=RetrievalPath.STRUCTURED,
+            rank=1,
+            title="业务数据库查询结果",
+            chunk_type="table",
+            metadata={"sql": sql, "row_count": len(rows)},
+        )][:top_k]
+
     async def _ephemeral(self, ctx: QueryContext, filter_base: dict,
                          cfg: dict) -> list[RetrievedChunk]:
         s = ctx.services
@@ -527,6 +631,49 @@ async def _remote_rerank_scores(url: str, model: str, pairs: list) -> list[float
         resp.raise_for_status()
         data = resp.json() or {}
     return _rerank_scores_from_payload(data, len(docs))
+
+
+async def check_reranker(cfg) -> tuple[bool, str]:
+    """重排模型行的健康探测（监控页）→ (可用, 原因文案)
+
+    重排有两条互斥的落地路径，「测试模型」按钮与这里必须同口径（否则会出现
+    "配置页测通了、监控页却红着"这种自相矛盾，见 TS-009/TS-011 那族）：
+
+      · 「模型路径/API」填 http(s) → 远程重排服务：真发一次两文档的 rerank，
+        能解析出分数才算通（地址少写一段、端点契约不对，都当场暴露）；
+      · 否则 → 本机 Cross-Encoder 权重：判"拼出来的目录在不在、有没有权重文件"。
+        权重齐不齐、显存够不够要到第一次问答才真知道 —— 这是本探测的口径局限，
+        不在这里假装能判（同 TS-009 对 rerank 测试的说明）。
+    """
+    ref = str(getattr(cfg, "rerank_model_dir", "") or "").strip()
+    model = str(getattr(cfg, "rerank_model", "") or "").strip()
+    if is_http_url(ref):
+        target = rerank_api_endpoint(ref)
+        try:
+            scores = await _remote_rerank_scores(
+                ref, model, [("健康探测", "文档一"), ("健康探测", "文档二")])
+        except Exception as e:
+            return False, (f"远程重排服务不可达（{target}）："
+                           f"{type(e).__name__}: {str(e)[:150]}")
+        if not scores or not any(scores):
+            return False, (f"{target} 有响应但没有可用分数："
+                           "地址可能少写了一段 /v1，或不是 rerank 契约")
+        return True, f"远程重排服务可用（{target}）"
+    # 本机权重：与运行期同一套路径解析（见 models.resolve_rerank_model_path）
+    path = resolve_rerank_model_path(ref, model or "BAAI/bge-reranker-v2-m3")
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parents[3] / p
+    if not p.is_dir():
+        return False, (f"本机权重目录不存在：{p}"
+                       "（核对「模型路径/API」与「模型ID」；未加载时精排会退化为"
+                       "RRF 顺序）")
+    weights = ("model.safetensors", "pytorch_model.bin", "onnx/model.onnx",
+               "model.onnx")
+    if not any((p / w).exists() for w in weights):
+        return False, (f"目录存在但没有可识别的权重文件：{p}"
+                       "（应有 model.safetensors / pytorch_model.bin / onnx）")
+    return True, f"本机权重目录可用：{p}"
 
 
 class RerankStep(PipelineStep):

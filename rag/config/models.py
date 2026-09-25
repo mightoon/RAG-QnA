@@ -69,6 +69,13 @@ _MODEL_PARAM_FIELDS: dict[str, tuple[str, ...]] = {
     # 它不是顶层的一个"段"（存储挂在 retrieval 上，见 _sync_rerank_library），
     # 但沿用同一套条目结构与参数表 —— 三个模型库接口才能原样复用
     "rerank": ("model_dir", "device"),
+    # 视觉模型（vlm）刻意**不在条目参数里放 temperature**：
+    # 温度取值范围由服务端与模型声明共同决定（OpenAI 约定 [0,2]，Anthropic 是 [0,1]，
+    # 向量模型干脆不校验），一个越界值会让**整个请求**被 400 拒掉 —— 表现为"图片描述
+    # 全空"，而错误信息指向的参数与被影响的功能看起来毫无关系（实测：配 7.0 时
+    # Qwen3.8 报 temperature must be in [0, 2]，把图片理解整条打掉）。
+    # 所以这一段不给用户填、请求里也不带它，由服务端用默认值 —— 少一个能配错的旋钮。
+    "vlm": (),
     # 文档解析（Doc-Parse）：条目级参数只有「处理能力」一项 —— 它就是 PaddleX
     # 服务上的一个 endpoint 路径（见 DOC_PARSE_CAPABILITIES）。这一段**没有模型ID**：
     # 一台 PaddleX 服务按能力拆成不同 endpoint，没有"调用哪个模型"这种选择，
@@ -410,13 +417,16 @@ class LLMConfig(BaseModel):
 class VLMConfig(BaseModel):
     """视觉模型（VLM）：图片理解用的多模态对话模型
 
-    与 LLMConfig 同构，不是复制粘贴的巧合 —— 它就是一个 OpenAI 兼容的对话服务
-    （vLLM 上的 Qwen2-VL、线上 qwen-vl-max…），只是消息里能带图。因此模型库、
-    「测试模型」、写入 YAML 全都复用同一套机制（见 _sync_model_library）。
-    现状说明：本段眼下只做"配置 + 模型库"（可测通、可存多套、可切 active），
-    运行期还没有消费者 —— 入库时的图片描述仍走 llm 段（ingest_parse 的
-    VLMCaptionStep 拿 services.llm 发带图消息）。所以要接上它，改动点就一处：
-    容器按本段建一个适配器，那一步改读它。在此之前这块库配了不影响任何链路。
+    与 LLMConfig 同构 —— 它就是一个 OpenAI 兼容的对话服务（vLLM 上的 Qwen-VL、
+    线上 qwen-vl-max…），只是消息里能带图。模型库、「测试模型」、写入 YAML 全都
+    复用同一套机制（见 _sync_model_library）。入库时的图片描述走这一段
+    （ingest_parse 的 VLMCaptionStep 读 services.vlm）。
+
+    **没有 temperature**（与 LLMConfig 的关键差异）：温度范围由服务端/模型声明决定
+    （OpenAI 约定 [0,2]，Anthropic 是 [0,1]），越界值会让整个带图请求被 400 拒掉，
+    而我们无法替用户判断某个视觉模型的确切区间。实测教训：这里曾配 7.0（值看着像
+    "稳妥的温度"），Qwen3.8 直接报 `temperature must be in [0, 2]`，图片理解整条
+    静默失效。所以这一段既不暴露该参数、请求里也不发送它，交给服务端默认值。
     """
     adapter: str = "openai_compatible"
     # 显示名：同 LLMConfig.display_name（视觉模型与主模型常是两套服务，卡片标题
@@ -425,13 +435,16 @@ class VLMConfig(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model: str = ""
-    temperature: float = 0.3
     max_tokens: int = 2048
     timeout: float = 60.0
     max_concurrency: int = 8
     # 模型库与当前生效的那一条（语义同 LLMConfig，见 _sync_model_library）
     models: list[ModelEntry] = Field(default_factory=list)
     active_id: str = ""
+
+    # 注：存量 YAML 里可能还留着 temperature（例如那个把图片理解打掉的 7.0）。
+    # pydantic 默认忽略未知字段 —— 本段没有该属性，所以请求侧也读不到它，
+    # 自然不会被发出去（见 llm._safe_temperature）。不需要额外兼容代码。
 
     @model_validator(mode="after")
     def _sync_library(self):
@@ -490,6 +503,14 @@ class DocParseConfig(BaseModel):
     api_key: str = ""                   # 保留仅为镜像口径；界面上不展示
     model: str = ""                     # 本段没有模型ID，恒为空
     capability: str = DOC_PARSE_DEFAULT_CAPABILITY
+    # 单次请求最多送几页 PDF。10 = PaddleX serving `max_num_input_imgs` 的默认值：
+    # **超过它的页会被服务端静默丢掉**（HTTP 仍是 200），所以客户端按这个值分批送，
+    # 并把"某个批次返回条数不足"当作截断信号做二分重试（见 doc_parse._pdf_batches）。
+    # 客户把服务端的上限调大后，这里也可以调大以减少请求数。
+    max_pages_per_request: int = 10
+    # 版面引擎的实现名 → 决定 rag/adapters/layout.py 用哪个 LayoutAdapter。
+    # 新增引擎时在 _ADAPTERS 注册并在这里填名字即可（**不需要改解析器/步骤**）。
+    layout_engine: str = "paddlex"
     # 模型库与当前生效的那一条（语义同 LLMConfig，见 _sync_model_library）
     models: list[ModelEntry] = Field(default_factory=list)
     active_id: str = ""

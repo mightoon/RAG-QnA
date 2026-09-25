@@ -184,7 +184,12 @@ class FaithfulnessStep(PipelineStep):
                 "content": "评估回答对给定资料的忠实度，只输出 0 到 1 的小数"
                            "（1=完全有据可依，0=完全无据）。\n\n"
                            f"资料：\n{context[:3000]}\n\n回答：\n{ctx.answer[:2000]}"}],
-                task="rewrite", temperature=0.0, max_tokens=10)
+                task="rewrite", temperature=0.0,
+                # 10 这个值是按"非推理模型只需要吐一个小数"估的：推理模型会先把
+                # 额度花在思考上，正文为空 → 这里永远拿到 None → 忠实度恒为 1.0，
+                # 自评/二轮检索静默失效。512 对"输出一个小数"足够，且适配器在
+                # 识别到推理端点后会再加一份思考额度。
+                max_tokens=512)
             m = re.search(r"[01](?:\.\d+)?", out)
             return float(m.group(0)) if m else 1.0
         except Exception:

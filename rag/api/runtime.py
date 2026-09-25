@@ -19,7 +19,7 @@ from rag.container import (
     RECOVER_INTERVAL_SEC, SECTION_ADAPTERS, SECTION_DEGRADED_KEYS,
     ServiceContainer,
 )
-from rag.observability.logging import get_logger
+from rag.observability.logging import configure_logging, get_logger
 
 log = get_logger("rag.runtime")
 
@@ -168,6 +168,10 @@ async def rebuild_container(app) -> dict:
     await stop_background(app, old)
     app.state.container = new_c
     await start_background(app, new_c)
+    # 日志的级别/格式也按新配置**立即生效**（不必重启进程）：
+    # 配置页里 observability.log_level 改了以后，用户期望马上不再刷 debug 行。
+    configure_logging(new_config.observability.log_level,
+                      new_config.observability.log_json)
     log.info("container_rebuilt", degraded=list(new_c.degraded),
              path=str(cfg_path))
     return {"degraded": dict(new_c.degraded)}

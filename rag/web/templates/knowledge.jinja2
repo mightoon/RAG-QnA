@@ -1,7 +1,8 @@
 {% extends "base.jinja2" %}
 {% block title %}知识库管理 - IQA{% endblock %}
 {% block head_extra %}
-<script>window.__ROLES__ = {{ (roleOptions if roleOptions is defined else []) | tojson }};</script>
+<script>window.__ROLES__ = {{ (roleOptions if roleOptions is defined else []) | tojson }};
+window.__MAX_UPLOAD_MB__ = {{ (maxUploadMb if maxUploadMb is defined else 0) | tojson }};</script>
 {% endblock %}
 
 {% block content %}
@@ -20,10 +21,11 @@
 
   <div class="upload-actions">
     <button class="btn btn-primary" id="btn-upload">上传文档</button>
-    <span class="upload-hint">支持 PDF / Word / TXT / MD / CSV / 图片，可拖拽批量上传</span>
+    <button class="btn btn-ghost" id="btn-upload-dir">上传文件夹</button>
+    <span class="upload-hint">支持 PDF / Word / Excel / PPT / TXT / MD / CSV / 图片，可拖拽文件或文件夹批量上传</span>
     <span class="upload-hint" id="queue-hint"></span>
   </div>
-  <div class="drop-zone hidden" id="drop-zone">拖拽文件到此处上传</div>
+  <div class="drop-zone hidden" id="drop-zone">拖拽文件或文件夹到此处上传</div>
   <div class="staging-list" id="staging-list"></div>
   <div class="roles-field hidden" id="roles-field"></div>
 
@@ -39,14 +41,18 @@
         <option value="">全部集合</option>
         {% for c in collections | default([]) %}<option value="{{ c.name }}">{{ c.displayName }}</option>{% endfor %}
       </select>
+      {# 选项值必须是后端真实存在的 IngestStatus（rag/models.py）。
+         历史缺陷：这里写的是 queued / indexing —— 后端从不产生这两个值，
+         选中后 `IngestStatus(value)` 抛 ValueError → 后端把筛选**当成没传**
+         （st=None）→ "排队中/索引中"筛出来的是全部文档，而界面看不出任何异常。
+         中间态（parsing/chunking/embedding/writing）只在任务行上，文档行只在
+         pending 与 done/partial 之间，所以这里只放文档行真会出现的值。 #}
       <select class="form-select" id="doc-status-filter" style="width:150px">
         <option value="">全部状态</option>
         <option value="done">已完成</option>
-        <option value="failed">失败</option>
         <option value="partial">部分完成</option>
-        <option value="queued">排队中</option>
-        <option value="parsing">解析中</option>
-        <option value="indexing">索引中</option>
+        <option value="failed">失败</option>
+        <option value="pending">排队中</option>
       </select>
       <input class="form-input" id="doc-search" placeholder="搜索文件名…" style="width:220px">
     </div>
@@ -71,7 +77,20 @@
   </div>
 
   <div data-tab-panel="trash" class="hidden">
-    <div class="trash-banner">回收站中的文档不参与检索；可恢复或永久删除。</div>
+    {# 回收站语义（两段式删除）：
+       列表里的「删除」= 移入本页（可恢复，不动任何库）；
+       在本页**勾选**后点「彻底删除」才真的清向量库/全文索引/图谱/对象存储/元数据。
+       回收站中的文档不参与检索：元数据前置过滤只放 status IN ('done','partial')
+       的文档（meta_mysql.query_chunk_ids），它们的块拿不到白名单。 #}
+    <div class="trash-banner">回收站中的文档不参与检索；内容仍在各库中保存，可随时恢复。
+      勾选后再点「彻底删除」，才会清除向量库、全文索引、图谱、对象存储与元数据。</div>
+    <div class="trash-toolbar" id="trash-toolbar">
+      <span class="sel-count" id="trash-sel-count">已选 <b>0</b> 项</span>
+      <button class="btn btn-secondary btn-sm" id="btn-trash-restore" disabled
+              title="把选中的文档放回列表，状态还原成删除前的状态">恢复</button>
+      <button class="btn btn-danger btn-sm" id="btn-trash-purge" disabled
+              title="清除选中文档在五个数据库中的全部内容，不可恢复">彻底删除</button>
+    </div>
     <div data-piece="trash_tab">{% include "partials/knowledge/trash_tab.jinja2" %}</div>
   </div>
 </div>

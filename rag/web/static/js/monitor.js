@@ -288,11 +288,12 @@
     // 无话可说时返回空串，连 ⓘ 一起省掉（空 ⓘ 只会让人白悬停一次）。
     var parts = [];
     if (s.modelTitle) parts.push(s.modelTitle);
-    // "配置的注册名 ≠ 运行名"：LLM / 向量模型由 modelTitle 讲（它说的是模型，
-    // 比协议名更贴用户要找的答案，别把 openai_compatible 又搬回来）；其余组件
-    // 在这里补 —— 向量库降级成 memory 时，用户要确认的正是"我配的 milvus 还在
-    // 不在配置里"，这一句是唯一能回答它的地方。
-    if (s.key !== 'llm' && s.key !== 'embedding' && s.configuredAdapter
+    // "配置的注册名 ≠ 运行名"：模型类各行（llm / 多模态 / 向量模型）由 modelTitle
+    // 讲（它说的是模型，比协议名更贴用户要找的答案，别把 openai_compatible 又搬
+    // 回来）；其余组件在这里补 —— 向量库降级成 memory 时，用户要确认的正是"我配的
+    // milvus 还在不在配置里"，这一句是唯一能回答它的地方。
+    var modelRows = ['llm', 'vlm', 'embedding'];
+    if (modelRows.indexOf(s.key) < 0 && s.configuredAdapter
         && s.configuredAdapter !== s.adapter) {
       parts.push('配置注册名为 ' + s.configuredAdapter
         + '，当前实际运行 ' + s.adapter);

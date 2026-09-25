@@ -9,9 +9,9 @@
       {% for t in d.tasks %}
       <tr data-task-id="{{ t.task_id }}">
         <td><div class="doc-title-main">{{ t.filename or t.task_id }}</div>
-            <div class="doc-title-sub">{% if t.error %}<span class="text-error">{{ t.error[:80] }}</span>{% endif %}</div></td>
+            <div class="doc-title-sub">{% if t.error %}<span class="text-error">{{ t.error[:80] }}</span>{% elif t.dedup %}<span class="text-muted">⚡ {{ t.note }}</span>{% endif %}</div></td>
         <td>{{ t.collection }}</td>
-        <td>{{ status_badge(t.status) }}</td>
+        <td>{{ status_badge(t.status) }}{% if t.dedup %} <span class="badge badge-muted">秒传</span>{% endif %}</td>
         <td>{{ t.stage or '—' }}</td>
         <td>{{ (t.created_at or '')[:16].replace('T', ' ') }}</td>
         <td>{% if t.status in ('failed', 'partial') %}

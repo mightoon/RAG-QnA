@@ -87,6 +87,29 @@ window.API = (function () {
     delete: function (p, o) { return request('DELETE', p, o); },
     upload: function (p, formData, o) {
       return request('POST', p, Object.assign({ body: formData, timeout: 120000 }, o));
+    },
+    /* 下载文件：**必须走带 Token 的 fetch**，不能靠 <a href>。
+       历史缺陷：列表里的「下载」用的是 document.createElement('a') + href，
+       浏览器导航不携带 Authorization 头 → 后端 401 → "点了没反应/下载失败"；
+       而且它指向的是**在线预览**端点（对 PDF 直接 415），本就下不了原文件。
+       这里统一用 fetch 取回二进制，再交给浏览器保存，文件名优先取服务端
+       Content-Disposition 里的（中文名走 filename*，比前端猜的准）。 */
+    download: async function (path, fallbackName) {
+      var resp = await request('GET', path, { raw: true, timeout: 300000 });
+      var blob = await resp.blob();
+      var name = fallbackName || 'download';
+      var cd = resp.headers.get('content-disposition') || '';
+      var m = /filename\*=UTF-8''([^;]+)/i.exec(cd) || /filename="?([^";]+)"?/i.exec(cd);
+      if (m) { try { name = decodeURIComponent(m[1]); } catch (e) { name = m[1]; } }
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      return name;
     }
   };
 })();

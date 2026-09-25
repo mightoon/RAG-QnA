@@ -230,13 +230,15 @@ class ElasticsearchFTS(FullTextSearchAdapter):
 
     async def upsert_chunks(self, index: str, chunks: list[ChunkMeta],
                             texts: list[str], summaries: list[str | None],
-                            keywords: list[list[str]]) -> None:
+                            keywords: list[list[str]],
+                            doc: dict | None = None) -> None:
         full = self._index(index)
         await self.ensure_index(index)
+        doc = doc or {}
         actions: list[dict] = []
         for c, text, summary, kws in zip(chunks, texts, summaries, keywords):
             actions.append({"index": {"_index": full, "_id": c.chunk_id}})
-            actions.append({
+            body = {
                 "chunk_id": c.chunk_id, "doc_id": c.doc_id,
                 "tenant_id": c.tenant_id, "collection": c.collection,
                 "chunk_type": c.chunk_type,
@@ -247,13 +249,66 @@ class ElasticsearchFTS(FullTextSearchAdapter):
                 "figure_caption": c.figure_caption or "",
                 "allowed_roles": c.allowed_roles or [],
                 "quality_score": c.quality_score,
-            })
+            }
+            # 文档级字段：mapping 里声明了，但 ChunkMeta 不携带（见 base 契约）。
+            # `filename` 缺失会让 BM25 单独召回的引用没有文件名；`created_at` 缺失
+            # 会让"按时间字段筛选"的 Kibana 视图（数据视图的时间字段通常就选它）
+            # 一条都查不到 —— 看起来就像"ES 里没有内容"。
+            for k in ("filename", "file_type", "created_at"):
+                v = doc.get(k)
+                if v:
+                    body[k] = v
+            actions.append(body)
         if actions:
             resp = await self._client.bulk(operations=actions, refresh="wait_for")
             if resp.get("errors"):
-                from rag.observability.logging import get_logger
-                get_logger("rag.es").warning("es_bulk_partial_error",
-                                             items=len(resp.get("items", [])))
+                # 部分失败必须**当成失败**：原实现只打一条 warning，于是文档仍然
+                # 是 done、质量报告里一个字都不提，表现为"悄悄少了几块"。
+                # 抛出去交给 WriteStep 记成 es_write_failed（文档转 partial）。
+                bad = []
+                for item in (resp.get("items") or []):
+                    for op, res in (item or {}).items():
+                        if isinstance(res, dict) and res.get("error"):
+                            bad.append(f"{res.get('_id')}: "
+                                       f"{str(res['error'].get('reason') or res['error'])[:120]}")
+                msg = (f"ES 批量写入部分失败：{len(bad)}/{len(chunks)} 条，"
+                       f"示例 {bad[:2]}" if bad else
+                       f"ES 批量写入返回 errors=true（{len(chunks)} 条，"
+                       f"未解析出具体原因）")
+                raise RuntimeError(msg)
+            log.debug("es_bulk_done", index=full, count=len(chunks))
+
+    async def get_doc_enrichment(self, index: str,
+                                 doc_id: str) -> dict[str, dict]:
+        """取该文档现有块的摘要/关键词（补写时保留，见 base 契约）"""
+        full = self._index(index)
+        try:
+            resp = await self._client.search(
+                index=full, size=10000, query={"term": {"doc_id": doc_id}},
+                _source=["chunk_id", "summary", "keywords"])
+        except Exception as e:                    # 索引不存在等：当作没有
+            log.warning("es_enrichment_read_failed", index=full,
+                        doc_id=doc_id, error=_err_text(e))
+            return {}
+        out: dict[str, dict] = {}
+        for h in resp["hits"]["hits"]:
+            s = h.get("_source") or {}
+            cid = s.get("chunk_id") or h.get("_id")
+            out[cid] = {"summary": s.get("summary") or None,
+                        "keywords": list(s.get("keywords") or [])}
+        return out
+
+    async def delete_by_ids(self, index: str, chunk_ids: list[str]) -> int:
+        """按 chunk_id 批量删除（重跑清理旧块用）"""
+        ids = [c for c in (chunk_ids or []) if c]
+        if not ids:
+            return 0
+        full = self._index(index)
+        resp = await self._client.delete_by_query(
+            index=full, query={"terms": {"chunk_id": ids}},
+            refresh=True, conflicts="proceed",
+        )
+        return int(resp.get("deleted", 0))
 
     def _base_filter(self, filter: dict | None) -> list[dict]:
         must: list[dict] = []

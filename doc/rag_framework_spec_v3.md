@@ -1044,6 +1044,43 @@ class FullTextSearchAdapter(ABC):
     async def health_check(self) -> bool: ...
 ```
 
+**实现口径补充（与设计接口的差异，代码为准）**：实现里的写入口是
+`upsert_chunks(index, chunks, texts, summaries, keywords, doc=None)`（`rag/adapters/fulltext.py`），
+与设计接口 `index(...)` 的差别与约束：
+
+- **文档级字段必须由调用方带进来**：`filename / file_type / created_at` 在 mapping 里
+  声明了，但每个 `ChunkMeta` 都不携带 → 由 `doc={...}` 传入并写进每个 chunk 文档。
+  漏写的后果有二：BM25 单独召回的引用没有文件名；Kibana 数据视图若把时间字段
+  设为 `created_at`，Discover 会因"字段不存在"而一条都查不到（看起来像"ES 里没有内容"）。
+- **批量部分失败必须当失败**：`bulk` 返回 `errors=true` 时抛异常（由 WriteStep 记成
+  `es_write_failed`，文档转 `partial`）。只打一条 warning 会让"悄悄少了几块"既不改状态
+  也不进质量报告。
+- **`delete_by_ids(index, chunk_ids)`**：重跑清理旧块用（返回删除条数）。
+- **`get_doc_enrichment(index, doc_id)`**：取回该文档各块的 `summary/keywords`，
+  供一致性巡检补写时**保留**已有增强字段（MySQL 没有这两列，补写传空值等于永久抹掉）。
+
+**LLM 适配器的实现口径补充（`rag/adapters/llm.py`）**——文档解析/摘要这些"要求模型
+回结构化内容"的场景都依赖它，实测踩过坑，写在这里备查：
+
+- 接口比设计多一个 `response_format: dict | None`：传 `{"type": "json_object"}`
+  让服务端保证 `content` 是合法 JSON。**靠 prompt 求模型吐 JSON 在推理模型上不可靠**
+  —— 思考会先把 `max_tokens` 吃光。服务端不支持该参数（400）时会**端点级记住并去掉
+  后重试**（只告警一次），不让一个格式增强把功能打掉。
+- **思考文本（`reasoning_content`）绝不当回复正文返回**：`content` 为空就返回空串，
+  并在 `llm_empty_reply` 里带上 `reasoning_chars` / `finish_reason`。把思考当答案会让
+  下游写入错误数据（摘要、图片描述变成模型的自我独白），日志归因也会完全跑偏。
+- 调用方要按**预算阶梯**重试而不是同预算重试：失败几乎都是"思考吃满额度、答案还没
+  开始写"，同预算重试只会再被吃光一次（增强步骤的阶梯见 `doc/data_path.md` §8.3）。
+- 多一个 `thinking: bool | None` 参数（**内部参数，不作为配置项暴露**）：`False` = 别思考。
+  内置策略按任务定 —— 摘要/抽取/分类/评估/看图描述这类**短且结构化**的任务关掉思考
+  （实测同一块关掉后快 4 倍，且从"正文为空"变成稳定拿到 JSON），开放式作答保留思考。
+  这个取舍由框架定：配置页不出现该开关、YAML 也没有对应字段。
+  **关闭写法随服务端而异，实现必须逐招探测并缓存**：DeepSeek/Anthropic 系
+  `thinking.type=disabled`、OpenAI 系 `reasoning_effort=none`、自托管 vLLM/SGLang
+  `chat_template_kwargs.enable_thinking=false`；网关不认（400）或仍然返回
+  `reasoning_content` 就换下一招，全都无效时记一次结论并退回预算阶梯兜底
+  （详见 `doc/data_path.md` §8.24）。
+
 ### 5.6 文档解析适配器
 
 ```python
@@ -5809,9 +5846,11 @@ MinIO（原文件）→ MySQL（元数据，建立 chunk_id 与文档的关联�
 
 **主要方法**：
 - `upsert_document` / `update_doc_status` / `list_documents`
-- `upsert_chunks` — 批量 upsert，500 条一批
+- `upsert_chunks` — 批量 upsert（`INSERT ... ON DUPLICATE KEY UPDATE` + 单独的正文 UPDATE），500 条一批
 - `query_chunk_ids` — 元数据过滤查询，返回 chunk_id 列表（限 50000 条）
-- `upsert_table_data` — 表格结构化数据写入
+- `upsert_table_data` — 表格结构化数据写入。**语义是"按 doc 整体替换"**（同一事务内先删该 doc 的旧行再插入）：`table_data` 没有可用的自然唯一键（`table_index` 在 Excel 分支里是 200 行切片的编号、会重复；`chunk_id` 在表格块未生成时为空串），没有唯一键就无法 upsert，重跑会叠加出重复行
+- `delete_chunks(chunk_ids)` — 按 chunk_id 批量删除块元数据（重跑时清理"上次留下、这次没再产出"的旧块）
+- `delete_document` — 删文档；**必须同时删 `table_data`**（该表没有外键、无法级联）
 - `save_task` / `find_by_md5` / `find_incomplete_tasks` — 任务管理
 - `list_chunk_ids(doc_id)` — 一致性巡检辅助
 
@@ -5843,6 +5882,8 @@ MinIO（原文件）→ MySQL（元数据，建立 chunk_id 与文档的关联�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v1/ingest/upload` | 文件上传，返回 storage_url（最大 500MB） |
+| POST | `/api/v1/ingest/upload/confirm` | 确认"内容已入库过"的重复文件如何处理（覆盖重跑 / 新建 / 跳过） |
+| POST | `/api/v1/ingest/upload/discard` | 放弃本次待确认的上传（清临时文件，零写入） |
 | POST | `/api/v1/ingest/server-path` | 指定服务器路径批量入库（需配置 server_ingest_root） |
 | GET  | `/api/v1/ingest/tasks` | 任务列表，支持状态/collection 过滤和分页 |
 | GET  | `/api/v1/ingest/tasks/{id}/progress` | SSE 实时进度流 |
@@ -5850,6 +5891,38 @@ MinIO（原文件）→ MySQL（元数据，建立 chunk_id 与文档的关联�
 | GET  | `/api/v1/ingest/quality/{doc_id}` | 文档质量报告 |
 | POST | `/api/v1/ingest/ephemeral` | 对话框内临时文档上传 |
 | GET  | `/api/v1/ingest/ephemeral/{session_id}` | 列出 Session 中的临时文档 |
+
+**重复上传的确认闸门**（实现口径，详见 `doc/data_path.md` §3.1.1）：上传接口以
+**内容 MD5** 判定"同一份文件"（文件名/作者/时间等属性不参与），若该集合里已存在
+同内容文档，默认（`duplicate_action=ask`）**不写任何库**，返回
+
+```json
+{"batch_id": "...", "tasks": [...], "duplicates": [
+   {"md5": "...", "filename": "本次文件名", "doc_id": "物理文档 id",
+    "alias_doc_id": "若命中的是秒传别名", "existing_filename": "...",
+    "chunk_count": 66, "page_count": 22, "version": 1,
+    "uploaded_at": "...", "same_roles": true, "engine_changed": true}],
+ "staging_token": "...", "expires_in": 1800}
+```
+
+由前端弹框让用户选择：`reingest`（覆盖原文档、沿用原 `doc_id`、按本次角色更新、
+版本号 +1）、`new`（作为新文档入库，同内容会有两套块）、`skip`。未给出决定的
+文件按 `skip` 处理；暂存 30 分钟超时、`staging_token` 一次性。
+服务器路径导入与临时文档走 `duplicate_action=auto`（无人交互，命中秒传直接复用）。
+
+**删除采用两段式**（实现口径，详见 `doc/data_path.md` §8.27 与 `doc/ui_spec_v3.md` §7.1）：
+列表里的「删除」是**移入回收站**（可恢复、不动任何库），回收站里**勾选**后
+「彻底删除」才落到五个存储上 —— 误点一次的代价从"索引不可恢复"降到"点一次恢复"。
+
+| 方法 | 路径（实现路径） | 说明 |
+|---|---|---|
+| DELETE | `/api/documents/{doc_id}` | **移入回收站**：`status='deleted'` + `deleted_at` + `prev_status`；块/向量/索引/原文件一概不动；处理中的文档 409 |
+| POST | `/api/documents/{doc_id}/restore`、`/api/documents/restore` | 恢复（单篇 / 批量）：状态还原成 `prev_status`（老数据按有无块兜底） |
+| DELETE | `/api/documents/{doc_id}/permanent` | 彻底删除单篇：清五个存储（回收站里的行内按钮用） |
+| POST | `/api/documents/purge` | **批量彻底删除**（body `{"doc_ids":[…]}`）：只允许回收站里的行；逐个清库、单库失败不阻断其余库 |
+
+回收站文档不参与检索是**免费的**：元数据前置过滤只放 `status IN ('done','partial')`
+的文档，它们拿不到 `chunk_id` 白名单。
 
 ### 22.10 配置系统 V2 新增字段（追加到 TenantConfig）
 

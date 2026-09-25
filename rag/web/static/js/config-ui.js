@@ -313,6 +313,15 @@
     verify_certs: '证书仅对 https 地址生效',
   };
 
+  /* 数值字段的取值范围提示（按字段名）—— 摆在输入框下方一行。
+     温度为什么要写范围：范围由服务端与模型共同决定（OpenAI 约定 0-2，DeepSeek 官方
+     文档也是 <=2；但 Anthropic 是 0-1，向量模型不校验），填一个越界值会让**整个请求**
+     被 400 拒掉 —— 界面上只写"小数"等于把这条约束藏起来，用户很自然会填 7 这种
+     "看着稳妥"的值，然后整条功能静默失效（实测踩过）。 */
+  const NUM_FIELD_HINTS = {
+    temperature: '范围 0-2，保留一位小数',
+  };
+
   /* 改这些字段不必重测模型：它们不参与"连得上吗、这个模型能用吗" ——
      模型名只是卡片上的标识，温度 / 最大 Token 是生成参数，向量维度 / 查询前缀是
      检索侧的用法。改完直接可存，否则用户只想调个温度却被逼着再打一次模型。
@@ -663,11 +672,14 @@
     const empty = el('div', 'model-lib-empty');
     empty.appendChild(el('div', null, '还没有已测通的模型：点下面卡片里的 + 开始配置'));
     /* 这一段没有模型ID（见后端 _MODEL_SECTION_UI_FLAGS）：指向「获取模型ID」的
-       指引就成了死路，改说该填的三样 —— 测试探的是服务的 /health */
+       指引就成了死路，改说该填的三样。测试口径是「打真实能力端点 + 校验响应
+       字段根名」——只探 /health 会把"产线选错"测成绿色（PaddleX 一个实例只挂
+       一条产线，能力选错时 /health 照样 200，入库才 404） */
     empty.appendChild(el('div', 'form-hint',
       g.noModelId
         ? '在弹窗里填好「模型名」「API 地址」并选好「处理能力」'
-          + ' → 点「测试模型」（测服务的 /health）→ 通过后点「存入模型库」'
+          + ' → 点「测试模型」（会真调该能力的端点并校验响应，能当场发现'
+          + '「处理能力」与服务的 --pipeline 不一致）→ 通过后点「存入模型库」'
         : '在弹窗里填好参数（模型ID 可点「获取模型ID」从服务端列表里选）'
           + ' → 点「测试模型」→ 通过回应后点「存入模型库」'));
     return empty;
@@ -1512,7 +1524,15 @@
       let initial = p.value;       // 框里先摆的值（凭据行可能是圆点占位）
       if (p.type === 'int' || p.type === 'float') {
         opts.type = 'number';
+        // 数值字段的占位/提示按字段名给（见 NUM_FIELD_HINTS）；没有专门说明的
+        // 保留原来的通用占位
         if (p.type === 'float') opts.placeholder = '小数';
+        if (p.key === 'temperature') {
+          opts.placeholder = '0-2，如 0.5';
+          opts.step = '0.1';
+          opts.min = '0';
+          opts.max = '2';
+        }
       }
       if (p.secret) {
         // 凭据一律用密码框：画出来都是圆点，但框里的**值**分两种（见 routes._param_row）
@@ -1577,6 +1597,11 @@
       rows.appendChild(kvRow(p.label || p.key, input,
         p.key === 'model' || p.key === 'display_name' || p.key === 'model_dir',
         p.optional));
+      // 取值范围的说明另起一行（见 NUM_FIELD_HINTS）：塞进 placeholder 会被输入的
+      // 值顶掉，塞进 ⓘ 又够不到"填多少才对"这种当场决策
+      if (NUM_FIELD_HINTS[p.key]) {
+        rows.appendChild(hintLine(NUM_FIELD_HINTS[p.key]));
+      }
     });
     injectEndpoint();   // 没有"模型名"的卡片：地址行退回最前
     // paramsJson → JSON 编辑框

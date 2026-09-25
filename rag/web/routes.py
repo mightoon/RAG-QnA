@@ -16,7 +16,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                Response)
 from fastapi.staticfiles import StaticFiles
@@ -38,7 +38,7 @@ from rag.container import (
     RECOVER_INTERVAL_SEC, RECOVERABLE_SECTIONS, SECTION_DEGRADED_KEYS,
     ServiceContainer,
 )
-from rag.models import IngestStatus, UserContext
+from rag.models import ACTIVE_TASK_STATUSES, IngestStatus, UserContext
 from rag.observability.logging import get_logger
 
 log = get_logger("rag.web")
@@ -231,6 +231,9 @@ _DEGRADED_KEY = {
     "graph": "knowledge_graph", "knowledge_graph": "knowledge_graph",
     "business": "business_data", "business_data": "business_data",
     "redis": "redis", "storage": "storage", "fulltext": "fulltext",
+    # 视觉模型与 llm 共用注册类型，但降级键是它自己的：容器写 degraded["vlm"]，
+    # 「测试模型」按钮回传的 kind 也是 "vlm"，两边必须对上才不会各说各话
+    "vlm": "vlm",
 }
 
 # 模型域：UI 分组键（= YAML 键）→ (中文名, 可编辑扁平参数)
@@ -253,8 +256,13 @@ _MODEL_SECTIONS = (
     # YAML 全部自动继承（见 models.ModelEntry 与 _write_model_section 的通用分支）。
     # 界面上它与 llm **共用右侧那一份表单**（标题写「大模型」），两块库上下叠着：
     # 点哪一块的卡片就是在编哪一段（见 config-ui.js 的 SHARED_FORM_LIBS）
+    #
+    # **没有 temperature**（与 llm 的唯一字段差异）：温度合法区间由服务端与模型声明
+    # 共同决定，我们无法替用户判断某个视觉模型的确切区间，而越界值会让整个带图请求
+    # 被 400 拒掉 → 图片理解整条静默失效（实测配 7.0 踩过）。所以这一段不给填、
+    # 请求里也不发（见 adapters/llm._safe_temperature 返回 None 的分支）。
     ("vlm", "VLM 视觉模型",
-     ("display_name", "api_key", "model", "temperature", "max_tokens")),
+     ("display_name", "api_key", "model", "max_tokens")),
     ("embedding", "向量模型 (Embedding)",
      ("display_name", "api_key", "model", "dim", "query_prefix")),
     # 文档解析（Doc-Parse）：一台 PaddleX 服务 + 一项处理能力。
@@ -982,6 +990,9 @@ async def knowledge_page(request: Request, collection: str | None = None,
         "focusDocId": docId or "",
         "ephemeralTtlHours": c.config.ephemeral.ttl_hours,
         "roleOptions": _role_views(c),
+        # 后端按**整批**校验 max_upload_mb；目录上传动辄几百个文件，前端必须
+        # 按同一个上限分批（写死 100MB 时，把上限调到 50MB 就会整批 400）。
+        "maxUploadMb": c.config.max_upload_mb,
         "queue": {"queuedTasks": queued, "queueDepthLimit": depth,
                   "queueFull": bool(depth and queued >= depth)},
     })
@@ -1006,7 +1017,9 @@ async def doc_detail_page(request: Request, doc_id: str,
     if doc is None:
         return RedirectResponse("/knowledge?tab=docs", status_code=302)
     ctx = _base_ctx(request, user, "doc-detail")
-    ctx.update({"doc": _doc_view(doc), "backCollection": collection or ""})
+    live = await _active_status_by_doc(c, user.tenant_id)
+    ctx.update({"doc": _doc_view(doc, live.get(doc.doc_id)),
+                "backCollection": collection or ""})
     return templates.TemplateResponse("doc-detail.jinja2", ctx)
 
 
@@ -1135,8 +1148,21 @@ def _monitor_endpoint(key: str, cfg) -> str:
             return "，".join(cfg.hosts or []) or "—"
         if key == "knowledge_graph":
             return cfg.uri or "—"
-        if key in ("llm", "embedding"):
+        if key in ("llm", "vlm", "embedding"):
             return cfg.base_url or "—"
+        if key == "rerank":
+            # 「模型路径/API」一栏两义共存：目录 = 本机权重，http(s) = 远程重排服务。
+            # 与配置页展示同一份判据（见 models.is_http_url），不另造一套。
+            ref = str(getattr(cfg, "rerank_model_dir", "") or "").strip()
+            return ref or "本机权重（未指定目录）"
+        if key == "doc_parse":
+            # 一个地址通常只承载一项能力（PaddleX 一个实例只挂一条产线），这里报
+            # 库里第一条配了地址的能力；能力明细在 ⓘ 的 modelTitle 里展开。
+            for e in list(getattr(cfg, "models", None) or []):
+                url = str(getattr(e, "base_url", "") or "").strip()
+                if url:
+                    return url
+            return str(getattr(cfg, "base_url", "") or "").strip() or "—"
         if key == "synonym":
             return cfg.url or cfg.file or "—"
         if key == "auth":
@@ -1152,7 +1178,7 @@ def _monitor_endpoint(key: str, cfg) -> str:
 
 # 模型名前面那个名词：与「基础服务」第一列的槽位名对得上，才能一眼看出是"谁的模型"。
 # LLM 行讲的是主模型（改写/摘要另说），向量模型行讲的是 embedding 模型。
-_MODEL_NOUN = {"llm": "主模型 ", "embedding": "向量模型 "}
+_MODEL_NOUN = {"llm": "主模型 ", "vlm": "视觉模型 ", "embedding": "向量模型 "}
 
 
 def _monitor_model(key: str, cfg, runtime: str) -> tuple[str, str]:
@@ -1168,8 +1194,34 @@ def _monitor_model(key: str, cfg, runtime: str) -> tuple[str, str]:
     但「配置了真实模型、此刻跑的却是本地替身」这件事必须说出来 —— 否则
     用户只看到一行 mock，不知道配置里的模型去哪了（见下 local 分支）。
     """
-    if key not in ("llm", "embedding"):
+    if key not in ("llm", "vlm", "embedding", "rerank", "doc_parse"):
         return "", ""
+    # 重排模型：模型名在 retrieval.rerank_model（段是 retrieval，不是独立段）
+    if key == "rerank":
+        model = str(getattr(cfg, "rerank_model", "") or "").strip()
+        local = runtime in _MONITOR_LOCAL_IMPLS
+        if not model:
+            return "", ""
+        device = str(getattr(cfg, "rerank_device", "") or "").strip() or "cpu"
+        ref = str(getattr(cfg, "rerank_model_dir", "") or "").strip()
+        where = "远程重排服务" if is_http_url(ref) else f"本机权重（{ref or '默认目录'}）"
+        if local:
+            return "", (f"重排模型 {model}，当前实际运行 {runtime}"
+                        "（未加载 Cross-Encoder，精排已退化为 RRF 顺序）")
+        return model, f"重排模型 {model} · {where} · 推理设备 {device}"
+    # 文本分析模型：本段没有 model 字段（PaddleX 按 endpoint 区分能力），
+    # 报的是"配了哪几项能力、各在哪个地址"
+    if key == "doc_parse":
+        caps: list[str] = []
+        for e in list(getattr(cfg, "models", None) or []):
+            cap = doc_parse_capability((e.params or {}).get("capability"))
+            label = doc_parse_capability_label(cap)
+            url = str(getattr(e, "base_url", "") or "").strip() or "未填地址"
+            caps.append(f"{label}（{url}）")
+        if not caps:
+            return "", ""
+        short = "、".join(c.split("（")[0] for c in caps)
+        return short, "文本分析能力：" + "；".join(caps)
     model = str(getattr(cfg, "model", "") or "").strip()
     local = runtime in _MONITOR_LOCAL_IMPLS
     if local:
@@ -1192,6 +1244,9 @@ def _monitor_model(key: str, cfg, runtime: str) -> tuple[str, str]:
         if dim:
             title += f" · 输出维度 {dim}（须与向量库 collection 一致）"
         return model, title
+    if key == "vlm":
+        # 视觉模型没有 task 路由（不像 LLM 还分改写/摘要），只报主模型
+        return model, f"视觉模型 {model}"
     # LLM 按 task 路由到三个模型：只报主模型容易被读成"改写/摘要没生效"
     rewrite = str(getattr(cfg, "rewrite_model", "") or "").strip()
     summary = str(getattr(cfg, "summary_model", "") or "").strip()
@@ -1245,6 +1300,94 @@ async def _monitor_probe_redis(c: ServiceContainer) -> dict:
                 "message": redis_failure_reason(e, c.config.redis)}
 
 
+# 这些行的探测**不经适配器注册表**：它们没有独立适配器（重排是 pipeline 内实现、
+# 文本分析是外部 HTTP 能力、视觉模型复用 llm 注册类型），但监控页要按同一套
+# 「真探测 + 原因文案」的规则显示 —— 所以统一在监控层收口，返回 (可用, 原因)。
+_MONITOR_INTERNAL_KEYS = frozenset({"rerank", "doc_parse", "vlm"})
+
+
+class _MonitorRow:
+    """监控行的**判据占位**（不是适配器，不参与运行期链路）
+
+    `_monitor_service_specs` 的最后一格原来是"适配器实例"，用例是 `adapter is None`
+    判断"未初始化/已关闭"。重排与文本分析没有可传的实例，直接传 None 会被判成
+    "未初始化"——这一行就恒红，与它实际是否可用无关。所以传这个占位对象，
+    让判据落到真正的探测函数（`_monitor_probe_internal`）上。
+
+    `adapter` 字段返回空串：它不是配置里写的注册名（配置页也没有 adapter 一栏），
+    前端与 `_row` 会用"配置名"兜底，那正是这里要的效果。
+    """
+
+    def __init__(self, key: str):
+        self.monitor_key = key
+
+    @property
+    def adapter(self) -> str:
+        return ""
+
+
+async def _monitor_probe_internal(c: ServiceContainer, key: str,
+                                  sec) -> dict:
+    """重排 / 文本分析 / 视觉模型三行的探测（口径与「测试模型」一致）"""
+    t0 = time.perf_counter()
+
+    def _done(ok: bool, message: str) -> dict:
+        return {"online": bool(ok), "probe": "live",
+                "latencyMs": round((time.perf_counter() - t0) * 1000, 1),
+                "message": "" if ok else message}
+
+    if key == "doc_parse":
+        ok, message = await _monitor_check_doc_parse(c)
+    elif key == "vlm":
+        reason = c.vlm_ready()
+        if reason:
+            ok, message = False, reason
+        else:
+            ok = True
+            message = ""
+            # 探过一次（含"不支持图片"的否定结论）就不必每轮都打一次远端
+            if getattr(c, "_vision_ok", None) is None:
+                ok, message = await c.probe_vision()
+    else:                                   # rerank
+        enabled = bool(getattr(sec, "enabled", True))
+        if not enabled:
+            return {"online": False, "probe": "static", "latencyMs": None,
+                    "message": "已关闭（检索策略里未启用重排）"}
+        # 延迟导入：query_retrieve 会拉进检索侧的一堆依赖，监控页不该把它变成
+        # 模块级依赖（本页在配置页/登录页也会被 import）
+        from rag.pipeline.steps.query_retrieve import check_reranker
+        ok, message = await check_reranker(sec)
+    return _done(ok, message)
+
+
+async def _monitor_check_doc_parse(c: ServiceContainer) -> tuple[bool, str]:
+    """文本分析模型行：逐能力探真实端点，报「几项可用/共几项」
+
+    只报"至少一项可用"会把半坏的状态说成全好；只报"全好才算好"又会让
+    "配了但只用得上其中一项"的场景一直红着。所以两个数都给，并列出不可用项。
+    """
+    from rag.adapters.doc_parse import doc_parse_available, resolve_base_url
+    cfg = c.config.doc_parse
+    caps: list[str] = []
+    for e in list(getattr(cfg, "models", None) or []):
+        cap = doc_parse_capability((e.params or {}).get("capability"))
+        if cap not in caps and doc_parse_available(cfg, cap):
+            caps.append(cap)
+    if not caps:
+        return False, ("未配置任何文本分析能力（配置页 → 模型 → 文本分析模型）")
+    bad: list[str] = []
+    for cap in caps:
+        ok, reason = await c.probe_doc_parse(cap)
+        if not ok:
+            bad.append(f"{doc_parse_capability_label(cap)}：{reason[:80]}")
+    if bad:
+        return False, f"{len(caps) - len(bad)}/{len(caps)} 项可用；" + "；".join(bad)
+    detail = "、".join(
+        f"{doc_parse_capability_label(cap)}={resolve_base_url(cfg, cap)}"
+        for cap in caps)
+    return True, f"{len(caps)} 项能力全部可用（{detail}）"
+
+
 def _monitor_service_specs(c: ServiceContainer) -> tuple:
     """(监控键, 中文名, 分组, 配置段, 适配器实例) —— 顺序即页面顺序
 
@@ -1252,12 +1395,22 @@ def _monitor_service_specs(c: ServiceContainer) -> tuple:
     按**实际运行**的实现给出，标题再拼一份就是多余的第二口径。槽位名才是这一行
     稳定的身份 —— 底下的实现换成别的产品、或降级成本地替身，标题都还是
     「元数据库」，而 badge 会如实改名。
+
+    「核心依赖」的顺序是**模型服务的调用链顺序**：大语言模型 → 多模态大模型 →
+    向量模型 → 重排模型 → 文本分析模型。元数据库是存储而非模型，归到基础设施。
     """
     cfg = c.config
     return (
-        ("llm", "LLM 大模型", "core", cfg.llm, c.llm),
+        ("llm", "大语言模型", "core", cfg.llm, c.llm),
+        ("vlm", "多模态大模型", "core", cfg.vlm, c.vlm),
         ("embedding", "向量模型", "core", cfg.embedding, c.embedding),
-        ("meta", "元数据库", "core", cfg.meta, c.meta),
+        # 重排与文本分析没有独立适配器（前者是 pipeline 内实现、后者是外部 HTTP
+        # 能力），传 None 会被当成"未初始化"→ 恒红。所以传一个轻量代理，让它们
+        # 与其它行共用同一套探测与状态渲染（见 _monitor_probe_internal）。
+        ("rerank", "重排模型", "core", cfg.retrieval,
+         _MonitorRow("rerank") if cfg.retrieval.rerank_enabled else None),
+        ("doc_parse", "文本分析模型", "core", cfg.doc_parse,
+         _MonitorRow("doc_parse")),
         ("fulltext", "全文检索", "retrieval", cfg.fulltext, c.fulltext),
         ("vector_store", "向量库", "retrieval", cfg.vector_store, c.vector),
         ("knowledge_graph", "知识图谱", "retrieval",
@@ -1265,6 +1418,8 @@ def _monitor_service_specs(c: ServiceContainer) -> tuple:
         ("business_data", "业务数据库", "retrieval",
          cfg.business_data, c.business),
         ("synonym", "同义词表", "retrieval", cfg.synonym, c.synonym),
+        # 元数据库是存储组件：它不属于"模型服务"，放基础设施第一行
+        ("meta", "元数据库", "infra", cfg.meta, c.meta),
         ("storage", "对象存储", "infra", cfg.storage, c.storage),
         ("redis", "缓存", "infra", cfg.redis, c.redis),
         ("auth", "认证服务", "infra", cfg.auth, c.auth),
@@ -1294,6 +1449,8 @@ async def _monitor_snapshot(c: ServiceContainer) -> dict:
                     "message": message}
         if key == "redis":
             result = await _monitor_probe_redis(c)
+        elif key in _MONITOR_INTERNAL_KEYS:
+            result = await _monitor_probe_internal(c, key, sec)
         else:
             result = await _monitor_probe(adapter)
         # 运行期掉线（实例还在、只是探不通）→ 把探测结论写回容器
@@ -1662,6 +1819,32 @@ async def retry_task_alias(task_id: str, request: Request,
     return await retry_task(task_id, request, user)
 
 
+@ui_router.post("/ingest/documents/{doc_id}/reingest")
+async def reingest_document(doc_id: str, request: Request,
+                            user: UserContext = Depends(get_current_user)):
+    """按文档重建索引（前端「重建」按钮，两处调用点都是这个路径）
+
+    与「重试」的区别：重试针对一条失败的**任务**；重建针对一份**文档** ——
+    内容不变但解析链路要重跑（换了版面/OCR 引擎、调了分块参数、上次质量差）。
+    落地在 coordinator.reingest_document：沿用原 doc_id，因此 chunk_id 不变，
+    重复重建是幂等的 upsert 覆盖，不会产生孤儿 chunk。
+    """
+    c = _container(request)
+    doc = await _find_doc(c, doc_id, user)
+    if doc is None:
+        raise HTTPException(404, "文档不存在")
+    if doc.status == IngestStatus.DELETED:
+        # 回收站里的文档不允许直接重解析：入库收尾会把状态写回 done，
+        # 等于"绕过恢复流程"把文档偷偷拉回列表。要重跑先恢复。
+        raise HTTPException(409, "文档在回收站中，请先恢复再重解析")
+    task = await c.ingest_coordinator.reingest_document(
+        doc.doc_id, doc.tenant_id, user.user_id)
+    if task is None:
+        raise HTTPException(
+            400, "重建失败：原文件不可得（对象存储中已无该文档），请重新上传")
+    return {"ok": True, "task_id": task.task_id, "doc_id": doc.doc_id}
+
+
 @ui_router.get("/documents/{doc_id}/chunks")
 async def list_doc_chunks(doc_id: str, request: Request, page: int = 1,
                           size: int = 12,
@@ -1735,38 +1918,178 @@ async def doc_content(doc_id: str, request: Request,
 @ui_router.post("/documents/{doc_id}/restore")
 async def restore_document(doc_id: str, request: Request,
                            user: UserContext = Depends(require_admin)):
+    """从回收站恢复：状态还原成**删除前**的状态（见 meta.restore_document）
+
+    历史缺陷：这里原来无条件写 `IngestStatus.DONE`。一篇 `partial`（部分库没写进去）
+    或 `failed` 的文档只要"删一次再恢复"，就变成"已完成" —— 状态筛选与质量视图
+    当场失真。现在按 documents.prev_status 还原，老数据按有无块兜底。
+    """
     c = _container(request)
     doc = await c.meta.get_document(doc_id, user.tenant_id)
     if doc is None:
         raise HTTPException(404, "文档不存在")
-    await c.meta.update_doc_status(doc_id, IngestStatus.DONE)
-    return {"ok": True, "status": "done"}
+    back = await c.meta.restore_document(doc_id, user.tenant_id)
+    log.info("doc_restored", doc_id=doc_id, to=back)
+    return {"ok": True, "status": back or "done",
+            "restoredTo": back or "done"}
+
+
+@ui_router.post("/documents/restore")
+async def restore_documents(request: Request,
+                            doc_ids: list[str] = Body(..., embed=True),
+                            user: UserContext = Depends(require_admin)):
+    """批量恢复（回收站里勾选多篇后一次恢复）"""
+    c = _container(request)
+    restored: list[str] = []
+    failed: list[dict] = []
+    for did in list(dict.fromkeys(doc_ids or [])):
+        try:
+            if await c.meta.restore_document(did, user.tenant_id) is None:
+                failed.append({"doc_id": did, "error": "文档不存在"})
+            else:
+                restored.append(did)
+        except Exception as e:                          # noqa: BLE001
+            failed.append({"doc_id": did, "error": f"{type(e).__name__}: {e}"[:200]})
+    log.info("docs_restored", count=len(restored), failed=len(failed))
+    return {"ok": not failed, "restored": restored, "failed": failed}
 
 
 @ui_router.delete("/documents/{doc_id}/permanent")
 async def permanent_delete_document(doc_id: str, request: Request,
                                     user: UserContext = Depends(require_admin)):
+    """彻底删除**单篇**：清掉该文档在五个存储里的内容（回收站里的行内按钮走这里）"""
     c = _container(request)
     doc = await c.meta.get_document(doc_id, user.tenant_id)
     if doc is None:
-        return {"ok": True}
-    # 五库物理清理（meta 级联删 chunks）
-    if c.fulltext is not None:
-        await c.fulltext.delete_by_doc(doc.collection, doc.doc_id)
-    if c.vector is not None:
-        await c.vector.delete_by_doc(doc.collection, doc.doc_id)
-    if c.graph is not None:
-        await c.graph.delete_by_doc(doc.tenant_id, doc.doc_id)
-    if doc.storage_url and c.storage is not None:
+        return {"ok": True, "cleaned": [], "failed": []}
+    cleaned, failed = await _purge_document(c, doc, user.tenant_id)
+    return {"ok": not failed, "cleaned": cleaned, "failed": failed}
+
+
+@ui_router.post("/documents/purge")
+async def purge_documents(request: Request,
+                          doc_ids: list[str] = Body(..., embed=True),
+                          user: UserContext = Depends(require_admin)):
+    """批量彻底删除（回收站里**勾选后**才走这里）：逐个清五个存储
+
+    ⚠ 只有回收站里的文档允许彻底删除：不在回收站的行必须先"移入回收站"再删。
+    这道闸门的意义是——彻底删除是不可恢复的，而列表页的删除按钮是**可恢复**的
+    一步；把两者分开，误点一次最多是"进了回收站"，不会直接清库。
+    """
+    c = _container(request)
+    deleted: list[str] = []
+    skipped: list[dict] = []
+    failed: list[dict] = []
+    warned: list[dict] = []
+    for did in list(dict.fromkeys(doc_ids or [])):
+        doc = await c.meta.get_document(did, user.tenant_id)
+        if doc is None:
+            skipped.append({"doc_id": did, "reason": "文档不存在"})
+            continue
+        if doc.status != IngestStatus.DELETED:
+            skipped.append({"doc_id": did, "reason": "不在回收站中（请先删除再彻底删除）"})
+            continue
+        cleaned, bad = await _purge_document(c, doc, user.tenant_id)
+        if bad:
+            failed += [dict(f, doc_id=did) for f in bad]
+        else:
+            deleted.append(did)
+        shared = [x for x in cleaned if x.startswith("storage(shared")]
+        if shared:
+            warned.append({"doc_id": did, "reason": "原文件被其它文档行共用，已保留"})
+    log.info("docs_purged", deleted=len(deleted), failed=len(failed),
+             skipped=len(skipped))
+    return {"ok": not failed, "deleted": deleted, "failed": failed,
+            "skipped": skipped, "warnings": warned}
+
+
+async def _purge_document(c: ServiceContainer, doc,
+                          tenant_id: str) -> tuple[list[str], list[dict]]:
+    """彻底清理一篇文档在**所有存储**里的内容，返回 (成功项, 失败项)
+
+    五个存储逐个清：全文索引 → 向量库 → 图谱 → 对象存储原文件 → 元数据
+    （分块随外键级联，表格行在 delete_document 里显式删）。
+
+    **每个存储各自 try**：原实现是一条直线，ES 抖一下（索引被删、集群重启）就会在
+    这一步抛异常 → 后面的对象存储与元数据**一个都不会清**，而文档行还留在列表里，
+    用户看到"删除失败"却发现文档还在、索引已经删了一半 —— 越删越乱。
+    现在改成"能删的都删"，把失败项如实回报，前端按结果提示。
+
+    **"目标不存在"不算失败**：ES 的 `index_not_found_exception`（这个集合从来没建过
+    索引）与 Milvus 的 collection not found，含义是"本来就没有东西要删"。
+    原先把它们记成 `failed` —— 在一个从没索引过的集合里删文档，界面上永远显示
+    "部分清理失败：fulltext"，用户以为没删干净，反复点。现在记为
+    `fulltext(absent)`（cleaned 里的旁注），真正的异常（集群不可达等）照旧报失败。
+    """
+    cleaned: list[str] = []
+    failed: list[dict] = []
+
+    async def _step(name: str, coro, absent_ok: bool = False) -> None:
         try:
-            await c.storage.delete(doc.storage_url)
-        except Exception as e:
-            log.warning("storage_delete_failed", doc_id=doc.doc_id, error=str(e))
-    try:
-        await c.meta.delete_document(doc.doc_id, user.tenant_id)
-    except Exception as e:
-        log.warning("permanent_delete_meta_failed", doc_id=doc.doc_id, error=str(e))
-    return {"ok": True}
+            await coro
+            cleaned.append(name)
+        except Exception as e:                      # noqa: BLE001
+            if absent_ok and _is_absent_store(e):
+                cleaned.append(f"{name}(absent)")
+                log.info("permanent_delete_store_absent", doc_id=doc.doc_id,
+                         store=name, error=str(e)[:120],
+                         effect="该库里本来就没有这篇文档的内容，不算失败")
+                return
+            failed.append({"store": name, "error": f"{type(e).__name__}: {e}"[:200]})
+            log.warning("permanent_delete_step_failed", doc_id=doc.doc_id,
+                        store=name, error=str(e)[:200])
+
+    if c.fulltext is not None:
+        await _step("fulltext", c.fulltext.delete_by_doc(doc.collection, doc.doc_id),
+                    absent_ok=True)
+    if c.vector is not None:
+        await _step("vector", c.vector.delete_by_doc(doc.collection, doc.doc_id),
+                    absent_ok=True)
+    if c.graph is not None:
+        await _step("graph", c.graph.delete_by_doc(doc.tenant_id, doc.doc_id))
+    if doc.storage_url and c.storage is not None:
+        # ⚠ 对象存储要**先确认没有别的文档行还引用同一个对象**再删。
+        # 秒传别名（同内容重复上传产生的那一行）的 storage_url 是**照抄源文档**的：
+        # 直接按它删，会把源文档的原文件一起删掉 —— 源文档还在列表里、块也都在，
+        # 但下载/重解析从此都会失败（"文件不可得"）。实测踩到过这个场景。
+        shared = []
+        try:
+            shared = [d.doc_id for d in await c.meta.list_documents(
+                tenant_id, limit=1000)
+                if d.doc_id != doc.doc_id and d.storage_url == doc.storage_url]
+        except Exception as e:                      # noqa: BLE001
+            # 查不出来就当"可能被共享"处理：宁可不删原文件（留下一个孤儿对象），
+            # 也不能删掉别的文档正在用的文件
+            shared = ["<查询失败>"]
+            log.warning("permanent_delete_shared_check_failed", doc_id=doc.doc_id,
+                        error=str(e)[:160])
+        if shared:
+            log.info("permanent_delete_keep_storage", doc_id=doc.doc_id,
+                     shared_with=shared[:5],
+                     effect="同一对象仍被其它文档行引用，保留对象存储中的原文件")
+            cleaned.append("storage(shared->keep)")
+        else:
+            await _step("storage", c.storage.delete(doc.storage_url))
+    # 元数据放最后且**一定要试**：它是列表的数据源，删掉它用户才不会看到幽灵行
+    await _step("meta", c.meta.delete_document(doc.doc_id, tenant_id))
+
+    log.info("doc_permanently_deleted", doc_id=doc.doc_id, collection=doc.collection,
+             cleaned=cleaned, failed=[f["store"] for f in failed])
+    return cleaned, failed
+
+
+def _is_absent_store(e: Exception) -> bool:
+    """异常是不是"目标库里本来就没有"（而不是"删失败"）
+
+    ES：`index_not_found_exception`（索引没建过）；Milvus：collection/partition
+    not found。判据用底层错误文本 —— 两个客户端都把类型名写在消息里，
+    而它们的异常类型又各自不同（NotFoundError / MilvusException），
+    取类型反而更脆。
+    """
+    msg = str(e).lower()
+    return ("index_not_found" in msg or "no such index" in msg
+            or "collection not found" in msg or "collectionnotfound" in msg
+            or "can't find collection" in msg)
 
 
 # ───────────────────── 管理 API ─────────────────────
@@ -2861,35 +3184,59 @@ async def health_test(request: Request,
     elif kind == "doc_parse":
         if not endpoint:
             message = ("API 地址为空：先填 PaddleX 服务地址（如 http://host:8080），"
-                       "再点「测试模型」")
+                       "再点「测试解析」")
         else:
-            target = endpoint.rstrip("/") + "/health"
+            # 口径必须是「**打真实能力端点 + 校验响应字段根名**」，不能只探 /health。
+            # PaddleX 一个服务实例只挂**一条产线**（paddlex_cli.serve：单 pipeline 单
+            # app），而每个服务都有 /health：能力选错时（例如把 layout_parsing 服务标成
+            # 「OCR」）/health 照样 200、界面照样绿、配置照样存下 —— 直到入库调用真正
+            # 的端点才 404。这正是本项目反复记录的"假绿"族（TS-009 只校验路径存在 /
+            # TS-011 只看状态码 / TS-017 探测蹭旧连接）。响应字段根名
+            # （ocrResults / layoutParsingResults / tableRecResults / formulaRecResults）
+            # 本身就是产线指纹，用它当场分辨。
+            from rag.adapters.doc_parse import RESPONSE_ROOT, _probe_image_b64
+            cap = _row_value(rows, "capability")
+            root_key = RESPONSE_ROOT[doc_parse_capability(cap)]
+            target = endpoint.rstrip("/") + doc_parse_endpoint_path(cap)
             import httpx
             try:
                 async with httpx.AsyncClient(
-                        timeout=_MODEL_LIST_TIMEOUT_SEC) as hc:
-                    r = await hc.get(target)
+                        timeout=_MODEL_CALL_TIMEOUT_SEC) as hc:
+                    r = await hc.post(target, json={
+                        "file": _probe_image_b64(), "fileType": 1,
+                        "visualize": False})
             except Exception as e:
                 message = f"无法访问 {target}：{str(e)[:150]}"
             else:
-                if r.status_code == 200:
-                    online = True
-                    cap = _row_value(rows, "capability")
-                    message = (f"{target} 正常回应（HTTP 200）；这条配置将用于"
-                               f"「{doc_parse_capability_label(cap)}」"
-                               f"（{doc_parse_endpoint_path(cap)}）")
-                else:
+                if r.status_code != 200:
                     message = (f"HTTP {r.status_code}：{target} 未就绪。"
                                f"原始信息：{_resp_body_snippet(r) or '（无响应体）'}")
+                else:
+                    try:
+                        result = (r.json() or {}).get("result") or {}
+                    except Exception:
+                        result = {}
+                    if isinstance(result.get(root_key), list):
+                        online = True
+                        message = (f"{target} 可用，响应字段 {root_key} 已校验；"
+                                   f"这条配置用于「{doc_parse_capability_label(cap)}」")
+                    else:
+                        got = "、".join(result.keys()) or "空"
+                        message = (
+                            f"{target} 响应里没有 {root_key}（实际：{got}）——"
+                            f"这个地址上跑的不是「{doc_parse_capability_label(cap)}」"
+                            "产线，请核对启动时的 --pipeline 与这条配置的「处理能力」")
     # LLM/VLM/Embedding「测试模型」：用表单里的地址 + Key + 模型ID **真发一次请求**
     # （对话模型 → /chat/completions，向量模型 → /embeddings），有正确回应才算通过。
     # 旧口径只 GET 一次 /models，等于只证明"地址通"：模型ID 填错、Key 没权限、
     # 模型其实没加载，全都会显示"测试通过"，要到问答/入库时才炸在业务里。
     elif kind in ("llm", "vlm", "embedding") and endpoint:
-        # VLM 是"能带图的对话模型"，接口与 LLM 完全同一条：这里发纯文字 ping 就够
-        # 了（多模态服务照样收纯文字消息）—— 要验的是"这个地址 + 这把 Key + 这个
-        # 模型ID 能不能对话"，不是"它会不会看图"
+        # **vlm 的口径与 llm 不同**：llm 发一句纯文字 ping 就够（多模态服务照样收
+        # 纯文字），而 vlm 必须**带图** —— 它存在的唯一理由就是能看图，把文本模型
+        # 配进 vlm 段是本项目最容易犯的错，而这类错在入库侧是静默的（描述为空或为假，
+        # 见 container.vlm_ready）。同族缺陷：TS-009「只校验路径存在 → 假绿」。
         is_chat = kind in ("llm", "vlm")
+        want_image = kind == "vlm"
         model_id = str(body.get("model") or "").strip()
         # 与「获取模型ID」「入库」同一把钥匙（见 _effective_api_key）：
         # 框里的圆点没动 = 沿用（回落）；把圆点删干净 = 主动清空，如实拿空钥匙去测
@@ -2904,10 +3251,18 @@ async def health_test(request: Request,
         else:
             import httpx
             if is_chat:
+                content = "ping"
+                if want_image:
+                    from rag.adapters.doc_parse import _probe_image_b64
+                    content = [
+                        {"type": "text", "text": "这张图上有几行文字？只答数字。"},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{_probe_image_b64()}"}},
+                    ]
                 payload = {"model": model_id,
-                           "messages": [{"role": "user", "content": "ping"}],
-                           "max_tokens": 1, "temperature": 0,
-                           "stream": False}
+                           "messages": [{"role": "user", "content": content}],
+                           "max_tokens": 32 if want_image else 1,
+                           "temperature": 0, "stream": False}
             else:
                 payload = {"model": model_id, "input": ["ping"]}
 
@@ -2934,13 +3289,26 @@ async def health_test(request: Request,
                                                          model_id)
                 elif is_chat:
                     try:
-                        choices = (r.json() or {}).get("choices") or []
+                        msg = ((r.json() or {}).get("choices")
+                               or [{}])[0].get("message") or {}
+                        raw = msg.get("content")
+                        # 有些服务把 content 返回成数组（分块结构）；只认能取到文本的形式
+                        reply = (raw if isinstance(raw, str) else "").strip()
                     except Exception:
-                        choices = []
-                    online = bool(choices)
-                    message = (f"{model_id} 正常回应（HTTP 200）" if online else
-                               "HTTP 200 但响应里没有 choices：这不是 OpenAI 兼容的"
-                               "对话接口（检查 API 地址是否指向 /v1）")
+                        reply = ""
+                    online = bool(reply)
+                    if not online:
+                        message = (
+                            f"{model_id} 返回 HTTP 200 但没有可读内容："
+                            + ("它可能不是多模态模型（图片理解会被跳过）；"
+                               if want_image else "")
+                            + "或这不是 OpenAI 兼容的对话接口（检查 API 地址"
+                              "是否指向 /v1）")
+                    elif want_image:
+                        message = (f"{model_id} 已接收图片并作答：{reply[:40]}"
+                                   "（图片理解可用）")
+                    else:
+                        message = f"{model_id} 正常回应（HTTP 200）"
                 else:
                     try:
                         vec = ((r.json() or {}).get("data")
@@ -3090,20 +3458,75 @@ async def doc_parse_preview(request: Request, doc_id: str, page: int = 1,
 _PIECE_PAGES = ("knowledge", "chat", "doc-detail")
 _PAGE_DIR = {"doc-detail": "doc_detail"}
 
-_ACTIVE_TASK_STATUS = ("queued", "parsing", "embedding", "uploading",
-                       "indexing", "retrying")
+_ACTIVE_TASK_STATUS = ACTIVE_TASK_STATUSES
 
 
-def _doc_view(doc) -> dict:
+async def _active_status_by_doc(c: ServiceContainer,
+                                tenant_id: str) -> dict[str, str]:
+    """`doc_id → 该文档当前正在跑的阶段状态`（只收活动态任务）
+
+    为什么要有它：文档行的 status 只在"提交"与"收尾"两次被写（见 `_doc_view`），
+    中途的 解析中/分块中/向量化/写入中 只存在于任务行。列表要实时反映进度，
+    就得把任务状态取回来盖上去。活动任务通常只有个位数，拉最近 200 条足够。
+    """
+    out: dict[str, str] = {}
+    try:
+        tasks = await c.meta.list_tasks(tenant_id, limit=200)
+    except Exception:
+        return out
+    for t in tasks:
+        st = t.status.value if hasattr(t.status, "value") else str(t.status)
+        if st in _ACTIVE_TASK_STATUS and t.doc_id and t.doc_id not in out:
+            out[t.doc_id] = st
+    return out
+
+
+def _doc_error(doc) -> str:
+    """文档级可读错误（取不到就空串，绝不让视图因缺字段而 500）
+
+    历史缺陷：这里原先是 `doc.error`，而 `DocumentMeta` **没有** error 字段
+    （错误躺在 IngestTask.error_message 与 quality_report.issues 里）。于是
+    知识库文档列表与文档详情页一渲染就 AttributeError → 500。
+    质量报告里已经带了降级项与 issue，这里如实拼出来即可，不再依赖不存在的字段。
+    """
+    qr = getattr(doc, "quality_report", None)
+    if not isinstance(qr, dict):
+        return ""
+    parts: list[str] = []
+    for issue in (qr.get("issues") or [])[:3]:
+        if isinstance(issue, dict):
+            msg = issue.get("message") or issue.get("code") or ""
+            if msg:
+                parts.append(str(msg))
+    if not parts and qr.get("summary"):
+        parts.append(str(qr["summary"]))
+    return "；".join(parts)[:200]
+
+
+def _doc_view(doc, live_status: str | None = None) -> dict:
+    """文档视图。
+
+    `live_status`：**正在运行的任务**给出的实时状态。文档行（`documents.status`）
+    只在两个时刻被写：提交时置 `pending`、finalize 时落 `done/partial`——
+    中间那些 parsing/chunking/embedding/writing 全在 `ingest_tasks.status` 上。
+    所以列表若只读文档行，用户看到的就是"一直排队中，直到某刻突然已完成"。
+    这里允许调用方把任务状态盖上来（见 `_active_status_by_doc`）。
+    """
     status = doc.status.value if hasattr(doc.status, "value") else str(doc.status)
+    live = bool(live_status) and live_status != status
+    deleted_at = getattr(doc, "deleted_at", None)
     return {
         "doc_id": doc.doc_id, "filename": doc.filename,
         "collection": doc.collection, "file_type": doc.file_type,
-        "status": status, "file_size": doc.file_size,
+        "status": live_status or status, "live": live, "file_size": doc.file_size,
         "page_count": doc.page_count, "chunk_count": doc.chunk_count,
-        "version": doc.version, "error": doc.error,
+        "version": doc.version, "error": _doc_error(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "updated_at": doc.updated_at.isoformat() if getattr(doc, "updated_at", None) else None,
+        # 回收站列表按"删得最近的在上"排序与展示，故此字段要出到视图里
+        "deleted_at": (deleted_at.isoformat()
+                       if hasattr(deleted_at, "isoformat") else (deleted_at or None)),
+        "prev_status": getattr(doc, "prev_status", None),
         "allowed_roles": list(doc.allowed_roles or []),
         "created_by": doc.created_by, "storage_url": doc.storage_url,
         "quality_score": getattr(doc, "quality_score", None),
@@ -3125,12 +3548,21 @@ async def _find_doc(c: ServiceContainer, doc_id: str, user: UserContext):
 
 def _task_view(t) -> dict:
     status = t.status.value if hasattr(t.status, "value") else str(t.status)
+    # 秒传（MD5 去重）任务：没有任何库被写入，却在"一瞬间"变成 done。
+    # 界面上必须说清楚，否则用户会以为"按新代码重新入库了" —— 实际索引里还是
+    # 上一版解析结果（源文档的块），这也是"感觉没有更新后台数据库"的由来。
+    qs = getattr(t, "quality_summary", None) or {}
+    dedup = bool(isinstance(qs, dict) and qs.get("deduplicated"))
     return {
         "task_id": t.task_id, "doc_id": t.doc_id, "batch_id": t.batch_id,
         "filename": getattr(t, "filename", "") or "",
         "collection": t.collection, "status": status,
         "stage": getattr(t, "stage", "") or "",
         "error": getattr(t, "error", "") or "",
+        "dedup": dedup,
+        "note": ("同文件已入库过（MD5 秒传）：本次未重新解析、未写入任何库；"
+                 "要按当前解析口径重跑请用文档列表里的「重解析」"
+                 if dedup else ""),
         "progress": getattr(t, "progress", None),
         "created_at": t.created_at.isoformat() if getattr(t, "created_at", None) else None,
         "updated_at": t.updated_at.isoformat() if getattr(t, "updated_at", None) else None,
@@ -3184,12 +3616,21 @@ async def _piece_data(page: str, piece: str, request: Request,
         kw = (q.get("q") or "").strip().lower()
         if kw:
             docs = [d for d in docs if kw in (d.filename or "").lower()]
-        docs.sort(key=lambda d: d.created_at, reverse=True)
+        if archived:
+            # 回收站按**删除时间**倒序：这里的问题是"我刚删的是哪一篇"，
+            # 上传时间对这个问题没有帮助（同名/同批上传的文件时间几乎一样）。
+            docs.sort(key=lambda d: (getattr(d, "deleted_at", None) or d.created_at),
+                      reverse=True)
+        else:
+            docs.sort(key=lambda d: d.created_at, reverse=True)
         page_no = max(1, int(q.get("page", 1) or 1))
         size = min(max(1, int(q.get("size", 10) or 10)), 50)
         total = len(docs)
         window = docs[(page_no - 1) * size: page_no * size]
-        return {"docs": [_doc_view(d) for d in window], "total": total,
+        # 实时状态：正在重解析/入库的文档显示任务当前阶段，而不是干等文档行的 pending
+        live = await _active_status_by_doc(c, user.tenant_id)
+        return {"docs": [_doc_view(d, live.get(d.doc_id)) for d in window],
+                "total": total,
                 "page": page_no, "size": size,
                 "hasMore": page_no * size < total,
                 "archivedOnly": archived,
@@ -3265,7 +3706,10 @@ async def _piece_data(page: str, piece: str, request: Request,
 
     if page == "doc-detail" and piece in ("doc_header", "doc_attrs"):
         doc = await _find_doc(c, q.get("docId") or "", user)
-        return {"doc": _doc_view(doc) if doc else None}
+        if not doc:
+            return {"doc": None}
+        live = await _active_status_by_doc(c, user.tenant_id)
+        return {"doc": _doc_view(doc, live.get(doc.doc_id))}
 
     if page == "doc-detail" and piece == "chunks_container":
         doc_id = q.get("docId") or ""
@@ -3307,7 +3751,8 @@ async def _piece_data(page: str, piece: str, request: Request,
         doc_id = q.get("docId") or ""
         doc = await _find_doc(c, doc_id, user)
         pv = await _parse_preview_data(c, doc_id) if doc else None
-        return {"doc": _doc_view(doc) if doc else None,
+        live = await _active_status_by_doc(c, user.tenant_id) if doc else {}
+        return {"doc": _doc_view(doc, live.get(doc.doc_id)) if doc else None,
                 "elements": (pv or {}).get("elements", []),
                 "outline": (pv or {}).get("outline", [])}
 

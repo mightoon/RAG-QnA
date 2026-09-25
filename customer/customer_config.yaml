@@ -8,11 +8,11 @@ auth:
 llm:
   adapter: openai_compatible
   base_url: https://api.deepseek.com
-  api_key: enc:v1:gAAAAABqs501U0zD4dZhliY67dfIN-K_GQ8Iq36-ZmwQOEmBJtmXOKW-D1Tr6DZgM86hYlOMhySjoY9tQ2d_4RCdvu8DzQydHZgClL_qND077Ovk7ObXADDgix5PH8ZRXcRrqlnxdvUu
+  api_key: enc:v1:gAAAAABqthpk_i_dkwBKgXuU-UdyaTCJozAlWP9hNVFNeyj7rMltaUdFCwzXlREP5lqZCuVktKwGDAfRhkx3ZgY0PxCbr7tbAktITZhmXNthOsaj-3ib52tuas_BTRLMFjlo-eeenu67
   model: deepseek-flash
   rewrite_model: ''
-  temperature: 5.0
-  max_tokens: 4096
+  temperature: 0.5
+  max_tokens: 65536
   timeout: 60.0
   max_concurrency: 8
   display_name: int-deepseek01
@@ -20,26 +20,26 @@ llm:
   - id: current
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqs501nYcZn5M29vhs-6vvcZT5qyScjKA3heCwg95bFM1JCqkjUXNBi9h84X8VUBxkZImSfdG1BdGWeMRrERC-3EibE-5fFViS48u6D0BJTenNl8Dj5qIofXP4BTVMXUnWbFeV
+    api_key: enc:v1:gAAAAABqthpkh7TlZ_KTCFfma_XyJX3QhjB_ZkcfOISJY82BwCG3tbVAyV5Tt90S5mOP3zWw8nRfdxgBAac-8it8RqNIqJtuVqMujshSqSUUhV_lL2tWvpM_t4BET2IP0DgpZdlyszIW
     model_ids:
     - deepseek-flash
     model: deepseek-flash
-    tested_at: ''
+    tested_at: '2026-09-25 14:46:17'
     params:
-      temperature: 5.0
-      max_tokens: 4096
+      temperature: 0.5
+      max_tokens: 65536
       timeout: 60.0
       max_concurrency: 8
   - id: ef4d181f
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqs5015baR-dtBEOySwD-NTLTC2ZeMxCSSG_2jsvaWW9HF7KKznqSz2YCTarPe4HjQ_HUsZGljxe-lZI6j5eBZq9ZP4jxTlvbp6fbTKj8LNE-VqdSdZbTbVPsG-bx-duYvz3HZ
+    api_key: enc:v1:gAAAAABqthpkgIia2PAO9TGMFTz58PFKZc1ZXjrAAL3US5oUQzwVlrLUr-q9SXVdFb0AboSEk3m1xf8sgw3_uU45Sr5qV-_qq2fsblMsFZA1wkjpapNqEz3j2jxKsVmw-_MVbohEthVr
     model_ids:
     - deepseek-v4-pro
     model: deepseek-v4-pro
-    tested_at: '2026-09-21 18:12:20'
+    tested_at: '2026-09-25 14:53:24'
     params:
-      temperature: 7.0
+      temperature: 1.0
       max_tokens: 8192
       timeout: 60.0
       max_concurrency: 8
@@ -83,7 +83,7 @@ meta:
 redis:
   host: 192.168.100.239
   port: 6379
-  password: enc:v1:gAAAAABqs501F_PPDO3eKitKEuwT9-Lo-W-cs5QqcSaLhtUUkzzwMrQKhURoKaEWv_Yz_nli72NuZtPHPmpMMUmJH48Nwq49ww==
+  password: enc:v1:gAAAAABqthpkS8iQOdR36oRGLV8AnD2MKy9-GQd0SzMJw7Z3u6isMEfHvklCMDXRC_iZbfoqisg55EztoRutL2O_nT9OZ8d4iw==
   db: 0
   session_ttl_hours: 48
   prefix: 'rag:'
@@ -92,7 +92,7 @@ storage:
   enabled: true
   endpoint: 192.168.100.239:9000
   access_key: admin
-  secret_key: enc:v1:gAAAAABqs501VyuFiYHpeZTd97ur4WDBVEJoewEwdvwnguQk-qSLLLSj8C5UJnSMR8J_mJqUh3ckIlVRv_SvurNvb78xnKvgBA==
+  secret_key: enc:v1:gAAAAABqthpk7fHVnPlaP-u2_0ODBF7KVvRC0qgp5tojkqC6WzEstM1SRxxz2umMJYBY5OyPSGBENyMq1g0dFWZNgZ17ss5XGw==
   bucket: rag-docs
   secure: false
   local_root: ./data/files
@@ -107,7 +107,7 @@ knowledge_graph:
 business_data:
   adapter: sqlalchemy
   enabled: false
-  dsn: enc:v1:gAAAAABqs501ZOZYFCRdkHojOuUB30VKCpOJy0LuPt42rqakapkFiYphZapA3irIcL5PkBY_fsUhmdaRrzSTH_6jpZy6pOJpGlxUdSKfcWRrzCvlJjr9C_AWRYYzg_VlYruyNC29C-76Y8aso4h8V3W3Pyglwq_1hA==
+  dsn: enc:v1:gAAAAABqthpkrFAiw51dIQrUmPew6P8yamUpSTwBFowiPv6SjxGpnrbbE3O8K08AJtgnY0-1yVQrMOJfGfx8d3KusgTSPpf2qGPwOxXqRAV6Hh7pUxZBRd88jkog4jaGdLCjo-OzqiUKMPUgHxpSTbY8FAGMSD-LBg==
   schema_file: customer/business_schema.yaml
   allowed_tables: []
   max_rows: 100
@@ -123,6 +123,9 @@ retrieval:
   enable_vector: true
   enable_bm25: true
   enable_graph: false
+  # 结构化路（NL2SQL → 业务库精确数值）。要生效需**两处同时打开**：
+  # 这里 + business_data.enabled。只开这里不会报错，但检索路选择器会出现一个
+  # 永远返回空的路（见 query_retrieve._structured 的门禁说明）
   enable_structured: false
   enable_ephemeral: true
   top_k_per_path: 20
@@ -213,7 +216,10 @@ consistency_check:
   alert_threshold: 10
 observability:
   log_level: INFO
-  log_json: true
+  # log_json 现在**真的生效**了（以前 configure_logging 从没被调用，这两个字段都是
+  # 摆设，见 doc/data_path.md §8.28）。当前选 false = 控制台保持"人读格式"；
+  # 想切成每行一个 JSON（便于采集/grep）把它改成 true 即可，保存后立即生效。
+  log_json: false
   metrics_enabled: true
   pushgateway_url: ''
   tracing_enabled: false
@@ -243,10 +249,10 @@ vlm:
     model_ids:
     - qwen38-27b
     model: qwen38-27b
-    tested_at: '2026-09-22 16:00:10'
+    tested_at: '2026-09-25 14:44:34'
     params:
-      temperature: 7.0
-      max_tokens: 2048
+      temperature: 0.7
+      max_tokens: 65536
       timeout: 60.0
       max_concurrency: 8
   active_id: 66d943ae
@@ -254,33 +260,38 @@ vlm:
   base_url: http://192.168.100.242:29138/v1
   api_key: ''
   model: qwen38-27b
-  temperature: 7.0
-  max_tokens: 2048
+  temperature: 0.7
+  max_tokens: 65536
   timeout: 60.0
   max_concurrency: 8
 doc_parse:
   models:
   - id: 5e57ba9d
-    display_name: paddle
+    display_name: paddle-ocr
     base_url: http://192.168.100.237:18080
     api_key: ''
     model_ids: []
     model: ''
-    tested_at: '2026-09-23 17:17:30'
+    tested_at: '2026-09-25 13:59:41'
     params:
       capability: ocr
-  - id: 1fee36e3
-    display_name: paddle
-    base_url: http://192.168.100.237:18080
+  - id: 39b51611
+    display_name: paddle-layout
+    base_url: http://192.168.100.237:18081
     api_key: ''
     model_ids: []
     model: ''
-    tested_at: '2026-09-23 17:34:45'
+    tested_at: '2026-09-25 13:59:20'
     params:
       capability: layout-parsing
   active_id: 5e57ba9d
-  display_name: paddle
+  display_name: paddle-ocr
   base_url: http://192.168.100.237:18080
   api_key: ''
   model: ''
   capability: ocr
+  # 单次请求最多送几页 PDF。10 = PaddleX serving `max_num_input_imgs` 的默认值，
+  # **超过它的页会被服务端静默丢掉**（HTTP 仍 200）→ 客户端按此分批送，并自查
+  # "返回条数不足"做二分重试（见 rag/adapters/doc_parse.py 的 _pdf_batches）。
+  # 服务端上限调大后可同步调大（减少请求数），调小更保守但请求更多。
+  max_pages_per_request: 10

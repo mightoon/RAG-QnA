@@ -43,6 +43,24 @@ def file_md5(content: bytes) -> str:
 # 枚举
 # ═══════════════════════════════════════════════════════════
 
+# 子块**参与向量化的文本**的拼法版本（见 ingest_write._embed_text）。
+# 放在这里而不是步骤模块里：入库侧（拼文本）与协调器（算库指纹）都要读它，而
+# 协调器不该依赖流水线步骤模块。
+# ⚠ 改动拼法必须同时改这个值：它会进入库指纹（coordinator._ingest_fingerprint），
+# 否则同一集合里会出现"一部分文档用旧拼法、一部分用新拼法"，而秒传判据却认为
+# 口径一致（两边向量不可比，检索质量下降又无从归因）。
+EMBED_TEXT_VERSION = "v2"
+
+# 块**正文与元数据生成逻辑**的版本（分块切分、表格块正文、页码归属、图区裁剪…）。
+# ⚠ 只要改动会**改变入库内容**的流水线逻辑，就必须把它 +1：
+#   它会进入库指纹（coordinator._ingest_fingerprint），决定"同一份文件重传时能不能
+#   秒传"。不 bump 的后果是——用户重传同一文件，系统判"口径没变"直接秒传完成，
+#   索引里留着的还是旧逻辑产出的块，而界面上显示的是"已完成"。
+#   历史教训：v1 期间的改动（换行被吃掉导致英文粘连、表格块正文是 HTML、图区永不裁剪）
+#   就是被秒传挡住的 —— 用户重传后以为已修复，其实一个块都没更新。
+# 与 EMBED_TEXT_VERSION 的分工：那个只管"向量化文本怎么拼"，这个管"块本身长什么样"。
+CHUNK_BUILD_VERSION = "v2"
+
 class IngestStatus(str, Enum):
     PENDING = "pending"
     PARSING = "parsing"
@@ -55,6 +73,17 @@ class IngestStatus(str, Enum):
     RETRYING = "retrying"
     SUPERSEDED = "superseded"     # 软删除：被新版本覆盖
     DELETED = "deleted"           # 回收站：可恢复，内容不参与检索
+
+
+# "正在跑"的任务状态：文档行（documents.status）只会停在 pending 与 done/partial，
+# 中间的 解析中/分块中/向量化/写入中 全都只在任务行上。任何"这篇文档现在能不能删"
+# 的判断都必须看任务行，不能看文档行 —— 否则一篇正在写索引的文档可以被"删掉"，
+# 而入库收尾（ingest_write 最后一步 upsert_document）转头把它写回 done，
+# 用户看到的是"删了又自己回来了"。
+ACTIVE_TASK_STATUSES = (
+    IngestStatus.PENDING.value, IngestStatus.PARSING.value,
+    IngestStatus.CHUNKING.value, IngestStatus.EMBEDDING.value,
+    IngestStatus.WRITING.value, IngestStatus.RETRYING.value)
 
 
 class IntentType(str, Enum):
@@ -128,6 +157,13 @@ class DocumentMeta(BaseModel):
     created_by: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    # ── 回收站（status=deleted）专用 ──────────────────────────
+    # 为什么要有这两列：`status=deleted` 只说"在回收站里"，回答不了"恢复成什么"。
+    # 原来恢复时无条件写 done —— 一篇 `partial`（部分库没写进去）或 `failed`
+    # 的文档一删一恢复就变成"已完成"，用户按状态筛出来的质量视图直接失真。
+    # deleted_at 则是回收站列表的排序与展示依据（列表按"删得最近的在上"）。
+    deleted_at: datetime | None = None
+    prev_status: str | None = None
 
 
 class ChunkMeta(BaseModel):
@@ -200,11 +236,38 @@ class IngestTask(BaseModel):
     total_chunks: int = 0
     written_chunks: int = 0
     quality_summary: dict = Field(default_factory=dict)
-    source_type: str = "upload"             # upload / server_path / local_dir / cli / ephemeral_promote
+    source_type: str = "upload"             # upload / server_path / local_dir / cli / ephemeral_promote / reingest
     submitted_by: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @property
+    def progress(self) -> float:
+        """0-1 的总体进度估算（按阶段权重 + 页/块完成度）
+
+        前端任务视图一直在读 `t.progress`，而它原先是个不存在的字段 → 恒为 None、
+        进度条永远空着。权重与 task_progress(stage_detail) 上报的百分比一致，
+        两处口径相同才不会出现"SSE 推到 60%、列表却显示 0%"。
+        """
+        base = {
+            IngestStatus.PENDING: 0.0,
+            IngestStatus.PARSING: 0.05,
+            IngestStatus.CHUNKING: 0.35,
+            IngestStatus.EMBEDDING: 0.6,
+            IngestStatus.WRITING: 0.85,
+            IngestStatus.DONE: 1.0,
+            IngestStatus.PARTIAL: 1.0,
+            IngestStatus.FAILED: 1.0,
+            IngestStatus.RETRYING: 0.0,
+            IngestStatus.SUPERSEDED: 1.0,
+            IngestStatus.DELETED: 1.0,
+        }.get(self.status, 0.0)
+        if self.status == IngestStatus.PARSING and self.total_pages:
+            return min(1.0, base + 0.25 * self.processed_pages / self.total_pages)
+        if self.status == IngestStatus.WRITING and self.total_chunks:
+            return min(1.0, base + 0.1 * self.written_chunks / self.total_chunks)
+        return min(1.0, base)
 
 
 class IngestBatch(BaseModel):
@@ -265,7 +328,7 @@ class ParsedDocument(BaseModel):
 
 class QualityIssue(BaseModel):
     stage: str                              # parse / chunk / post_write
-    severity: str                           # low / medium / high
+    severity: str                           # info / low / medium / high
     code: str                               # char_density_low / ocr_low_conf / ...
     message: str
     page_num: int | None = None
@@ -283,6 +346,10 @@ class QualityReport(BaseModel):
     blank_page_ratio: float | None = None
     document_score: float = 1.0             # 文档级质量系数（ChunkStep降权）
     garbled_ratio: float | None = None
+    # 这份文档实际走了哪条解析路径（text / scanned / mixed）与用了几页 OCR。
+    # 判据是「页面有没有文本层」，不是字符密度 —— 见 doc_parser.PDFParser._parse_sync。
+    doc_type: str = ""
+    used_ocr_pages: int = 0
     summary: str = ""
 
 

@@ -43,7 +43,9 @@ class MockLLMAdapter(LLMAdapter):
 
     async def generate(self, messages: list[dict], task: str = "generate",
                        temperature: float | None = None,
-                       max_tokens: int | None = None) -> str:
+                       max_tokens: int | None = None,
+                       response_format: dict | None = None,
+                       thinking: bool | None = None) -> str:
         text = _last_user_text(messages)
         if task == "rewrite":
             # 查询理解：返回合法 QueryPlan JSON（子查询分解处解析为

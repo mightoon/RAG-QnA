@@ -40,6 +40,13 @@ class InMemoryMetaAdapter(MetaStoreAdapter):
     # ── 文档元数据 ─────────────────────────────────────────
 
     async def upsert_document(self, doc: DocumentMeta) -> None:
+        old = self._docs.get(doc.doc_id)
+        if old is not None and old.status == IngestStatus.DELETED:
+            # 与 MySQL 侧同一道兜底：回收站里的行不接受 upsert 带来的状态，
+            # 否则入库收尾会把"已删除"的文档悄悄写回 done（用户看到文档自己回来了）
+            doc.status = IngestStatus.DELETED
+            doc.prev_status = old.prev_status
+            doc.deleted_at = old.deleted_at
         self._docs[doc.doc_id] = doc
 
     async def update_doc_status(self, doc_id: str, status: IngestStatus,
@@ -73,6 +80,40 @@ class InMemoryMetaAdapter(MetaStoreAdapter):
             self._docs.pop(doc_id, None)
             for cid in self._doc_chunks.pop(doc_id, []):
                 self._chunks.pop(cid, None)
+                self._texts.pop(cid, None)
+            # 表格结构化行同属该文档，一并清掉（MySQL 侧没有外键可级联，这里也不留）
+            for tid in [k for k, t in self._tables.items() if t.doc_id == doc_id]:
+                self._tables.pop(tid, None)
+
+    async def soft_delete_document(self, doc_id: str,
+                                   tenant_id: str) -> str | None:
+        """移入回收站：只改状态，内容一概不动（恢复才能是"原样回来"）"""
+        doc = self._docs.get(doc_id)
+        if doc is None or doc.tenant_id != tenant_id:
+            return None
+        if doc.status == IngestStatus.DELETED:
+            return doc.prev_status or IngestStatus.DONE.value
+        prev = doc.status.value
+        doc.prev_status = prev
+        doc.status = IngestStatus.DELETED
+        doc.deleted_at = datetime.utcnow()
+        return prev
+
+    async def restore_document(self, doc_id: str,
+                               tenant_id: str) -> str | None:
+        doc = self._docs.get(doc_id)
+        if doc is None or doc.tenant_id != tenant_id:
+            return None
+        if doc.status != IngestStatus.DELETED:
+            return doc.status.value
+        # 老数据（本次改动之前删的）没有 prev_status：按"有没有块"兜底，
+        # 绝不再无条件写 done（那会把 failed/partial 洗成"已完成"）
+        back = doc.prev_status or (IngestStatus.DONE.value if doc.chunk_count
+                                   else IngestStatus.FAILED.value)
+        doc.status = IngestStatus(back)
+        doc.prev_status = None
+        doc.deleted_at = None
+        return back
 
     async def find_doc_by_md5(self, file_md5: str,
                               tenant_id: str) -> DocumentMeta | None:
@@ -149,11 +190,37 @@ class InMemoryMetaAdapter(MetaStoreAdapter):
     async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[ChunkMeta]:
         return [self._chunks[cid] for cid in chunk_ids if cid in self._chunks]
 
+    async def delete_chunks(self, chunk_ids: list[str]) -> int:
+        """按 chunk_id 批量删除（重跑清理旧块用），返回删除条数"""
+        n = 0
+        for cid in chunk_ids or []:
+            c = self._chunks.pop(cid, None)
+            if c is None:
+                continue
+            n += 1
+            self._texts.pop(cid, None)
+            ids = self._doc_chunks.get(c.doc_id) or []
+            if cid in ids:
+                ids.remove(cid)
+        return n
+
     # ── 表格数据 ───────────────────────────────────────────
 
     async def upsert_table_data(self, tables: list[TableData]) -> None:
-        for t in tables:
-            self._tables[t.table_id] = t
+        """按 doc 整体替换（与 MySQL 实现同一语义：重跑不叠加重复行）
+
+        键必须是 `chunk_id`（`TableData` 的字段之一）。原实现用 `t.table_id` ——
+        模型里根本没有这个字段，走内存兜底（MySQL 不可用时的 `_CORE_FALLBACKS`）
+        时每写一次表格就 AttributeError，整篇文档判失败。
+        同一 chunk 可能对应多行（切片/多表同块），因此键取
+        `(chunk_id, table_index, page_num)`，不做有损覆盖。
+        """
+        for doc_id in {t.doc_id for t in tables if t.doc_id}:
+            for k in [k for k, v in self._tables.items() if v.doc_id == doc_id]:
+                self._tables.pop(k, None)
+        for i, t in enumerate(tables):
+            key = f"{t.chunk_id}|{t.table_index}|{t.page_num}|{i}"
+            self._tables[key] = t
 
     # ── 入库任务/批次 ──────────────────────────────────────
 

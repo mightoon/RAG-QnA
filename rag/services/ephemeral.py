@@ -41,7 +41,8 @@ class EphemeralService:
                     "error": f"每会话最多 {cfg.max_files_per_session} 个临时文件"}
 
         from rag.ingestion.coordinator import IngestItem
-        batch, tasks = await self.s.ingest_coordinator.submit(
+        # 临时文档没有"用户确认"环节：命中秒传直接复用（dedup="auto"）
+        batch, tasks, _dups = await self.s.ingest_coordinator.submit(
             [IngestItem(filename=filename, file_path=file_path,
                         file_size=file_size)],
             tenant_id=tenant_id, collection="__ephemeral__",

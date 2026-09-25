@@ -10,12 +10,17 @@
     </div>
     <div class="doc-header-actions">
       {% if doc and doc.status != 'deleted' %}
-      <button class="btn btn-secondary btn-sm" data-doc-op="reingest">重建索引</button>
-      <button class="btn btn-secondary btn-sm" data-doc-op="download">下载</button>
-      <button class="btn btn-danger btn-sm" data-doc-op="delete">删除</button>
+      <button class="btn btn-secondary btn-sm" data-doc-op="reingest"
+              title="按当前解析口径重跑这篇文档：沿用原文档，覆盖更新全文索引/向量库/元数据，不会产生新文档或重复块">重解析</button>
+      <button class="btn btn-secondary btn-sm" data-doc-op="download"
+              title="从对象存储下载上传时的原始文件">下载</button>
+      <button class="btn btn-secondary btn-sm" data-doc-op="delete"
+              title="移入回收站：列表里不再显示、不参与检索，可在回收站恢复或彻底删除">删除</button>
       {% elif doc %}
-      <button class="btn btn-secondary btn-sm" data-doc-op="restore">恢复</button>
-      <button class="btn btn-danger btn-sm" data-doc-op="permanent">永久删除</button>
+      <button class="btn btn-secondary btn-sm" data-doc-op="restore"
+              title="放回文档列表，状态还原成删除前的状态（不重新解析）">恢复</button>
+      <button class="btn btn-danger btn-sm" data-doc-op="permanent"
+              title="彻底删除：清理向量库、全文索引、图谱、对象存储与元数据中的全部内容，不可恢复">彻底删除</button>
       {% endif %}
     </div>
   </div>

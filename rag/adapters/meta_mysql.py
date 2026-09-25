@@ -141,6 +141,8 @@ DDL_STATEMENTS = [
       created_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
                      ON UPDATE CURRENT_TIMESTAMP,
+      deleted_at     DATETIME      NULL,
+      prev_status    VARCHAR(32)   NULL,
       INDEX idx_tenant_col (tenant_id, collection),
       INDEX idx_status     (status),
       INDEX idx_md5        (file_md5, tenant_id)
@@ -298,6 +300,9 @@ class MySQLMetaStore(MetaStoreAdapter):
                 "ALTER TABLE chunks_meta ADD COLUMN figure_label VARCHAR(64) NULL",
                 "ALTER TABLE chunks_meta ADD COLUMN figure_caption TEXT NULL",
                 "ALTER TABLE documents ADD INDEX idx_md5 (file_md5)",
+                # 回收站：deleted_at 供列表排序/展示，prev_status 供"恢复成原状"
+                "ALTER TABLE documents ADD COLUMN deleted_at DATETIME NULL",
+                "ALTER TABLE documents ADD COLUMN prev_status VARCHAR(32) NULL",
             ):
                 try:
                     await conn.execute(text(mig))
@@ -314,6 +319,11 @@ class MySQLMetaStore(MetaStoreAdapter):
         d["quality_report"] = json.dumps(d.get("quality_report") or {})
         d["created_at"] = d.get("created_at") or datetime.utcnow()
         d["updated_at"] = datetime.utcnow()
+        # ⚠ 已在回收站（status='deleted'）的行**不接受**这次 upsert 的状态：
+        # 入库收尾（ingest_write 最后一步）就是 upsert_document，如果它能把回收站
+        # 里的行写回 done，用户就会看到"删掉的文档自己回来了"，而此刻台面上没有任何
+        # 提示。正常流程下走不到这里（删除前会拦住"正在处理中"的文档），
+        # 这一条是兜底：宁可状态不变，也不要静默复活。
         async with self._session() as s:
             await s.execute(text("""
                 INSERT INTO documents
@@ -327,7 +337,8 @@ class MySQLMetaStore(MetaStoreAdapter):
                    :status, :chunk_count, :allowed_roles, :version,
                    :quality_report, :created_by, :created_at, :updated_at)
                 ON DUPLICATE KEY UPDATE
-                  status=VALUES(status), chunk_count=VALUES(chunk_count),
+                  status=IF(status='deleted', status, VALUES(status)),
+                  chunk_count=VALUES(chunk_count),
                   quality_report=VALUES(quality_report),
                   storage_url=VALUES(storage_url),
                   page_count=VALUES(page_count), version=VALUES(version),
@@ -377,10 +388,88 @@ class MySQLMetaStore(MetaStoreAdapter):
 
     async def delete_document(self, doc_id: str, tenant_id: str) -> None:
         async with self._session() as s:
+            # table_data **没有外键**（见 DDL：加不了 ON DELETE CASCADE，存量库里
+            # 已有表结构也改不动），只删 documents 会把它的行永久留下 —— 文档没了、
+            # 结构化行还在，按 doc_id 巡检/统计都对不上。这里显式先删子表。
+            await s.execute(text("DELETE FROM table_data WHERE doc_id=:id"),
+                            {"id": doc_id})
             await s.execute(text(
                 "DELETE FROM documents WHERE doc_id=:id AND tenant_id=:t"),
                 {"id": doc_id, "t": tenant_id})
             await s.commit()
+
+    async def soft_delete_document(self, doc_id: str,
+                                   tenant_id: str) -> str | None:
+        """移入回收站：`status='deleted'` + `deleted_at=NOW()` + 记住原状态。
+
+        `prev_status` 用 COALESCE 保护：对**已经在回收站**的文档再点一次删除，
+        不能把 prev_status 覆盖成 'deleted'（那就永远恢复不成原状了）。
+        返回删除前的状态；文档不存在（或不属于该租户）返回 None。
+        """
+        await self._ensure_tables()
+        async with self._session() as s:
+            row = await s.execute(text(
+                "SELECT status, prev_status FROM documents "
+                "WHERE doc_id=:id AND tenant_id=:t"), {"id": doc_id, "t": tenant_id})
+            r = row.mappings().first()
+            if r is None:
+                return None
+            cur = str(r["status"] or "")
+            if cur == IngestStatus.DELETED.value:
+                return str(r["prev_status"] or IngestStatus.DONE.value)
+            await s.execute(text(
+                "UPDATE documents SET status=:st, prev_status=:prev, "
+                "deleted_at=NOW(), updated_at=NOW() WHERE doc_id=:id"),
+                {"st": IngestStatus.DELETED.value, "prev": cur, "id": doc_id})
+            await s.commit()
+            return cur
+
+    async def restore_document(self, doc_id: str,
+                               tenant_id: str) -> str | None:
+        await self._ensure_tables()
+        async with self._session() as s:
+            row = await s.execute(text(
+                "SELECT status, prev_status, chunk_count FROM documents "
+                "WHERE doc_id=:id AND tenant_id=:t"), {"id": doc_id, "t": tenant_id})
+            r = row.mappings().first()
+            if r is None:
+                return None
+            cur = str(r["status"] or "")
+            if cur != IngestStatus.DELETED.value:
+                return cur                     # 不在回收站：原样返回，不硬改状态
+            # 老数据没有 prev_status（本次改动之前删的）→ 按"有没有块"兜底：
+            # 有块说明当时是能用的，恢复成 done；没块说明本来就是 failed。
+            back = str(r["prev_status"] or "") or (
+                IngestStatus.DONE.value if int(r["chunk_count"] or 0)
+                else IngestStatus.FAILED.value)
+            try:
+                back = IngestStatus(back).value
+            except ValueError:
+                back = IngestStatus.DONE.value
+            await s.execute(text(
+                "UPDATE documents SET status=:st, prev_status=NULL, deleted_at=NULL, "
+                "updated_at=NOW() WHERE doc_id=:id"),
+                {"st": back, "id": doc_id})
+            await s.commit()
+            return back
+
+    async def delete_chunks(self, chunk_ids: list[str]) -> int:
+        """按 chunk_id 批量删除块元数据（重跑清理旧块用），返回删除条数"""
+        ids = [c for c in (chunk_ids or []) if c]
+        if not ids:
+            return 0
+        await self._ensure_tables()
+        total = 0
+        async with self._session() as s:
+            for i in range(0, len(ids), 500):
+                sub = ids[i:i + 500]
+                ph = ",".join(f":c{j}" for j in range(len(sub)))
+                res = await s.execute(
+                    text(f"DELETE FROM chunks_meta WHERE chunk_id IN ({ph})"),
+                    {f"c{j}": v for j, v in enumerate(sub)})
+                total += int(res.rowcount or 0)
+            await s.commit()
+        return total
 
     async def find_doc_by_md5(self, file_md5: str, tenant_id: str) -> DocumentMeta | None:
         async with self._session() as s:
@@ -600,8 +689,28 @@ class MySQLMetaStore(MetaStoreAdapter):
     # ── 表格数据 ───────────────────────────────────────────
 
     async def upsert_table_data(self, tables: list[TableData]) -> None:
+        """写表格结构化行：**按 doc 整体替换**（先删该 doc 的旧行，再插新行）
+
+        为什么不是纯 INSERT：`table_data` 没有可用的自然唯一键 ——
+        `table_index` 在 Excel 分支里是"每 200 行切片"的编号（同一张 sheet 的多个
+        切片会重复），`chunk_id` 在"表格块没生成"时是空串。没有唯一键就没法
+        ON DUPLICATE KEY UPDATE，于是重跑（reingest）会**叠加**出一份重复行
+        （实测 8 行里只有 7 个不同 chunk_id，其中一对是同表被写了两遍）。
+        整体替换既幂等又顺手清掉上一轮的残留。
+
+        必须在**同一个事务**里删+插：中途失败回滚后仍是上一轮的完整数据，
+        不会出现"删了旧的、新的没进去"。
+        """
         await self._ensure_tables()
+        if not tables:
+            return
+        doc_ids = sorted({t.doc_id for t in tables if t.doc_id})
         async with self._session() as s:
+            if doc_ids:
+                ph = ",".join(f":d{i}" for i in range(len(doc_ids)))
+                await s.execute(
+                    text(f"DELETE FROM table_data WHERE doc_id IN ({ph})"),
+                    {f"d{i}": v for i, v in enumerate(doc_ids)})
             for t in tables:
                 d = t.model_dump(mode="json")
                 d["headers"] = json.dumps(d.get("headers") or [])

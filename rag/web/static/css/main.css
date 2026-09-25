@@ -137,6 +137,7 @@ img{max-width:100%}
 .btn-ghost{background:transparent;color:var(--text-secondary)}
 .btn-ghost:hover:not(:disabled){background:var(--bg-hover)}
 .btn-sm{padding:4px 10px;font-size:var(--fs-xs)}
+.btn-xs{padding:2px 8px;font-size:var(--fs-xs);border-radius:4px}
 .btn-lg{padding:12px 28px;font-size:var(--fs-lg)}
 .badge{display:inline-flex;align-items:center;font-size:var(--fs-xs);padding:2px 8px;
   border-radius:10px;font-weight:var(--fw-medium);white-space:nowrap}
@@ -434,6 +435,58 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
 .doc-filters{display:flex;gap:12px;align-items:center;margin-bottom:var(--space-4);flex-wrap:wrap}
 .doc-title-main{font-weight:var(--fw-medium)}
 .doc-title-sub{font-size:var(--fs-xs);color:var(--text-tertiary)}
+/* 表格里的"一格一行"：时间/大小这类值不许折行 ——
+   日期与时间被拆成两行时，"哪一次上传"反而更难一眼扫出来（知识库里同名文件靠时间区分） */
+.nowrap{white-space:nowrap}
+/* 文档名：长名字在格子里换行，但不撑破列宽 */
+.cell-name{word-break:break-all}
+
+/* ── 行内图标操作（文档列表 / 回收站）──────────────────────────
+   用户要求：操作列用四个小图标代替「详情 / 重解析 / 下载 / 删除」文字按钮，
+   紧凑排列；图标简约——简单线条 + 透明底；悬浮时显示对应文字。
+   实现要点：
+   · 图标是内联 SVG，颜色走 currentColor、描边 fill:none，所以"透明底 + 单色线条"
+     是天然结果，不需要给每个图标配图片；
+   · 按钮本身 28×28、无边框、无底色（hover 才给背景），四个排下来约 120px，
+     比原来的文字按钮（250px 列宽）省一半；
+   · 悬浮文字用绝对定位的子元素而不是原生 title：原生 title 有 1 秒延迟、
+     样式不可控，且和自定义提示会同时弹出（两个气泡）。 */
+.icon-actions{display:flex;align-items:center;gap:2px;justify-content:flex-end}
+.icon-act{position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:28px;height:28px;padding:0;background:transparent;border:none;
+  border-radius:var(--radius-sm);color:var(--text-tertiary);cursor:pointer;
+  transition:color var(--anim-fast),background var(--anim-fast)}
+.icon-act svg{width:16px;height:16px;display:block}
+/* 线条风格统一在这里：只描边不填充，1.6px 细线 + 圆角接头 */
+.icon-act svg *{fill:none;stroke:currentColor;stroke-width:1.6;
+  stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.icon-act:hover{background:var(--bg-hover);color:var(--text-primary)}
+.icon-act:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+.icon-act.danger:hover{background:var(--error-light);color:var(--error)}
+.icon-act:disabled{opacity:.45;cursor:not-allowed;background:transparent}
+/* 悬浮文字：锚在图标右边缘**向左生长** —— 操作列是最后一列，
+   居中对齐的气泡会越过表格右边界被裁掉。
+   形状是**横长的方块**（用户要求：宽大于高）：定一个最小宽度让短标签也有块状感，
+   上限定在 300px 保证说明文字两三行就收住，不会变成窄高条。 */
+.icon-tip{position:absolute;bottom:calc(100% + 6px);right:0;z-index:20;
+  background:var(--text-primary);color:var(--bg-surface);font-size:var(--fs-xs);
+  font-weight:var(--fw-semibold);line-height:1.55;padding:7px 12px;
+  border-radius:var(--radius-sm);min-width:200px;max-width:300px;
+  white-space:normal;opacity:0;pointer-events:none;
+  transition:opacity var(--anim-fast);box-shadow:var(--shadow-md);text-align:left}
+/* 第二行说明：常规字重 + 稍暗，与第一行的动作名区分开（不额外加标记，省一层 DOM） */
+.icon-tip-sub{display:block;font-weight:var(--fw-normal);opacity:.72;margin-top:3px}
+.icon-act:hover .icon-tip,.icon-act:focus-visible .icon-tip{opacity:1}
+/* 操作列只放四个 28px 图标，给它固定窄宽度，别把文档名那一列挤没 */
+.th-actions{width:132px}
+/* 回收站：勾选框列（用户要求复选框在文件名**前面**） */
+.col-check{width:36px;text-align:center}
+.col-check input{margin:0}
+.trash-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:var(--space-3);
+  padding:8px 14px;background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm)}
+.trash-toolbar .sel-count{font-size:var(--fs-sm);color:var(--text-secondary);margin-right:auto}
+.trash-toolbar .sel-count b{color:var(--primary)}
 .quality-block{border-top:1px solid var(--border);padding:12px 14px}
 .q-dist{display:flex;height:10px;border-radius:5px;overflow:hidden;margin:8px 0;background:var(--bg-hover)}
 .q-dist>span{display:block;height:100%}

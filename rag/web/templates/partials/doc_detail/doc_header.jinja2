@@ -2,7 +2,9 @@
 {% set d = data if data is defined else none %}
 {% set doc = d.doc if d and d.doc is defined else (doc if doc is defined else none) %}
 {% if doc %}
-<div class="doc-title-row">
+{# data-doc-status 供前端判断"还在处理中吗"：活动态才开轮询，终止态自动停
+   （见 doc-detail.js 的 ensurePoll） #}
+<div class="doc-title-row" data-doc-status="{{ doc.status }}">
   <h1>{{ doc.filename }}</h1>
   {{ dd_status_badge(doc.status) }}
   {% if doc.status == 'deleted' %}<span class="trash-badge">🗑 回收站中</span>{% endif %}

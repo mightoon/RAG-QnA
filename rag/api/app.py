@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 from rag.config.loader import load_config
 from rag.config.models import AppConfig
 from rag.container import ServiceContainer
-from rag.observability.logging import get_logger
+from rag.observability.logging import configure_logging, get_logger
 
 log = get_logger("rag.api")
 
@@ -26,6 +26,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     if config is None:
         config = load_config(
             os.environ.get("RAG_CONFIG", "customer/customer_config.yaml"))
+
+    # 日志初始化放在**最前面**（在第一条日志之前）：级别与格式取自
+    # observability.log_level / log_json。历史缺陷：这个函数全仓没人调用，
+    # structlog 跑默认配置 → 不做级别过滤（debug 也打）、也不是 JSON，
+    # 两个配置项都是摆设（详见 doc/data_path.md §8.28）。
+    configure_logging(config.observability.log_level,
+                      config.observability.log_json)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

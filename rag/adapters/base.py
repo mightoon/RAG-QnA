@@ -34,8 +34,23 @@ class LLMAdapter(ABC):
         task: str = "generate",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        response_format: dict | None = None,
+        thinking: bool | None = None,
     ) -> str:
-        """非流式生成，返回完整文本"""
+        """非流式生成，返回完整文本
+
+        `response_format`：结构化输出约束（OpenAI 兼容接口的
+        `{"type": "json_object"}`）。要求"必须回 JSON"的场景（摘要/关键词/实体）
+        应当传它 —— 靠 prompt 求模型吐 JSON 在推理模型上并不可靠：思考过程会先把
+        `max_tokens` 吃光，`content` 为空、只剩 `reasoning_content`。
+        实现若不被服务端支持，应自动去掉该参数重试，而不是让整条链路失败。
+
+        `thinking`：是否让推理模型"别思考"（**内部参数**，不作为配置项暴露给客户）。
+        `None` = 按内置策略：摘要/抽取/分类/评估/看图描述这类"短且结构化"的任务关掉
+        思考，开放式作答保留。关闭方式随服务端而异（DeepSeek `thinking.type`、
+        OpenAI `reasoning_effort`、自托管 `chat_template_kwargs`），实现应自行探测
+        并在不生效时降级，绝不能因为"关不掉"就抛错。
+        """
 
     @abstractmethod
     async def stream_generate(
@@ -118,8 +133,12 @@ class VectorStoreAdapter(ABC):
         """按 doc_id 删除该文档所有向量，返回删除数"""
 
     @abstractmethod
-    async def delete_by_ids(self, collection: str, ids: list[str]) -> None:
-        """按 chunk_id 批量删除"""
+    async def delete_by_ids(self, collection: str, ids: list[str]) -> int:
+        """按 chunk_id 批量删除，返回删除数（"-1" = 该后端不返回计数）
+
+        入库重跑时要清掉"上次留下、这次没再产出"的旧块，调用方把返回值写进日志
+        与运维结论，所以**不要把计数丢掉**。
+        """
 
     @abstractmethod
     async def get_doc_chunk_ids(self, collection: str, doc_id: str) -> set[str]:
@@ -173,8 +192,15 @@ class FullTextSearchAdapter(ABC):
     async def upsert_chunks(
         self, index: str, chunks: list[ChunkMeta],
         texts: list[str], summaries: list[str | None], keywords: list[list[str]],
+        doc: dict | None = None,
     ) -> None:
-        """批量写入 Chunk 全文索引"""
+        """批量写入 Chunk 全文索引
+
+        `doc` 为文档级字段（filename / file_type / created_at）：mapping 里声明了
+        它们，但每个 chunk 都不携带，必须由调用方从 DocumentMeta 带进来 ——
+        不写的话，Kibana 里按时间字段筛选会因为"字段根本不存在"而查不到任何文档，
+        引用来源也拿不到文件名。
+        """
 
     @abstractmethod
     async def search(
@@ -204,6 +230,22 @@ class FullTextSearchAdapter(ABC):
     @abstractmethod
     async def get_doc_chunk_ids(self, index: str, doc_id: str) -> set[str]:
         """一致性巡检辅助"""
+
+    async def delete_by_ids(self, index: str, chunk_ids: list[str]) -> int:
+        """按 chunk_id 批量删除（重跑清理旧块用）；返回删除条数。
+
+        默认返回 0：不支持的实现不会因此中断入库，只是清理不生效。
+        """
+        return 0
+
+    async def get_doc_enrichment(self, index: str,
+                                 doc_id: str) -> dict[str, dict]:
+        """取该文档各块的增强字段 `{chunk_id: {"summary":…, "keywords":[…]}}`
+
+        供一致性巡检**补写**时保留原有摘要/关键词：补写走的是同一个 upsert，
+        传空值就等于把 ES 里已有的增强结果抹掉（而这两样在 MySQL 没有副本）。
+        """
+        return {}
 
     async def health_check(self) -> bool:
         return True
@@ -240,6 +282,19 @@ class MetaStoreAdapter(ABC):
     async def delete_document(self, doc_id: str, tenant_id: str) -> None: ...
 
     @abstractmethod
+    async def soft_delete_document(self, doc_id: str,
+                                   tenant_id: str) -> str | None:
+        """移入回收站（status=deleted）：只改状态与 deleted_at/prev_status，
+        **不动任何内容**（chunks / 向量 / 全文索引 / 对象存储都原样保留），
+        这样"恢复"才是原样回来。返回删除前的状态；文档不存在返回 None。"""
+
+    @abstractmethod
+    async def restore_document(self, doc_id: str,
+                               tenant_id: str) -> str | None:
+        """从回收站恢复：把 status 还原成 prev_status（老数据按有无块兜底），
+        并清掉 deleted_at/prev_status。返回恢复后的状态。"""
+
+    @abstractmethod
     async def find_doc_by_md5(self, file_md5: str, tenant_id: str) -> DocumentMeta | None: ...
 
     # ── Chunk 元数据 ───────────────────────────────────────
@@ -270,6 +325,13 @@ class MetaStoreAdapter(ABC):
     async def get_chunk_texts(self, chunk_ids: list[str]) -> dict[str, str]:
         """按 chunk_id 批量取回正文；不支持正文字段的实现返回空字典。"""
         return {}
+
+    async def delete_chunks(self, chunk_ids: list[str]) -> int:
+        """按 chunk_id 批量删除元数据（重跑清理旧块用）；返回删除条数。
+
+        默认返回 0（不支持则不动），调用方据返回值判断是否真的清掉。
+        """
+        return 0
 
     async def list_collections(self, tenant_id: str) -> list[str]:
         """该租户下已有数据的逻辑集合清单（供多集合检索展开 "*"）"""

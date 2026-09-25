@@ -75,6 +75,8 @@
 | TS-021 | 关机时 Milvus / Qdrant / ES 被静默跳过：`shutdown()` 与 `_close_quietly()` 用了两套关闭入口查找规则 | container / 各适配器生命周期 |
 | TS-022 | 换过向量模型后检索静默失准：同维不同源的向量住进同一个集合（服务全绿、不报错、RRF 也淘汰不掉） | vector_store 适配器 / 向量空间指纹（新增） / container / 入库与检索链路 / 监控页 |
 | TS-023 | 配置页「测试连接」拿掩码当密钥（假 401、模型列表空）+ 保存把凭据明文写回 / 把留空当清空 | 配置文件凭据（新增加密） / 配置页载荷与探测 / 适配器降级链路 |
+| TS-024 | 全站确认框「点确认等于点取消」（Promise 被关闭回调抢先 settle）：删除/恢复/重试等所有需要点"是"的操作都被静默取消 | 确认弹框 / 删除与上传确认链路 |
+| TS-025 | 删除改成两段式（回收站）时暴露的四处隐患：恢复无条件写 done 把 partial/failed 洗成"已完成" / ES 索引不存在被记成"删除失败" / 删除与入库收尾抢状态（删了会自己回来） / 回收站文档仍可被重解析 | documents 状态机 / 回收站字段 / 五库清理 / 知识库列表与回收站视图 |
 | 附录 | 优化前后指标对比 / 验证脚本 / 经验总结 / 适配器命名体系（组件名 ↔ 槽位 ↔ 注册名） | — |
 
 ---
@@ -2603,6 +2605,120 @@ connector: <aiohttp.connector.TCPConnector object at 0x…>
 6. **顺带暴露的既有缺陷：探测函数的返回值没有统一契约。** `_probe_mysql_with_form` 两处返回 3 元组、
    其余同类函数返回 2 元组，而调用方按 2 元组解包 —— 一条"参数非法"的输入就能把它变成 `ValueError`，
    而不是一次可读的失败原因。⇒ 契约统一为 `(bool, str)`，失败原因始终能落到界面上。
+
+---
+
+## TS-024 全站确认框"点确认等于点取消"（Promise 被关闭回调抢先 settle）+ 删除路径上的两个连带缺陷
+
+### 现象
+
+知识库列表里点「删除」→ 确认框正常弹出 → 点「确认」→ **什么都没发生**（文档仍在列表里，
+一个库都没清）。浏览器控制台无报错，后端日志无请求。
+
+### 定位过程
+
+1. 先用应用自己的签发接口拿 Token（`POST /api/auth/token`，无需知道 JWT 密钥），
+   对**正在运行的服务**发一次 `DELETE /api/documents/{id}/permanent`：
+   临时造一个"无 storage_url"的文档行 → 返回 **500 服务器内部错误**，行仍在库里。
+2. 换成**手工构造的 admin Token** 反被 401 拒绝（`签名无效`）—— 说明该进程用的
+   `JWT_SECRET` 与配置文件里的 `${JWT_SECRET:-change-me-in-production}` 不同，
+   无关本次缺陷，但记下来：**用应用自己的签发接口才能复现真实调用**。
+3. 500 的成因：删除是一条直线，`fulltext.delete_by_doc()` 打到**不存在的 ES 索引**时抛
+   `NotFoundError` → 整条链路中断，后面的对象存储与元数据**一个都不会清**。
+   但用户这条文档所在集合的索引是存在的，它连 500 都没有 —— 说明请求压根没发出去。
+4. 读 `partials.js` 的 `confirm()`：
+
+   ```js
+   ok.addEventListener('click', function () { m.close(); resolve(true); });
+   ```
+
+   而 `buildModal.close()` 会回调 `onClose`，那里写的是 `resolve(false)`
+   —— **Promise 只认第一次 settle**，`m.close()` 先触发的 `resolve(false)` 永远赢。
+   点「确认」= `false`，点「取消」= `false`：取消键"看起来正常"，
+   所以这个 bug 从未被察觉（同理也解释了上传重复文件弹框里"选了重解析却按跳过执行"）。
+
+### 修复方式
+
+1. `rag/web/static/js/partials.js`（`confirm`）：加 `settled` 守卫 + 先 `decide(结果)`
+   再 `close()`，`onClose` 只在"没决定过"时兜底为 `false`；
+   `window.confirmDialog` 全站共用，一处修好、所有确认类操作恢复。
+2. `rag/web/routes.py`（`permanent_delete_document`）：五个存储**逐个 try**，
+   失败的记进 `failed[]` 并如实回报，其余照删；元数据放最后且一定要试。
+3. 同处新增**共享对象保护**：秒传别名那一行的 `storage_url` 是照抄源文档的，
+   直接删会把源文档还在用的原文件删掉（列表里源文档还在、块也都在，
+   但下载/重解析从此失败）。删除前先查有没有别的文档行引用同一个 `storage_url`，
+   有则保留对象（日志 `permanent_delete_keep_storage`）。
+4. 前端把「删除」在列表页与详情页统一成同一个语义 —— 当时统一成了**彻底删除**，
+   后来（用户口径变更）统一成**移入回收站**：两段式，回收站里勾选后才彻底删除，
+   误点一次的代价从"索引不可恢复"降到"点一次恢复"。详见
+   `doc/data_path.md` §8.27 与 `doc/ui_spec_v3.md` §7.1。
+
+### 根因分析
+
+- **"Promise 只能 settle 一次"与"关闭回调"相遇时的经典陷阱**：把用户意图写在事件处理
+  里、把兜底写在 `onClose` 里，两者顺序一旦颠倒，兜底就会覆盖意图。凡是
+  `resolve` 出现在 `close()` 之后的写法都不可靠 —— 正确姿势是**先决定、后关闭**，
+  并用 `settled` 守卫把"已决定"这件事显式化（`tmp_selftest/t_confirm.mjs` 与
+  `tmp_selftest/t_dialog.mjs` 都以"桩驱动真实函数"的方式盯住这一点）。
+- **静默失败最难发现**：按钮点下去没有报错、没有请求、没有日志，用户只会说"没生效"。
+  因此删除这类多存储操作必须**逐库留痕并回报失败项**，而不是一条直线跑到底。
+- **别名/秒传这类"多行指向同一份数据"的模型**，任何按行清理的动作都要先问一句
+  "这份数据还有别人在用吗"。
+
+---
+
+## TS-025 删除改成两段式（回收站）时暴露的四处隐患
+
+### 背景
+
+用户口径变更：列表里的「删除」应当是**移入回收站**（可恢复），只有"在回收站里勾选后
+再删除"才真正落到各数据库上 —— 误点一次的代价从"索引不可恢复"降到"点一次恢复"。
+改造过程中发现四处**原有行为与新语义直接冲突**的地方，一并修掉。
+
+### 四处隐患与修法
+
+1. **恢复无条件写 `done`**（`web/routes.py` 的 `restore_document`）。
+   一篇 `partial`（部分库没写进去）或 `failed` 的文档，删一次再恢复就变成"已完成" ——
+   状态筛选、统计卡、质量视图当场失真，而且**没有任何提示**。
+   修法：新增 `documents.prev_status`，删除时记下原状态，恢复时原样还原；
+   老数据（没有这一列）按"有没有块"兜底（有块→done，没块→failed），不猜。
+2. **ES 索引不存在被记成"删除失败"**（`_purge_document`）。
+   在一个从来没有建过索引的集合里删文档，ES 抛 `index_not_found_exception`，
+   原来直接进 `failed[]` → 界面永远显示"部分清理失败：fulltext"，用户以为没删干净、
+   反复点。修法：把"目标库里本来就没有内容"（ES `index_not_found`、Milvus
+   collection not found）记为 `cleaned: "fulltext(absent)"`；真正的异常照旧报失败。
+   （`tmp_selftest/t_permanent_delete.py` 相应地把故障注入换成真实异常，
+   并新增"索引不存在记 absent"一项。）
+3. **删除与入库收尾抢状态**。文档行的状态由**入库收尾**写：`ingest_write` 最后一步是
+   `upsert_document(ctx.doc)`（status=done/partial）。若允许在解析途中删除，
+   收尾会把 `deleted` 覆盖成 `done` —— 用户看到"删掉的文档自己回来了"。
+   修法两道：① 删除前查**任务行**（不是文档行，文档行压根不停在中间态），
+   有活动任务就 409 并说明"正在处理中（parsing）"；② SQL 兜底
+   `status=IF(status='deleted', status, VALUES(status))`，回收站里的行不接受任何
+   后续 upsert 带来的状态变化。同理，**回收站里的文档拒绝重解析**（409）。
+4. **回收站成了"绕过恢复"的旁路**：批量彻底删除原来对任何 doc_id 都执行。
+   修法：只允许 `status='deleted'` 的行走彻底删除，其余进 `skipped[]` 并说明原因 ——
+   这样"删除"这个词在界面上始终是两段：第一段永远可恢复。
+
+### 自测里踩到的坑（与本功能无关，但会误导结论）
+
+- **`submit()` 的返回值早就是三元组** `(batch, tasks, duplicates)`，`t_e2e_ingest.py`
+  还在按两元组解包 → `ValueError`，但**任务已经提交、对象已上传**，
+  于是库里留下一个"有原文件、0 块"的幽灵文档，把后续核对（`fetchone()` 不带
+  ORDER BY）选错对象，报出"ES 文档数=0"的假象。教训：脚本崩溃不等于"什么都没发生"。
+- **Milvus 裸 `query()` 默认 Bounded 一致性**：删完立刻查会读到旧快照（实测报
+  "剩余=10"），必须走适配器的 `get_doc_chunk_ids()`（内部 `consistency_level="Strong"`，
+  见 `vector_store.py:438` 的注释）才是真实状态。
+- **`decrypt()` 的 `key_dir` 默认是当前工作目录**：在仓库根目录下调用会**新建一个
+  `.secrets.key`** 并用它解密 → 解不开（密文是 `customer/.secrets.key` 加的），
+  还在根目录留下一个假密钥文件（本次已删除）。自测脚本一律显式传 `key_dir="customer"`。
+
+### 回归
+
+`tmp_selftest/t_recycle_bin.py`（真实 MySQL/MinIO + 真实模板渲染：软删除 → 恢复 →
+批量彻底删除 → 三处护栏 → 片段数据源与 HTML 结构）、
+`tmp_selftest/t_trash_ui.mjs`（桩驱动真实前端逻辑：勾选、全选、刷新后保留勾选、
+只把勾选的文档发给 purge 接口）、`tmp_selftest/t_permanent_delete.py`（五库清理）。
 
 ---
 

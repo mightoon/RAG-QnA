@@ -92,6 +92,7 @@ class ConsistencyChecker:
             try:
                 es_ids = await self.s.fulltext.get_doc_chunk_ids(
                     doc.collection, doc.doc_id)
+                # ES 侧父子块都索引 → 这里用全量比（与向量侧判据不同是**故意的**）
                 if mysql_ids - es_ids:
                     return False
             except Exception:
@@ -100,11 +101,19 @@ class ConsistencyChecker:
             try:
                 vec_ids = await self.s.vector.get_doc_chunk_ids(
                     doc.collection, doc.doc_id)
-                child_ids = {cid for cid in mysql_ids}     # 父块不入向量库
-                if child_ids - vec_ids:
-                    # 需排除父块：粗判（缺失过多才算）
-                    if len(child_ids - vec_ids) > len(child_ids) * 0.1:
-                        return False
+                # ⚠ 只比**子块**：父块按设计不进向量库（is_parent=True 的块不生成
+                # embedding）。原实现拿 MySQL 全量 chunk（含父块）去比，而父块数≈
+                # 子块数 → 缺失比例天然 ~50% → **每篇文档都被判不一致**并触发一次
+                # 无效补写（补写时又排除父块，实际修不动）。抽样巡检因此退化成常态
+                # 化误报。list_chunk_ids 不带 is_parent，必须取元数据才能筛。
+                metas = await self.s.meta.get_chunks_by_ids(list(mysql_ids))
+                child_ids = {m.chunk_id for m in metas if not m.is_parent}
+                if not child_ids:
+                    return True
+                missing = child_ids - vec_ids
+                # 少量缺失属正常抖动（写入与清理并发），超过一成才算不一致
+                if len(missing) > len(child_ids) * 0.1:
+                    return False
             except Exception:
                 pass
         return True
@@ -129,12 +138,30 @@ class ConsistencyChecker:
                 return False
             chunks = [c for c, _ in pairs]
             texts = [t for _, t in pairs]
-            summaries = [None] * len(chunks)
-            keywords = [[] for _ in chunks]
+            # 摘要/关键词**从 ES 原文档读回来**再写回：补写走的是同一个 upsert，
+            # 传空值等于把已有的增强结果抹掉，而这两样在 MySQL 没有副本
+            # （`chunks_meta` 没这两列）—— 一次巡检修复就会永久丢掉它们。
+            enriched: dict[str, dict] = {}
+            if self.s.fulltext is not None:
+                enriched = await self.s.fulltext.get_doc_enrichment(
+                    doc.collection, doc.doc_id)
+            summaries = [(enriched.get(c.chunk_id) or {}).get("summary")
+                         for c in chunks]
+            keywords = [list((enriched.get(c.chunk_id) or {}).get("keywords")
+                             or []) for c in chunks]
+            kept = sum(1 for s in summaries if s)
+            if enriched and not kept:
+                log.info("repair_no_enrichment_kept", doc_id=doc.doc_id,
+                         chunks=len(chunks),
+                         hint="ES 侧本来就没有摘要/关键词，补写后仍为空")
             repaired = False
             if self.s.fulltext is not None:
                 await self.s.fulltext.upsert_chunks(
-                    doc.collection, chunks, texts, summaries, keywords)
+                    doc.collection, chunks, texts, summaries, keywords,
+                    doc={"filename": doc.filename, "file_type": doc.file_type,
+                         "created_at": (doc.created_at.strftime(
+                             "%Y-%m-%dT%H:%M:%SZ")
+                             if getattr(doc, "created_at", None) else "")})
                 repaired = True
             if self.s.vector is not None:
                 # 向量空间门禁：与入库同一个判据。这里若不拦，巡检修复会把伪向量

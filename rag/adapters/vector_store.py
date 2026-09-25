@@ -450,18 +450,19 @@ class MilvusVectorStore(VectorStoreAdapter):
             return len(found)
         return await asyncio.to_thread(_delete)
 
-    async def delete_by_ids(self, collection: str, ids: list[str]) -> None:
+    async def delete_by_ids(self, collection: str, ids: list[str]) -> int:
         if not ids:
-            return
+            return 0
         full = self._full_name(collection)
 
         def _delete():
             cli = self._client()
             if not cli.has_collection(full):
-                return
+                return 0
             quoted = ",".join(f'"{i}"' for i in ids)
             cli.delete(collection_name=full, filter=f"chunk_id in [{quoted}]")
-        await asyncio.to_thread(_delete)
+            return len(ids)
+        return await asyncio.to_thread(_delete)
 
     async def get_doc_chunk_ids(self, collection: str, doc_id: str) -> set[str]:
         full = self._full_name(collection)
@@ -712,12 +713,13 @@ class QdrantVectorStore(VectorStoreAdapter):
         resp.raise_for_status()
         return -1   # Qdrant 不返回计数
 
-    async def delete_by_ids(self, collection: str, ids: list[str]) -> None:
+    async def delete_by_ids(self, collection: str, ids: list[str]) -> int:
         resp = await self._client.post(
             f"/collections/{self._full_name(collection)}/points/delete?wait=true",
             json={"points": ids},
         )
         resp.raise_for_status()
+        return -1   # Qdrant 不返回计数
 
     async def get_doc_chunk_ids(self, collection: str, doc_id: str) -> set[str]:
         resp = await self._client.post(
@@ -866,12 +868,13 @@ class PgVectorStore(VectorStoreAdapter):
             await conn.commit()
             return cur.rowcount or 0
 
-    async def delete_by_ids(self, collection: str, ids: list[str]) -> None:
+    async def delete_by_ids(self, collection: str, ids: list[str]) -> int:
         table = self._table(collection)
         async with await self._conn() as conn:
-            await conn.execute(f"DELETE FROM {table} WHERE chunk_id = ANY(%s)",
-                               (ids,))
+            cur = await conn.execute(
+                f"DELETE FROM {table} WHERE chunk_id = ANY(%s)", (ids,))
             await conn.commit()
+            return cur.rowcount or 0
 
     async def get_doc_chunk_ids(self, collection: str, doc_id: str) -> set[str]:
         table = self._table(collection)
