@@ -1,11 +1,16 @@
 {% set d = data if data is defined else none %}
+{# ⚠ `d.items` 不能写：Jinja 取属性**优先于**取键，字典的 `items` 是内置方法，
+   于是 `{% for c in d.items %}` 拿到的是 method → TypeError:
+   'builtin_function_or_method' object is not iterable（详情页点「分块」直接 500）。
+   凡是与 dict 方法同名的键（items/values/keys/get/copy/...）一律用下标写法。 #}
+{% set chunks = d['items'] if d is not none else none %}
 {% if d is none %}
   <div class="table-empty">加载中…</div>
-{% elif not d.items %}
+{% elif not chunks %}
   <div class="table-empty">暂无分块</div>
 {% else %}
 <div class="chunk-list">
-  {% for c in d.items %}
+  {% for c in chunks %}
   <div class="chunk-item" data-chunk-id="{{ c.chunk_id }}">
     <div class="chunk-head">
       <span class="chunk-index">#{{ c.n }}</span>

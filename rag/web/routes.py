@@ -3772,6 +3772,14 @@ def _queue_view(c: ServiceContainer) -> dict:
 
 
 async def _parse_preview_data(c: ServiceContainer, doc_id: str) -> dict:
+    """内容预览的数据：按**文档顺序**取块，父块不参与（否则正文会出现两遍）
+
+    · 顺序来自 `list_chunk_ids`（按 chunks_meta.seq 排；老数据按页码兜底）。
+    · 父块是"整节的聚合文本"，它的正文**已经包含**了自己的所有子块 ——
+      两者一起展示时同一段话会连着出现两遍（实测预览就是这个观感）。
+      预览要回答的是"解析出来的正文对不对"，所以展示检索单元（子块）；
+      只有整篇都没子块时（极端情况）才退回展示父块，避免预览空白。
+    """
     try:
         ids = await c.meta.list_chunk_ids(doc_id)
     except Exception:
@@ -3782,6 +3790,17 @@ async def _parse_preview_data(c: ServiceContainer, doc_id: str) -> dict:
         texts = await c.meta.get_chunk_texts([x.chunk_id for x in metas])
     except Exception:
         pass
+    by_id = {m.chunk_id: m for m in metas}
+    # ⚠ 顺序必须按 `ids`（list_chunk_ids 的 seq 序）重排：get_chunks_by_ids 走的是
+    # `WHERE chunk_id IN (...)`，MySQL 返回的是**主键（哈希）序**，直接遍历它就又把
+    # 顺序打乱了 —— 那样"按文档顺序预览"只做了一半。
+    ordered = [by_id[cid] for cid in ids[:500] if cid in by_id]
+    # 一场父子两级的取舍：父块 = 整节的聚合正文，子块是父块的**片段**。
+    # 两者一起展示时同一段话会出现两遍（实测就是"正文重复"的观感）；
+    # 只展示父块 = 全文按节出现一次、覆盖完整；没有父块的文档（短文档/Excel）
+    # 退回展示全部块，避免预览空白。
+    parents = [m for m in ordered if m.is_parent]
+    metas = parents or ordered
     elements, outline, seen = [], [], set()
     for i, cm in enumerate(metas, 1):
         text = texts.get(cm.chunk_id, "") or ""

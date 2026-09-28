@@ -119,16 +119,25 @@
     qsa('[data-doc-op]').forEach(btn => {
       btn.addEventListener('click', () => doOp(btn.dataset.docOp, filename));    });
 
+    /* 面板切换：**每次点击都重拉一次**该面板的片段。
+       两个理由（都来自用户反馈"点内容预览无反应"）：
+       ① 内容预览是默认面板，点到已经选中的 tab 时原来什么都不做 —— 用户看到的是
+          "按钮点了没反应"。现在重拉一次：有加载态、也保证内容是最新的
+          （刚做完重解析就想看新结果时尤其需要）；
+       ② 原来分块用 `chunks.loaded` 做**一次性闩锁**：首次加载失败（服务端 500）
+          后闩锁已经置位，面板永久停在错误条上、再点也不重试。现在每次点击都会重试。 */
     qsa('[data-dtab]').forEach(tab => {
       tab.addEventListener('click', () => {
+        const name = tab.dataset.dtab;
         qsa('[data-dtab]').forEach(t => t.classList.toggle('active', t === tab));
         qsa('[data-dtab-panel]').forEach(p =>
-          p.classList.toggle('hidden', p.dataset.dtabPanel !== tab.dataset.dtab));
-        if (tab.dataset.dtab === 'chunks' && !chunks.loaded) {
-          chunks.loaded = true;
+          p.classList.toggle('hidden', p.dataset.dtabPanel !== name));
+        if (name === 'chunks') {
           Partials.refreshPiece('chunks_container', {
-            query: Object.assign(docQuery(), { page: 1, size: chunks.size })
+            query: Object.assign(docQuery(), { page: chunks.page, size: chunks.size })
           });
+        } else if (name === 'preview') {
+          Partials.refreshPiece('preview_pane', { query: docQuery() });
         }
       });
     });

@@ -12,7 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ═══════════════════════════════════════════════════════════
@@ -171,6 +171,11 @@ class ChunkMeta(BaseModel):
     doc_id: str
     tenant_id: str
     collection: str
+    # 块在**文档内的构建序号**（0 起）。它一直只活在分块过程里（chunk_id 的哈希
+    # 用它，但哈希不可逆），所以详情页的「分块」「内容预览」只能按主键（哈希）
+    # 顺序取行 —— 实测预览是 1.2 → 四、 → 1.1 → 5.2 → 七、 这种乱序。
+    # 现在落库并作为展示顺序（见 meta_mysql.list_chunk_ids）。
+    seq: int = 0
     chunk_type: str = "text"
     is_parent: bool = False
     parent_chunk_id: str | None = None
@@ -182,6 +187,18 @@ class ChunkMeta(BaseModel):
     figure_label: str | None = None         # 图/表标题编号，如"图28"
     figure_caption: str | None = None       # 图/表题注文本
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @field_validator("seq", mode="before")
+    @classmethod
+    def _seq_null_to_zero(cls, v: Any) -> Any:
+        """`seq` 列在**存量库**里是 NULL（本次改动才加的列）→ 当 0 处理。
+
+        不这么兜的话，`ChunkMeta(**row)` 会因为 `seq=None` 抛 ValidationError ——
+        而 `get_chunks_by_ids` 的调用点全都包在 try/except 里（预览、分块列表、
+        一致性巡检、父子回补），异常被吞掉就变成"块元数据全空"的**静默降级**：
+        详情页的块类型/token/section_path 全丢、巡检误判一致。实测踩到过。
+        """
+        return 0 if v is None else v
 
 
 class TableData(BaseModel):

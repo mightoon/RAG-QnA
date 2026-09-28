@@ -17,7 +17,7 @@ import base64
 import re
 from pathlib import Path
 
-from rag.adapters.doc_parse import (DocParseEndpointMissing,
+from rag.adapters.doc_parse import (DocParseBadInput, DocParseEndpointMissing,
                                     DocParseUnavailable,
                                     doc_parse_capability_for, make_client)
 from rag.models import (ContentType, ParsedElement, QualityIssue, TableData)
@@ -26,6 +26,11 @@ from rag.pipeline.base import PipelineStep, StepError, StepRegistry
 from rag.pipeline.context import IngestContext
 
 log = get_logger("rag.steps.parse")
+
+# 走 OCR 的扩展名：PDF（逐页判有无文字层）+ 图片（整图）。
+# 其余类型（md/txt/csv/html/docx/xlsx/pptx）由解析器直接读文件，**不能**送去 OCR ——
+# 详见 ParseStep.execute 里的说明（实测 .md 会让整篇文档卡在重试里）。
+_OCR_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 
 
 @StepRegistry.register("detect_format")
@@ -313,19 +318,30 @@ class ParseStep(PipelineStep):
 
         # ① 扫描页 OCR：优先用**已配置的 doc_parse 服务**，其次才是进程内 PaddleOCR。
         #    预取一次整篇结果交给解析器消费，避免解析器内部按页逐次调用远端。
+        #
+        # ⚠ 预取只对**需要 OCR 的类型**做（PDF 逐页 / 图片整图）。原实现是"非 PDF 一律
+        #   当图片送 OCR"，于是 md/txt/csv/html/docx/xlsx/pptx 的字节被丢给
+        #   /ocr 端点 → 服务端判 "Invalid input file"（实测 .md → HTTP 422）→
+        #   这里抛的是**可重试**的 StepError → 文档反复重试后失败，永远入不了库。
+        #   上传界面明明写着支持 TXT/MD/CSV/Word/Excel，实际全被这一步拦死。
         ocr_pages = None
         cap = doc_parse_capability_for(s.config, "ocr")
         ready = getattr(s, "doc_parse_ready", None)
         blocked = ready("ocr") if ready is not None else None
+        name_l = (ctx.doc.filename or "").lower()
+        need_ocr = name_l.endswith(_OCR_EXTS)
         if blocked:
             # 未配置/配错不是致命错误：扫描页回落到进程内 PaddleOCR（未装则为空文本）。
             # 但要留痕 —— 否则"扫描件入库成功却没有文字"无从归因。
             ctx.add_warning(f"OCR 服务已跳过：{blocked}")
+        elif not need_ocr:
+            log.debug("ocr_prefetch_skipped", filename=ctx.doc.filename,
+                      reason="该类型由解析器直接读取，不需要 OCR 预取")
         else:
             try:
                 data = Path(ctx.file_path).read_bytes()
                 client = make_client(s.config, cap)
-                if (ctx.doc.filename or "").lower().endswith(".pdf"):
+                if name_l.endswith(".pdf"):
                     ocr_pages = await client.ocr_pdf_pages(data)
                 else:
                     one = await client.ocr_image(data)
@@ -335,9 +351,10 @@ class ParseStep(PipelineStep):
                 _surface_doc_parse_notes(ctx, client, "OCR")
             except DocParseUnavailable as e:
                 # 端点不存在 = 配置错（不是抖动）：重试三轮也不会自愈，直接失败并
-                # 把可处置的原因写给用户；其余（超时/5xx/连接）按可重试处理。
-                if isinstance(e, DocParseEndpointMissing):
-                    raise StepError("parse", f"OCR 服务配置有误：{e}",
+                # 把可处置的原因写给用户；文件本身被拒收（4xx）同理；
+                # 其余（超时/5xx/连接）按可重试处理。
+                if isinstance(e, (DocParseEndpointMissing, DocParseBadInput)):
+                    raise StepError("parse", f"OCR 服务不可用：{e}",
                                     retryable=False) from e
                 raise StepError("parse", f"OCR 服务失败：{e}",
                                 retryable=True) from e

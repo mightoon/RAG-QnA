@@ -153,6 +153,7 @@ DDL_STATEMENTS = [
       doc_id           VARCHAR(64)  NOT NULL,
       tenant_id        VARCHAR(64)  NOT NULL,
       collection       VARCHAR(128) NOT NULL,
+      seq              INT          NULL,
       chunk_type       VARCHAR(32)  NOT NULL DEFAULT 'text',
       is_parent        TINYINT(1)   DEFAULT 0,
       parent_chunk_id  VARCHAR(64),
@@ -303,6 +304,9 @@ class MySQLMetaStore(MetaStoreAdapter):
                 # 回收站：deleted_at 供列表排序/展示，prev_status 供"恢复成原状"
                 "ALTER TABLE documents ADD COLUMN deleted_at DATETIME NULL",
                 "ALTER TABLE documents ADD COLUMN prev_status VARCHAR(32) NULL",
+                # 块在文档内的构建序号（详情页按它展示；老数据为 NULL，
+                # 由 ORDER BY 的兜底按页码排，见 list_chunk_ids）
+                "ALTER TABLE chunks_meta ADD COLUMN seq INT NULL",
             ):
                 try:
                     await conn.execute(text(mig))
@@ -513,16 +517,17 @@ class MySQLMetaStore(MetaStoreAdapter):
                     values.append(d)
                 await s.execute(text("""
                     INSERT INTO chunks_meta
-                      (chunk_id, doc_id, tenant_id, collection, chunk_type,
+                      (chunk_id, doc_id, tenant_id, collection, seq, chunk_type,
                        is_parent, parent_chunk_id, page_num, section_path,
                        quality_score, token_count, allowed_roles,
                        figure_label, figure_caption, created_at)
                     VALUES
-                      (:chunk_id, :doc_id, :tenant_id, :collection, :chunk_type,
+                      (:chunk_id, :doc_id, :tenant_id, :collection, :seq, :chunk_type,
                        :is_parent, :parent_chunk_id, :page_num, :section_path,
                        :quality_score, :token_count, :allowed_roles,
                        :figure_label, :figure_caption, :created_at)
                     ON DUPLICATE KEY UPDATE
+                      seq=VALUES(seq),
                       quality_score=VALUES(quality_score),
                       token_count=VALUES(token_count),
                       section_path=VALUES(section_path),
@@ -662,9 +667,20 @@ class MySQLMetaStore(MetaStoreAdapter):
             return [row[0] for row in rows3]
 
     async def list_chunk_ids(self, doc_id: str) -> list[str]:
+        """该文档的块 id，**按文档内顺序**返回（详情页的「分块」「内容预览」用它分页）
+
+        为什么需要 seq 才能排：chunk_id 是 sha256 哈希，主键索引里就是哈希序 ——
+        实测一篇文档的预览顺序是 1.2 → 四、 → 1.1 → 5.2 → 七、 这种乱序，
+        页面看着像"解析结果被洗牌了"。seq 是分块时的构建序号（父块先于其子块），
+        落库后这里按它排。
+        老数据（本次改动前入库的）seq 为 NULL：退化成"按页码 + 哈希"，
+        页面至少不再跨页乱跳；重解析一次即可补上 seq。
+        """
+        await self._ensure_tables()      # 这条 SQL 依赖 seq 列，先确保迁移跑过
         async with self._session() as s:
             rows = await s.execute(text(
-                "SELECT chunk_id FROM chunks_meta WHERE doc_id=:d"), {"d": doc_id})
+                "SELECT chunk_id FROM chunks_meta WHERE doc_id=:d "
+                "ORDER BY (seq IS NULL), seq, page_num, chunk_id"), {"d": doc_id})
             return [row[0] for row in rows]
 
     async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[ChunkMeta]:

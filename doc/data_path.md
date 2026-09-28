@@ -106,7 +106,7 @@ Worker._process()                       rag/ingestion/coordinator.py:173-244
 
 **② `chunks_meta`（块级，1 行/chunk）** — `meta_mysql.py:149-170`
 
-`chunk_id`(PK) / `doc_id`(FK→documents, ON DELETE CASCADE) / `tenant_id` / `collection` / `chunk_type` / `is_parent` / **`parent_chunk_id`** / `page_num` / `section_path` / `quality_score` / `token_count` / `allowed_roles` / `figure_label` / `figure_caption` / **`text`（块正文全文）** / `created_at`。
+`chunk_id`(PK) / `doc_id`(FK→documents, ON DELETE CASCADE) / `tenant_id` / `collection` / **`seq`（块在文档内的构建序号，详情页按它展示；存量行为 NULL，见 §8.29）** / `chunk_type` / `is_parent` / **`parent_chunk_id`** / `page_num` / `section_path` / `quality_score` / `token_count` / `allowed_roles` / `figure_label` / `figure_caption` / **`text`（块正文全文）** / `created_at`。
 
 - **`text` 是块正文的唯一权威副本**：父子回补（`query_retrieve.py:808-827`）与一致性巡检修复（`consistency.py:121-160`）都从这里取真文。
 - **没有** `summary` / `keywords` 列——这两样只在 ES。
@@ -919,6 +919,49 @@ $ python -c "from rag.api.app import create_app; from rag.observability.logging 
   · 临时配置改 `log_json: true` → 每行一个 JSON 对象；
   · **pdfminer 聚合在应用上下文里终于生效**：连发 5 条 FontBBox 告警 → 0 行输出 +
     一条 `pdf_parse_warnings_suppressed total=5` 汇总；ERROR 照常打印。
+
+### 8.29 块的**文档内顺序**现在落库了（chunks_meta.seq）——顺带修掉两处入库缺陷
+
+起因：详情页「分块」点了 500、「内容预览」看不到东西（详见 `doc/trouble-shooting.md`
+TS-026）。其中"看不到东西"的一半原因是**顺序**：展示用的块顺序一直是主键（哈希）序。
+
+**为什么以前没有顺序可用**：`seq` 只活在分块过程里（它进了 `chunk_id` 的哈希，
+而哈希不可逆），从来没落库。`SELECT chunk_id FROM chunks_meta WHERE doc_id=…`
+走二级索引拿到的是 `(doc_id, chunk_id)` 序 = 哈希序，所以预览实测是
+`1.2 → 四、 → 1.1 → 5.2 → 七、` 这种乱序。
+
+修法（数据侧）：
+
+| 改动 | 说明 |
+|---|---|
+| `chunks_meta.seq INT NULL` | DDL + 存量库 ALTER（`meta_mysql.py` 的 `_ensure_tables`）；分块时写 `seq`（父块先于其子块） |
+| `ChunkMeta.seq`（`int = 0`） | 加 `field_validator(mode="before")` 把**NULL 当 0**：存量行读出来是 NULL，不兜会让 `ChunkMeta(**row)` 抛错，而调用点（预览、分块列表、一致性巡检、父子回补）**全都包在 try/except 里** → 异常被吞 → "块元数据全空"的静默降级（实测踩到：详情页 token/section 全丢） |
+| `list_chunk_ids` | `ORDER BY (seq IS NULL), seq, page_num, chunk_id` —— 新数据严格按构建顺序；老数据退化为"按页码 + 哈希"，至少不跨页乱跳 |
+
+**存量文档怎么补 seq（不用重解析）**：ES 的 `_seq_no` 是**写入序**，而入库时
+`ctx.chunks` 就是按文档顺序生成的、ES 也按这个顺序 bulk 写入 ⇒ `_seq_no` 升序
+== 构建顺序。这条假设先被验证过：新入库一篇文档后断言"ES `_seq_no` 顺序 ==
+MySQL `seq` 顺序"，**逐个相同**（`tmp_selftest/t_chunk_order.py` 第 4 项）。
+随后用它给存量块补齐（`tmp_selftest/t_seq_backfill.py`，只写 `seq IS NULL` 的行）：
+本环境三篇文档 214 / 13 / 338 块，seq 范围 `[0, N-1]` 无重复，预览随即变成
+封面 → 1.1 → 1.2 → 1.3 → 二、 → 四、 → 5.1 → 5.2 → 六、的正确顺序。
+
+**同一次诊断里修掉的两处入库缺陷**（都会让内容或类型静默丢失）：
+
+1. **短节的正文被整段丢弃**：分块时"一节短于 `min_chunk_tokens` 就 `continue`"
+   （注释写的是"过短节并入"，实际是丢掉）→ 那一节在 MySQL/ES/Milvus 里都不存在。
+   实测 6 节的 markdown 只入库 5 个块、第一章凭空消失。
+   现在父块不再按 token 门槛丢弃：`min_tokens` 是**子块**的粒度门槛，
+   父块代表"这一节的正文"，丢了就是内容缺失。
+   ⚠ 存量文档里已被丢掉的短节只能靠重解析找回。
+2. **非 PDF 文件被当图片送 OCR**：`ParseStep` 的 OCR 预取原来对"非 PDF"一律
+   `ocr_image(文件字节)` → 服务端 `Invalid input file`（.md 实测 HTTP 422）→
+   抛**可重试**的 StepError → 文档重试三轮后失败，md/txt/csv/Word/Excel 全都入不了库。
+   现在只有 `_OCR_EXTS`（PDF + 图片）才预取；并把 4xx（除 404）归为
+   `DocParseBadInput` → **不可重试**，直接失败并说清"服务端拒收该文件"。
+
+回归：`tmp_selftest/t_doc_detail_pieces.py`（两个面板的渲染、顺序、不重复）、
+`tmp_selftest/t_chunk_order.py`（真实入库验证 seq 与 ES 序一致）。
 
 ---
 

@@ -172,10 +172,12 @@ class ChunkStep(PipelineStep):
                 return ""
             seen_fps.add(fp)
             cid = make_chunk_id(ctx.doc.tenant_id, ctx.doc.doc_id, seq, text)
-            seq += 1
             chunks.append(ChunkMeta(
                 chunk_id=cid, doc_id=ctx.doc.doc_id,
                 tenant_id=ctx.doc.tenant_id, collection=ctx.doc.collection,
+                # seq 一并落库：详情页的「分块」「内容预览」要按文档顺序展示，
+                # 而 chunk_id 是哈希、主键序等于乱序（见 meta_mysql.list_chunk_ids）
+                seq=seq,
                 chunk_type=chunk_type, is_parent=is_parent,
                 parent_chunk_id=parent_id, page_num=el.page_num,
                 section_path=el.metadata.get("section_path") or None,
@@ -184,6 +186,7 @@ class ChunkStep(PipelineStep):
                 figure_caption=el.raw_data.get("figure_caption") or None,
                 token_count=ctx.services.llm.count_tokens(text),
                 allowed_roles=list(ctx.doc.allowed_roles)))
+            seq += 1
             texts.append(text)
             return cid
 
@@ -248,9 +251,13 @@ class ChunkStep(PipelineStep):
             parent_parts = self._split_parent(
                 parent_text, parent_max, ctx.services.llm.count_tokens)
             for part, p_start in parent_parts:
-                if ctx.services.llm.count_tokens(part) < min_tokens \
-                        and len(parent_parts) == 1:
-                    continue                      # 过短节并入（此处独立节直接跳过）
+                # ⚠ 过短的节**不跳过**：原来这里写的是
+                #      if count(part) < min_tokens and len(parent_parts) == 1: continue
+                #   注释说是"过短节并入"，实际是**直接丢掉**——这一节的正文就此从
+                #   MySQL/ES/Milvus 里整段消失。实测：6 节的 md 入库后只有 5 个块，
+                #   第一章连块都没有（预览里那一章凭空不见）。
+                #   min_tokens 是**子块**的粒度门槛（父块已经覆盖了正文，子块可以粗）；
+                #   父块代表"这一节的正文"，丢了就是内容缺失 —— 宁可多一个短块。
                 el0 = _el_at(ranges, p_start, section_buf[0])
                 pid = emit(part, ChunkType.PARENT.value, el0,
                            is_parent=True)

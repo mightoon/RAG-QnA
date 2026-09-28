@@ -90,6 +90,19 @@ class DocParseEndpointMissing(DocParseUnavailable):
     """
 
 
+class DocParseBadInput(DocParseUnavailable):
+    """4xx（404 之外）：请求或**文件本身**不被这个端点接受，重试多少次都一样
+
+    实测：把 .md 的字节当图片送 `/ocr` → HTTP 422 `Invalid input file`。
+    这类错误若按"可重试"处理，一篇文档要白跑三轮退避重试才失败，
+    而且错误里只有服务端原始 JSON，用户看不出"是送错了类型"。
+    """
+
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
+
 # 业务侧的「内部能力名」→ doc_parse 端点能力名。
 # 业务不必知道 PaddleX 把任务拆成了哪些 endpoint（以后它换名也不影响入库链路）。
 CAPABILITY_FOR = {
@@ -571,6 +584,13 @@ class DocParseClient:
                 "请用 `--pipeline` 起对应产线的服务，或把这条配置的「处理能力」"
                 "改成该服务实际提供的能力")
         if resp.status_code != 200:
+            # 4xx = 这次的请求/文件不被接受（送错类型、文件损坏、尺寸不合规…）：
+            # 重试不会变好，单独抛一类让上层直接失败并说清原因（见 DocParseBadInput）
+            if 400 <= resp.status_code < 500:
+                raise DocParseBadInput(
+                    f"文档解析服务拒收该文件（HTTP {resp.status_code}）"
+                    f"（{self.base_url}{self.endpoint}）：{resp.text[:200]}",
+                    status=resp.status_code)
             raise DocParseUnavailable(
                 f"文档解析服务返回 HTTP {resp.status_code}"
                 f"（{self.base_url}{self.endpoint}）：{resp.text[:200]}")
