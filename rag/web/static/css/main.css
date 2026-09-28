@@ -377,6 +377,27 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
 .source-item-figure{font-size:var(--fs-xs);color:var(--text-link);cursor:pointer;margin-top:6px}
 .source-item-figure img{margin-top:6px;border-radius:8px;border:1px solid var(--border)}
 .source-item-actions{margin-top:8px;display:flex;gap:12px;font-size:var(--fs-xs)}
+
+/* ── 图区查看器（figure-view.js）：区域图 + 所在页面的红框定位 ── */
+.figure-view-overlay{position:fixed;inset:0;background:rgba(17,24,39,.55);z-index:900;
+  display:flex;align-items:center;justify-content:center;padding:24px;
+  animation:fadeIn var(--anim-fast)}
+.figure-view{background:var(--bg-surface);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);
+  max-width:min(1100px,96vw);max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.figure-view-head{display:flex;align-items:center;gap:12px;padding:12px 18px;
+  border-bottom:1px solid var(--border);font-weight:var(--fw-semibold)}
+.figure-view-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.figure-view-loc{font-size:var(--fs-xs);color:var(--text-tertiary);font-weight:var(--fw-normal)}
+.figure-view-body{display:flex;gap:16px;padding:16px 18px;overflow:auto;flex-wrap:wrap}
+.figure-view-col{flex:1 1 320px;min-width:260px}
+.figure-view-cap{font-size:var(--fs-xs);color:var(--text-tertiary);margin-bottom:6px}
+.figure-view-img{max-width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--bg-base)}
+.figure-view-err{font-size:var(--fs-xs);color:var(--text-secondary);padding:10px;
+  border:1px dashed var(--border);border-radius:var(--radius-sm)}
+.chunk-figure{margin-top:10px;display:flex;align-items:flex-start;gap:12px}
+.chunk-figure-thumb{max-width:220px;max-height:260px;border:1px solid var(--border);
+  border-radius:var(--radius-sm);cursor:zoom-in;background:var(--bg-base)}
 .chat-input-area{border-top:1px solid var(--border);background:var(--bg-surface);padding:12px 24px 14px;
   flex-shrink:0}
 .ep-docs-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
@@ -496,9 +517,12 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
 .q-legend{display:flex;gap:14px;font-size:var(--fs-xs);color:var(--text-secondary);flex-wrap:wrap}
 .q-legend .dot{margin-right:4px}
 .issue-list{margin-top:10px;border-top:1px dashed var(--border)}
-.issue-row{display:flex;gap:8px;align-items:flex-start;padding:6px 0;font-size:var(--fs-xs);
+/* 每条备注**两行**：标签一行、解释一行（解释常常很长，与标签同行时只剩半行宽） */
+.issue-row{display:block;padding:8px 0;font-size:var(--fs-xs);
   border-bottom:1px dashed var(--border)}
 .issue-row:last-child{border-bottom:none}
+.issue-row .badge{display:inline-block;margin-bottom:4px}
+.issue-msg{display:block;color:var(--text-secondary);line-height:1.6;word-break:break-word}
 .task-flow{display:flex;align-items:center;gap:6px;font-size:var(--fs-xs);flex-wrap:wrap;margin:8px 0}
 .stage-chip{background:var(--bg-hover);border:1px solid var(--border);border-radius:12px;
   padding:1px 10px;color:var(--text-tertiary)}
@@ -524,7 +548,12 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
   color:#92400E;border:1px solid var(--warning);border-radius:12px;padding:4px 14px;
   font-size:var(--fs-xs);font-weight:var(--fw-medium)}
 .doc-layout{display:grid;grid-template-columns:300px 1fr;gap:20px;align-items:start}
-.doc-side-panel{position:sticky;top:20px}
+/* 左栏自己滚：sticky 元素**高于一屏时**它是贴在顶部的，超出的部分用页面滚动
+   永远看不到（sticky 不会把内容推上去）—— 实测就是"鼠标在左栏滚不动，只有右边
+   内容预览/分块能滚"。给自己一个高度上限 + overflow-y 即可。
+   overscroll-behavior:contain 让滚到底后不要把页面一起带走（避免"不知不觉整页跑了"）。 */
+.doc-side-panel{position:sticky;top:20px;max-height:calc(100vh - 40px);
+  overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
 .doc-attrs{list-style:none}
 .doc-attrs li{display:flex;justify-content:space-between;gap:12px;padding:8px 0;
   border-bottom:1px dashed var(--border);font-size:var(--fs-sm)}
@@ -534,8 +563,17 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
 .doc-attrs .attr-val.plain{font-family:var(--font-sans);font-size:var(--fs-sm)}
 .doc-roles{margin-top:4px}
 .doc-roles-list{display:flex;flex-wrap:wrap;gap:6px}
+/* 整行块：键在上、值在下（解析质量、可见角色这类"值很长或不止一个"的项） */
+.doc-attr-block{padding:8px 0;border-bottom:1px dashed var(--border)}
+.doc-attr-block:last-child{border-bottom:none}
+.doc-attr-block .attr-key{display:block;color:var(--text-tertiary);font-size:var(--fs-sm);
+  margin-bottom:4px}
+.doc-attr-block .attr-val-block{display:block;font-family:var(--font-mono);
+  font-size:var(--fs-xs);color:var(--text-primary);word-break:break-all;line-height:1.6}
 .doc-section{font-size:var(--fs-sm);font-weight:var(--fw-semibold);color:var(--text-secondary);
   margin:16px 0 6px}
+/* 第一段标题不要额外的上边距（卡片本来就有 padding） */
+.doc-section-first{margin-top:0}
 .preview-pane{background:var(--bg-surface);border:1px solid var(--border);border-radius:var(--radius-lg);
   padding:20px;min-height:300px}
 .preview-text-pane{white-space:pre-wrap;font-family:var(--font-mono);font-size:var(--fs-sm);
@@ -1003,7 +1041,8 @@ table.data-table .form-input{font-size:var(--fs-sm);padding:5px 8px}
 /* ── 响应式 ── */
 @media (max-width:1024px){
   .doc-layout{grid-template-columns:1fr}
-  .doc-side-panel{position:static}
+  /* 窄屏：左栏变成页面顶部的一整块，不该再有"内部滚动条 + 高度上限" */
+  .doc-side-panel{position:static;max-height:none;overflow:visible}
   /* 窄屏：上面定死的 5 列在这儿松开，交回 auto-fill 自己减列（200px 下限 ⇒
      1024 宽约 4 列，更窄 3 列）。硬塞 5 列会把卡片压到放不下模型ID */
   .model-grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}

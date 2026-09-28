@@ -21,7 +21,10 @@
   {% for el in elements[:300] %}
     {% if el.page and el.page != ns.last_page %}
       {% set ns.last_page = el.page %}
-      <div class="pv-page-mark">— 第 {{ el.page }} 页 —</div>
+      {# 页标记显示**区间**：这里展示的是"父块 = 一整节"，一节常常跨页
+         （实测 5 页的文档里有 4 节跨页）。只显示起始页会让用户以为"分页标错了"。
+         区间 = "从这一页开始的内容，一直排到第几页"，由后端按组算好（page_span_end）。 #}
+      <div class="pv-page-mark">— 第 {{ el.page }}{% if el.page_span_end and el.page_span_end > el.page %}–{{ el.page_span_end }}{% endif %} 页 —</div>
     {% endif %}
     {% if el.type == 'heading' %}
       <div class="pv-element pv-title t2">{{ el.text }}</div>

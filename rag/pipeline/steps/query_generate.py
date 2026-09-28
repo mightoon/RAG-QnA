@@ -11,7 +11,7 @@ import json
 import re
 
 from rag.models import (ChatMessage, EntitySlot, MessageRole,
-                        SourceReference)
+                        SourceReference, page_label)
 from rag.observability.logging import get_logger
 from rag.pipeline.base import PipelineStep, StepRegistry
 from rag.pipeline.context import QueryContext
@@ -46,9 +46,12 @@ class GenerateStep(PipelineStep):
             used = 0
             for i, c in enumerate(ctx.reranked, start=1):
                 body = c.parent_content or c.text
+                # 页码：跨页的块写成"第 3–4 页"（page_end 由 retrieve 步骤从 MySQL 补上），
+                # 别只给起始页 —— 模型据此写出的页码要能对得上原文。
+                # 与来源抽屉共用 rag.models.page_label，避免两处口径不一致。
+                page_text = page_label(c.page_num, c.page_end) or None
                 location = " · ".join(
-                    x for x in [c.title, c.section_path,
-                                f"第{c.page_num}页" if c.page_num else None,
+                    x for x in [c.title, c.section_path, page_text,
                                 c.figure_label] if x)
                 block = f"[{i}] {location}\n{body}"
                 per = min(1500, max(0, context_budget - used))
@@ -61,8 +64,12 @@ class GenerateStep(PipelineStep):
                     ref_id=str(i), chunk_id=c.chunk_id, doc_id=c.doc_id,
                     title=c.title, section=(c.section_path or "").split("/")[-1]
                     or None, section_path=c.section_path,
-                    page_num=c.page_num, figure_label=c.figure_label,
+                    page_num=c.page_num, page_end=c.page_end,
+                    figure_label=c.figure_label,
                     figure_caption=c.figure_caption,
+                    # 图区框（PDF point）：前端据此高亮图区，并向
+                    # /api/documents/{doc}/chunks/{chunk}/figure 要那张图
+                    figure_bbox=c.figure_bbox,
                     storage_url=c.storage_url, chunk_type=c.chunk_type))
         ctx.sources = sources
         # 原文预览 URL 出链（前 5 条，best-effort）

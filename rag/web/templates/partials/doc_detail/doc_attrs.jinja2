@@ -1,27 +1,109 @@
 {% set d = data if data is defined else none %}
 {% set doc = d.doc if d and d.doc is defined else (doc if doc is defined else none) %}
+{% set q = doc.quality if doc and doc.quality is defined else none %}
+{% set tc = doc.type_counts if doc and doc.type_counts is defined else none %}
+{% set fs = q.figure_stats if q and q.figure_stats is defined else none %}
 {% if doc %}
+{# 左栏结构（用户 2026-09-28 指定，四段顺序照此）：
+     基本信息 / 解析信息 / 管理信息 / 质量备注（即 comment：figure_region_cropped 等）
+   值太长或不止一个（解析质量、可见角色）用整行块 `.doc-attr-block`：键在上、值在下，
+   在 300px 宽的面板里比"左键右值"少一堆锯齿状换行。 #}
+
+<div class="doc-section doc-section-first">基本信息</div>
 <ul class="doc-attrs">
   <li><span class="attr-key">文档 ID</span><span class="attr-val">{{ doc.doc_id }}</span></li>
   <li><span class="attr-key">集合</span><span class="attr-val plain">{{ doc.collection }}</span></li>
-  <li><span class="attr-key">类型</span><span class="attr-val plain">{{ doc.file_type or '—' }}</span></li>
-  <li><span class="attr-key">大小</span><span class="attr-val plain">
+  {# 「类型」改名「文档类型」：这里指的是文件类型（pdf/docx/xlsx…） #}
+  <li title="文件类型（pdf / docx / xlsx / pptx / md / txt …）">
+    <span class="attr-key">文档类型</span>
+    <span class="attr-val plain">{{ (doc.file_type or '—') | upper }}</span></li>
+  <li><span class="attr-key">文档大小</span><span class="attr-val plain">
     {%- if doc.file_size is none -%}—
     {%- elif doc.file_size < 1048576 -%}{{ '%.1f' | format(doc.file_size / 1024) }} KB
     {%- else -%}{{ '%.1f' | format(doc.file_size / 1048576) }} MB{%- endif -%}</span></li>
-  <li><span class="attr-key">页数</span><span class="attr-val plain">{{ doc.page_count if doc.page_count is not none else '—' }}</span></li>
-  <li><span class="attr-key">分块数</span><span class="attr-val plain">{{ doc.chunk_count if doc.chunk_count is not none else '—' }}</span></li>
+</ul>
+
+<div class="doc-section">解析信息</div>
+<ul class="doc-attrs">
+  {% if q and q.doc_type %}
+  <li title="解析路径类型：text=有文字层 / scanned=扫描件 / mixed=部分页扫描">
+    <span class="attr-key">解析类型</span>
+    <span class="attr-val plain">{{ q.doc_type_label or q.doc_type }}</span>
+  </li>
+  {% endif %}
+  <li><span class="attr-key">页数</span>
+    <span class="attr-val plain">{{ doc.page_count if doc.page_count is not none else '—' }}</span></li>
+  {# 这一项以前叫「OCR N 页」，容易被读成"调了几次 OCR 服务"。它真正的含义是
+     **有几页没有文本层** —— 那几页的文字是**版面引擎自己 OCR** 出来的（引擎产线
+     默认带 OCR），18080 的 /ocr 只是兜底。名字里带上 (OCR) 让人一眼知道与 OCR 有关，
+     括号里的说明给准确口径。 #}
+  <li title="这几页**没有文本层**（页面上没有可选中的文字）：文字由版面引擎自己 OCR 识别（/layout-parsing 产线自带 OCR），独立的 /ocr 服务只是兜底。不等于"调了几次 OCR 端点"">
+    <span class="attr-key">无文本层（OCR）</span>
+    <span class="attr-val plain">{{ q.ocr_pages if q else 0 }} 页</span>
+  </li>
+  {# 图表：以**库里实际的块**为准（image_caption / table 块）—— 问"这份文档到底有多少
+     图/表"时，答案应当是现在能检索到多少个；整页图/空白跳过/未裁出等解析期计数
+     跟在后面（有才显示），它们解释"为什么图块数是这个数"。 #}
+  <li title="入库的图块 / 表块数量（image_caption / table 块）。括号里是解析期的图区计数：整页=粒度是整页（扫描页/整页照片页）、空白跳过=纯色区域没做图片理解、未裁出=坐标不可用既不进图片理解">
+    <span class="attr-key">图表</span>
+    <span class="attr-val plain">
+      {%- if tc -%}
+      图 {{ tc.image_caption or 0 }} / 表 {{ tc.table or 0 }}
+      {%- if fs and (fs.page_scope or fs.blank_skipped or fs.crop_failed) -%}
+      <span class="text-tertiary" style="font-size:var(--fs-xs)">（整页 {{ fs.page_scope or 0 }}{% if fs.blank_skipped %}、空白跳过 {{ fs.blank_skipped }}{% endif %}{% if fs.crop_failed %}、未裁出 {{ fs.crop_failed }}{% endif %}）</span>
+      {%- endif -%}
+      {%- else -%}—{%- endif -%}</span>
+  </li>
+  {# 分块数写明"检索块 + 父块"：质量分档只统计检索块，两个数字并列才不会让人以为漏统计了 #}
+  <li title="检索块=进向量库的检索单元；父块=整节的聚合正文（供命中后回取上下文，不计质量档）">
+    <span class="attr-key">分块数</span>
+    <span class="attr-val plain">{{ doc.chunk_count if doc.chunk_count is not none else '—' }}
+      {%- if q %}（检索块 {{ q.scored }} + 父块 {{ q.parents }}）{% endif %}</span>
+  </li>
+  {# 解析质量：**与其它项一样同一行**。值用短写法（`高235 / 中17 / 低4`）——
+     300px 宽放得下；口径（只统计检索块、父块不计档）与完整写法都在悬停里。
+     历史：先是"共 N 块 = 检索块 N + 父块 M；…（父块不计档）"一整句，用户要求只留
+     质量分布；再要求缩短，因为它原来折行。 #}
+  {% if q and q.summary %}
+  <li title="分档只统计**检索块**（进向量库的检索单元），父块不计档；总块数与父子拆分见上面「分块数」。完整写法：{{ q.summary }}">
+    <span class="attr-key">解析质量</span>
+    <span class="attr-val plain">{{ q.summary_compact or q.summary }}</span>
+  </li>
+  {% endif %}
+</ul>
+
+<div class="doc-section">管理信息</div>
+<ul class="doc-attrs">
   <li><span class="attr-key">版本</span><span class="attr-val plain">v{{ doc.version or 1 }}</span></li>
   <li><span class="attr-key">上传者</span><span class="attr-val plain">{{ doc.created_by or '—' }}</span></li>
-  <li><span class="attr-key">上传时间</span><span class="attr-val plain">{{ (doc.created_at or '')[:16].replace('T', ' ') or '—' }}</span></li>
+  {# 可见角色与其它项一样**同一行**（值就是几个标签，放不下时在值那一栏换行） #}
+  <li><span class="attr-key">可见角色</span>
+    <span class="attr-val plain doc-roles-list">
+      {%- for r in doc.allowed_roles or [] %}<span class="tag-chip">{{ r }}</span>
+      {%- else %}<span class="text-tertiary">全部角色</span>{% endfor -%}
+    </span></li>
+  <li><span class="attr-key">上传时间</span><span class="attr-val plain">{{ doc.created_at or '—' }}</span></li>
+  {# 「处理时间」= 最后一次入库/重解析结束的时间（任务行的完成时间，重解析会新增一条）。
+     只显示时间本身：来源（上传入库/重解析）在悬停提示里 —— 用户要求行内不出现那三个字。 #}
+  <li title="最后一次处理（入库或重解析）完成的时间{% if doc.processed_source %}；本次来源：{{ doc.processed_source }}{% endif %}">
+    <span class="attr-key">处理时间</span>
+    <span class="attr-val plain">{{ doc.processed_at or '—' }}</span>
+  </li>
 </ul>
-<div class="doc-section">可见角色</div>
-<div class="doc-roles-list">
-  {% for r in doc.allowed_roles or [] %}<span class="tag-chip">{{ r }}</span>
-  {% else %}<span class="text-tertiary" style="font-size:var(--fs-xs)">全部角色</span>{% endfor %}
-</div>
-{% if doc.error %}
-<div class="doc-section">错误信息</div>
-<div class="task-detail">{{ doc.error }}</div>
+
+{# 最后一段（用户说的 comment）：失败/降级/口径说明，如 figure_region_cropped、
+   table 区域未识别、图片理解已跳过… 它与"质量分布"是两件事：分布是数字、这里是原因。
+   **每条两行**：第一行是标签（issue code），第二行是解释 —— 解释常常很长，
+   与标签挤在一行时只剩半行宽（用户实测"半行显示"）。 #}
+{% if q and q.issues %}
+<div class="doc-section">质量备注</div>
+<ul class="issue-list">
+  {% for it in q.issues[:10] %}
+  <li class="issue-row">
+    <span class="badge badge-{{ 'error' if it.severity == 'error' else ('warning' if it.severity in ('warning', 'warn') else 'info') }}">{{ it.code }}</span>
+    <span class="issue-msg">{{ it.message }}{% if it.page %}（第 {{ it.page }} 页）{% endif %}</span>
+  </li>
+  {% endfor %}
+</ul>
 {% endif %}
 {% endif %}

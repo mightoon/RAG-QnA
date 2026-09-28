@@ -28,6 +28,11 @@ from rag.vector_space import judge_space, space_tag, tag_label
 
 log = get_logger("rag.container")
 
+# 文档解析能力"暂时不可用"后的静默期（秒）：见 `ServiceContainer.doc_parse_ready`。
+# 取值理由：用户**有意停掉**某个识别服务时（资源不够是常态），这段时间内不再白打请求；
+# 而服务起来之后最多等这么久就会自动恢复（不用改配置、不用重启进程）。
+_DOC_PARSE_COOLDOWN_S = 120.0
+
 
 class CoreDependencyError(RuntimeError):
     """遗留异常类型：核心依赖不可用（现已自动降级，不再抛出，保留兼容）"""
@@ -193,6 +198,8 @@ class ServiceContainer:
         # 文档解析能力探测结果：能力名 → (ok, 原因)。启动时不主动探（会拖慢启动），
         # 由入库步骤用 doc_parse_ready() 惰性触发，或配置页保存后由自检触发。
         self._doc_parse_probe: dict[str, tuple[bool, str]] = {}
+        # 能力"暂时不可用"的静默期：cap → 到期时刻（monotonic）。见 doc_parse_ready。
+        self._doc_parse_cooldown: dict[str, float] = {}
         self.meta: MetaStoreAdapter = self._create_core(
             "meta", config.meta.adapter, config.meta)
         self.auth: AuthAdapter = self._create_core(
@@ -782,6 +789,7 @@ class ServiceContainer:
             # 保存文档解析配置后立刻验证**每条能力**：探真实端点 + 校验响应字段根名。
             # 用 /health 会给出假绿（PaddleX 每个服务都有它，能力选错照样 200）。
             self._doc_parse_probe.clear()
+            self._doc_parse_cooldown.clear()
             cfg = self.config.doc_parse
             caps: list[str] = []
             for entry in list(cfg.models or []):
@@ -1122,15 +1130,28 @@ class ServiceContainer:
         与 `vlm_ready` 同一套口径：入库步骤先问这里，拿到原因就不发请求 ——
         "没配"与"配错"都不该以 404/超时 的形式在解析链路里炸开，也不该被静默跳过
         （静默跳过会让人以为版面引擎在生效）。原因同时进 degraded，监控页可见。
+
+        三种"不可用"的处置不同，别混：
+          · **没配**（配置里没有该能力的地址）→ 直接返回原因，零网络请求；
+          · **确定配错**（端点 404 / 字段根名不符）→ 记永久跳过（改配置才清）；
+          · **暂时挂了**（5xx / 连不上 / 超时）→ 记 `_DOC_PARSE_COOLDOWN_S` 秒的
+            静默期，期间不发请求，**到期自动放一次过去**（半开）。为什么要有静默期：
+            用户**有意停掉**某个服务时（资源不够是常态），每篇文档的每个区域都要白跑
+            3 次连接尝试 + 退避（实测 ≈3s/区域），而结论在服务起来之前不会变；
+            但也不能永久停用 —— 那服务恢复后就没有"自动可用"了。
         """
-        from rag.adapters.doc_parse import (doc_parse_capability_for,
-                                            resolve_base_url)
+        from rag.adapters.doc_parse import doc_parse_capability_for
         cap = doc_parse_capability_for(self.config, internal)
         if not cap:
             return (f"未配置「{internal}」能力的服务地址（配置页 → 文档解析）")
         cached = self._doc_parse_probe.get(cap)
         if cached is not None and not cached[0]:
             return cached[1]
+        until = self._doc_parse_cooldown.get(cap, 0.0)
+        if until and time.monotonic() < until:
+            left = int(until - time.monotonic())
+            return (self.degraded.get(f"doc_parse:{cap}")
+                    or f"「{cap}」暂时不可用") + f"（{left}s 后自动重试）"
         return None
 
     def note_doc_parse_failure(self, cap: str, reason: str) -> None:
@@ -1138,9 +1159,32 @@ class ServiceContainer:
 
         为什么值得缓存：`--pipeline` 配错时每篇 PDF 都要等一次超时/404 才降级，
         而结论在下次改配置之前不会变（保存 doc_parse 段会清这份缓存）。
+
+        ⚠ 只该用于**确定性**失败（端点 404 / 能力配错）。5xx 这类可恢复故障走
+        `note_doc_parse_degraded`：实测公式识别服务 18083 连续 500，把它缓存成
+        "不可用"就等于服务恢复后本进程也永远不再尝试（配置页还是绿的，没人看得出来）。
         """
         self._doc_parse_probe[cap] = (False, reason)
         self.degraded[f"doc_parse:{cap}"] = f"「{cap}」不可用：{reason[:200]}"
+
+    def note_doc_parse_degraded(self, cap: str, reason: str) -> None:
+        """记一次**可恢复**的能力失败：进 degraded（监控页可见）+ 开静默期
+
+        静默期只是"这段时间别再打它"，不是"永久停用"：到期后 `doc_parse_ready`
+        会放请求过去，服务恢复了就自动接着用（见 `doc_parse_ready` 的说明）。
+        """
+        if not cap:
+            return
+        self.degraded[f"doc_parse:{cap}"] = f"「{cap}」暂时不可用：{reason[:200]}"
+        self._doc_parse_cooldown[cap] = time.monotonic() + _DOC_PARSE_COOLDOWN_S
+
+    def note_doc_parse_ok(self, cap: str) -> None:
+        """一次调用成功：清掉静默期与 degraded（服务恢复了就立刻恢复正常节奏）"""
+        if not cap:
+            return
+        if self._doc_parse_cooldown.pop(cap, None) is not None:
+            log.info("doc_parse_recovered", capability=cap)
+        self.degraded.pop(f"doc_parse:{cap}", None)
 
     async def probe_doc_parse(self, cap: str) -> tuple[bool, str]:
         """真打一次能力端点并用响应字段根名校验产线（与「测试解析」同口径）
@@ -1159,13 +1203,14 @@ class ServiceContainer:
         ok, reason, definitive = await client.probe()
         if ok:
             self._doc_parse_probe[cap] = (True, reason)
-            self.degraded.pop(f"doc_parse:{cap}", None)
+            self.note_doc_parse_ok(cap)
         elif definitive:
             self._doc_parse_probe[cap] = (False, reason)
             self.degraded[f"doc_parse:{cap}"] = f"「{cap}」不可用：{reason}"
         else:
-            # 可恢复故障：登记给监控页看，但不写进"跳过"缓存，下次调用会重试
-            self.degraded[f"doc_parse:{cap}"] = f"「{cap}」暂时不可用：{reason}"
+            # 可恢复故障：登记给监控页看，也开静默期（探测本身就是一次真实调用，
+            # 探不通说明现在打它也没用），但不写"跳过"缓存 —— 到期会自动再试
+            self.note_doc_parse_degraded(cap, reason)
         return ok, reason
 
     # ── 视觉模型门禁 ────────────────────────────────────────

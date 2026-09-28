@@ -8,7 +8,7 @@ auth:
 llm:
   adapter: openai_compatible
   base_url: https://api.deepseek.com
-  api_key: enc:v1:gAAAAABqthpk_i_dkwBKgXuU-UdyaTCJozAlWP9hNVFNeyj7rMltaUdFCwzXlREP5lqZCuVktKwGDAfRhkx3ZgY0PxCbr7tbAktITZhmXNthOsaj-3ib52tuas_BTRLMFjlo-eeenu67
+  api_key: enc:v1:gAAAAABquibdlb2I4H_DaRCxtGgqCPlT0vMqPiS5SkaRHOHf2xi2O2EcYpZpvHNdtLTX7WfWBIqOx3g49YHAiIlFiEIaPJkNKBgSAFFR3a99k1LpGkfAci4dO84tr88MM_SDU-KdM9hR
   model: deepseek-flash
   rewrite_model: ''
   temperature: 0.5
@@ -20,7 +20,7 @@ llm:
   - id: current
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqthpkh7TlZ_KTCFfma_XyJX3QhjB_ZkcfOISJY82BwCG3tbVAyV5Tt90S5mOP3zWw8nRfdxgBAac-8it8RqNIqJtuVqMujshSqSUUhV_lL2tWvpM_t4BET2IP0DgpZdlyszIW
+    api_key: enc:v1:gAAAAABquibd0PWgX_zqvkWiLw5Pc16IUMjxmT-1EJd7FHAw-c4oU_otThWy7gN9WKGjRbXaTZ_fIq45eIZM05bGG7iHejk5R4aRJbpBLai0StHX7O4YPT5iBx-PxP_Ah7pMj3ojn5K8
     model_ids:
     - deepseek-flash
     model: deepseek-flash
@@ -33,7 +33,7 @@ llm:
   - id: ef4d181f
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABqthpkgIia2PAO9TGMFTz58PFKZc1ZXjrAAL3US5oUQzwVlrLUr-q9SXVdFb0AboSEk3m1xf8sgw3_uU45Sr5qV-_qq2fsblMsFZA1wkjpapNqEz3j2jxKsVmw-_MVbohEthVr
+    api_key: enc:v1:gAAAAABquibd1nNvkUKELVngzJkncOHmoQ5Jf1VPDjU_HIOftg5PomTToJZQI5ixBKAM10gKnlX1CkjLMard8TZ3RXiuWYXf49QXmzn-so80os7nmh79QbC4N1coroKtZzsqZcbt9Kp-
     model_ids:
     - deepseek-v4-pro
     model: deepseek-v4-pro
@@ -83,7 +83,7 @@ meta:
 redis:
   host: 192.168.100.239
   port: 6379
-  password: enc:v1:gAAAAABqthpkS8iQOdR36oRGLV8AnD2MKy9-GQd0SzMJw7Z3u6isMEfHvklCMDXRC_iZbfoqisg55EztoRutL2O_nT9OZ8d4iw==
+  password: enc:v1:gAAAAABquibdibVWdYezT-OwRsdWBM1mbE-v_UCv8rX3pjfLoasHmxSdbfC1WPVLWGnMRhJnRugNENjApjPxQ-eyGENwrMqJLg==
   db: 0
   session_ttl_hours: 48
   prefix: 'rag:'
@@ -92,7 +92,7 @@ storage:
   enabled: true
   endpoint: 192.168.100.239:9000
   access_key: admin
-  secret_key: enc:v1:gAAAAABqthpk7fHVnPlaP-u2_0ODBF7KVvRC0qgp5tojkqC6WzEstM1SRxxz2umMJYBY5OyPSGBENyMq1g0dFWZNgZ17ss5XGw==
+  secret_key: enc:v1:gAAAAABquibdB_gIa6Tzs6BLWuNfOgT1w4vSuAJPrIziomzAlLXr0OHfm7zssKJ2ULFHoKyJe7Pjt9k30H3v1nDdJWA_rlOTVA==
   bucket: rag-docs
   secure: false
   local_root: ./data/files
@@ -107,7 +107,7 @@ knowledge_graph:
 business_data:
   adapter: sqlalchemy
   enabled: false
-  dsn: enc:v1:gAAAAABqthpkrFAiw51dIQrUmPew6P8yamUpSTwBFowiPv6SjxGpnrbbE3O8K08AJtgnY0-1yVQrMOJfGfx8d3KusgTSPpf2qGPwOxXqRAV6Hh7pUxZBRd88jkog4jaGdLCjo-OzqiUKMPUgHxpSTbY8FAGMSD-LBg==
+  dsn: enc:v1:gAAAAABquibd_rUbLVkzKCq5GRxwhWLeeBVb5Ge-D4J_yMSItQRqIGm_eXAAmU1kvxY4QSzz0bUmQKpCpIdoFaHyY13lIP_MJfJ76YLkD4V7xWATjWK8TWL9x-ijCVYjkawUcxanBCXyzUfgwxHab5XFk29mhIIAgA==
   schema_file: customer/business_schema.yaml
   allowed_tables: []
   max_rows: 100
@@ -123,9 +123,6 @@ retrieval:
   enable_vector: true
   enable_bm25: true
   enable_graph: false
-  # 结构化路（NL2SQL → 业务库精确数值）。要生效需**两处同时打开**：
-  # 这里 + business_data.enabled。只开这里不会报错，但检索路选择器会出现一个
-  # 永远返回空的路（见 query_retrieve._structured 的门禁说明）
   enable_structured: false
   enable_ephemeral: true
   top_k_per_path: 20
@@ -216,9 +213,6 @@ consistency_check:
   alert_threshold: 10
 observability:
   log_level: INFO
-  # log_json 现在**真的生效**了（以前 configure_logging 从没被调用，这两个字段都是
-  # 摆设，见 doc/data_path.md §8.28）。当前选 false = 控制台保持"人读格式"；
-  # 想切成每行一个 JSON（便于采集/grep）把它改成 true 即可，保存后立即生效。
   log_json: false
   metrics_enabled: true
   pushgateway_url: ''
@@ -284,14 +278,28 @@ doc_parse:
     tested_at: '2026-09-25 13:59:20'
     params:
       capability: layout-parsing
+  - id: e2e0b708
+    display_name: table-recognition
+    base_url: http://192.168.100.237:18082
+    api_key: ''
+    model_ids: []
+    model: ''
+    tested_at: '2026-09-28 16:34:30'
+    params:
+      capability: table-recognition
+  - id: 8fb8c71d
+    display_name: formula-recognition
+    base_url: http://192.168.100.237:18083
+    api_key: ''
+    model_ids: []
+    model: ''
+    tested_at: '2026-09-28 16:35:41'
+    params:
+      capability: formula-recognition
   active_id: 5e57ba9d
   display_name: paddle-ocr
   base_url: http://192.168.100.237:18080
   api_key: ''
   model: ''
   capability: ocr
-  # 单次请求最多送几页 PDF。10 = PaddleX serving `max_num_input_imgs` 的默认值，
-  # **超过它的页会被服务端静默丢掉**（HTTP 仍 200）→ 客户端按此分批送，并自查
-  # "返回条数不足"做二分重试（见 rag/adapters/doc_parse.py 的 _pdf_batches）。
-  # 服务端上限调大后可同步调大（减少请求数），调小更保守但请求更多。
   max_pages_per_request: 10

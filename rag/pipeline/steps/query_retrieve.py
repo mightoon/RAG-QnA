@@ -811,6 +811,28 @@ class RerankStep(PipelineStep):
         try:
             chunk_ids = [c.chunk_id for c in ctx.reranked]
             cms = await s.meta.get_chunks_by_ids(chunk_ids)
+            # 顺带把**结束页**从 MySQL 补到命中块上：引用要说"第 3–4 页"就得知道它。
+            # ES/Milvus 的映射里都没有 page_end（给 Milvus 加字段必须重建集合），
+            # 而这一步本来就在按 chunk_id 取元数据，补一下是零额外查询。
+            by_cm = {cm.chunk_id: cm for cm in cms}
+            for c in ctx.reranked:
+                cm_got = by_cm.get(c.chunk_id)
+                if cm_got is None:
+                    continue
+                if getattr(cm_got, "page_end", None):
+                    c.page_end = cm_got.page_end
+                    # 起始页也以元数据为准：ES/Milvus 里的那份是写入时的快照
+                    if cm_got.page_num:
+                        c.page_num = cm_got.page_num
+                # 图块的**题注与图区框**同理从 MySQL 补：ES/Milvus 那边只有
+                # chunk_id/text/page_num，而来源抽屉要显示"图N：题注"和那张图本身
+                # （图按框从原始 PDF 现裁，见 routes 的 figure 端点）。
+                if getattr(cm_got, "figure_bbox", None):
+                    c.figure_bbox = cm_got.figure_bbox
+                if getattr(cm_got, "figure_label", None) and not c.figure_label:
+                    c.figure_label = cm_got.figure_label
+                if getattr(cm_got, "figure_caption", None) and not c.figure_caption:
+                    c.figure_caption = cm_got.figure_caption
             parent_ids = [cm.parent_chunk_id for cm in cms
                           if cm.parent_chunk_id]
             if parent_ids:

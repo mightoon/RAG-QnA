@@ -13,7 +13,7 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -38,7 +38,8 @@ from rag.container import (
     RECOVER_INTERVAL_SEC, RECOVERABLE_SECTIONS, SECTION_DEGRADED_KEYS,
     ServiceContainer,
 )
-from rag.models import ACTIVE_TASK_STATUSES, IngestStatus, UserContext
+from rag.models import (ACTIVE_TASK_STATUSES, IngestStatus, UserContext,
+                        doc_type_label, quality_short_summary)
 from rag.observability.logging import get_logger
 
 log = get_logger("rag.web")
@@ -999,6 +1000,19 @@ async def knowledge_page(request: Request, collection: str | None = None,
     return templates.TemplateResponse("knowledge.jinja2", ctx)
 
 
+async def _chunk_type_counts(c: ServiceContainer, doc_id: str) -> dict:
+    """该文档的块类型计数 `{chunk_type: n}`（详情页左栏「图表」那一行用它）
+
+    为什么要现查而不是读质量报告里的数字：报告里存的是**入库那一刻**的统计，
+    而详情页要回答的是"现在库里到底是什么"。数字不一致时，用户看到的应当是库里的
+    真相（报告只用于说明原因）。查不出来就返回空 dict，页面自然降级（显示 —）。
+    """
+    try:
+        return await c.meta.count_chunks_by_type(doc_id)
+    except Exception:
+        return {}
+
+
 @pages_router.get("/knowledge/docs/{doc_id}", response_class=HTMLResponse)
 async def doc_detail_page(request: Request, doc_id: str,
                           collection: str | None = None,
@@ -1018,8 +1032,15 @@ async def doc_detail_page(request: Request, doc_id: str,
         return RedirectResponse("/knowledge?tab=docs", status_code=302)
     ctx = _base_ctx(request, user, "doc-detail")
     live = await _active_status_by_doc(c, user.tenant_id)
-    ctx.update({"doc": _doc_view(doc, live.get(doc.doc_id)),
-                "backCollection": collection or ""})
+    # ⚠ 首屏也要带上「处理时间」的原始数据：原来这里只传了实时状态、**漏了
+    # `processed`**，于是第一次打开详情页时左栏「处理时间」是空的（显示 `—`），
+    # 只有等某个片段被重新拉取（点页签/轮询刷头部）之后才有值 —— 用户实测报的就是这个。
+    processed = (await _last_processed_by_doc(c, doc.tenant_id)).get(doc.doc_id)
+    view = _doc_view(doc, live.get(doc.doc_id), processed)
+    # 「图表」那一行要的块类型计数：只在**单篇详情**里查（按 doc_id 走索引，一次
+    # GROUP BY），不进列表视图 —— 列表一次渲染几十行，每行再查一次不划算。
+    view["type_counts"] = await _chunk_type_counts(c, doc.doc_id)
+    ctx.update({"doc": view, "backCollection": collection or ""})
     return templates.TemplateResponse("doc-detail.jinja2", ctx)
 
 
@@ -1882,9 +1903,143 @@ async def list_doc_chunks(doc_id: str, request: Request, page: int = 1,
             "quality_score": getattr(cm, "quality_score", None) if cm else None,
             "figure_label": getattr(cm, "figure_label", None) if cm else None,
             "figure_caption": getattr(cm, "figure_caption", None) if cm else None,
+            # 图区框（PDF point）：详情页预览用它把这块区域高亮出来
+            "figure_bbox": getattr(cm, "figure_bbox", None) if cm else None,
             "text": texts.get(cid, ""),
         })
     return {"items": items, "total": total}
+
+
+@ui_router.get("/documents/{doc_id}/chunks/{chunk_id}/figure")
+async def doc_chunk_figure(doc_id: str, chunk_id: str, request: Request,
+                           dpi: int = 150, pad: float = 2.0,
+                           user: UserContext = Depends(get_current_user)):
+    """图块的**区域图**：按块上存的 figure_bbox 从原始 PDF 现裁（不落盘）
+
+    为什么是"现裁"而不是入库时把图存一份：图片字节只在解析期间的内存里，另存 PNG
+    会让图片存储翻倍（麦肯锡那篇 73 张图就多 73 个对象），而**框只有 4 个浮点数**
+    —— 读的时候花几十毫秒现裁即可，还顺带支持"换个 dpi 再看清楚点"。
+    这个端点同时服务两处 UI：来源抽屉的缩略图、详情页预览的高亮区域。
+    """
+    c = _container(request)
+    try:
+        metas = await c.meta.get_chunks_by_ids([chunk_id])
+    except Exception:
+        metas = []
+    cm = next((m for m in metas if m.chunk_id == chunk_id), None)
+    if cm is None or (cm.doc_id and cm.doc_id != doc_id):
+        raise HTTPException(404, "块不存在")
+    box = getattr(cm, "figure_bbox", None)
+    if not box:
+        raise HTTPException(404, "该块没有图区坐标（非图块，或本次改动前入库的存量块）")
+    doc = await c.meta.get_document(doc_id, user.tenant_id)
+    if doc is None:
+        raise HTTPException(404, "文档不存在")
+    if c.storage is None or not doc.storage_url:
+        raise HTTPException(503, "存储适配器不可用")
+    try:
+        data = await c.storage.get(doc.storage_url)
+    except Exception as e:
+        raise HTTPException(404, f"无法读取文档: {e}")
+    if not (doc.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(415, "只有 PDF 支持按图区裁剪")
+
+    def _crop() -> bytes | None:
+        import io as _io
+
+        import pdfplumber
+
+        from rag.adapters.doc_parse import clamp_box_to_page, crop_page_region
+        page_no = cm.page_num or 1
+        with pdfplumber.open(_io.BytesIO(data)) as pdf:
+            if not (1 <= page_no <= len(pdf.pages)):
+                return None
+            page = pdf.pages[page_no - 1]
+            b = [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad]
+            b = clamp_box_to_page(b, float(page.width), float(page.height))
+            return crop_page_region(page, b, resolution=res) if b else None
+
+    res = min(max(int(dpi), 60), 300)
+    png = await asyncio.to_thread(_crop)          # pdfplumber 是同步 CPU 活
+    if not png:
+        raise HTTPException(404, "按该坐标裁不出内容（页码越界或框超出页面）")
+    # 图与块绑定，允许浏览器缓存（同一块的框不会变；重解析会换 chunk_id）
+    return Response(png, media_type="image/png", headers={
+        "Cache-Control": "private, max-age=86400"})
+
+
+@ui_router.get("/documents/{doc_id}/pages/{page_no}/image")
+async def doc_page_image(doc_id: str, page_no: int, request: Request,
+                         dpi: int = 100, highlight: str = "",
+                         bbox: str = "", pad: float = 3.0,
+                         user: UserContext = Depends(get_current_user)):
+    """整页渲染图；给了 highlight（块 id）或 bbox 就在页面上**画红框**标出图区
+
+    为什么在**服务端**画框而不是前端叠一层：前端要画就得知道"页面渲染尺寸 ÷ PDF
+    point 尺寸"的比例，而预览图是按 dpi 渲出来的（同一页换个 dpi 比例就变），
+    一旦两者不一致，框就会偏移 —— 而这种偏移在界面看着"像是对的"，很难发现。
+    这里渲染与画框用同一张图、同一个坐标系，框不可能偏。
+    """
+    c = _container(request)
+    doc = await c.meta.get_document(doc_id, user.tenant_id)
+    if doc is None:
+        raise HTTPException(404, "文档不存在")
+    if c.storage is None or not doc.storage_url:
+        raise HTTPException(503, "存储适配器不可用")
+    if not (doc.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(415, "只有 PDF 支持整页渲染")
+
+    box = None
+    if highlight:
+        try:
+            metas = await c.meta.get_chunks_by_ids([highlight])
+            cm = next((m for m in metas if m.chunk_id == highlight), None)
+            box = getattr(cm, "figure_bbox", None) if cm else None
+        except Exception:
+            box = None
+        if not box:
+            raise HTTPException(404, "该块没有图区坐标")
+    elif bbox:
+        try:
+            box = [float(v) for v in bbox.split(",")[:4]]
+        except (TypeError, ValueError):
+            raise HTTPException(400, "bbox 参数格式应为 x0,y0,x1,y1")
+        if len(box) != 4:
+            raise HTTPException(400, "bbox 参数需要 4 个数")
+
+    try:
+        data = await c.storage.get(doc.storage_url)
+    except Exception as e:
+        raise HTTPException(404, f"无法读取文档: {e}")
+
+    def _render() -> bytes | None:
+        import io as _io
+
+        import pdfplumber
+        from PIL import ImageDraw
+
+        with pdfplumber.open(_io.BytesIO(data)) as pdf:
+            if not (1 <= page_no <= len(pdf.pages)):
+                return None
+            page = pdf.pages[page_no - 1]
+            img = page.to_image(resolution=min(max(int(dpi), 50), 200)).original
+            if box:
+                scale = img.width / float(page.width or 1)
+                x0 = max(0.0, (box[0] - pad) * scale)
+                y0 = max(0.0, (box[1] - pad) * scale)
+                x1 = min(float(img.width), (box[2] + pad) * scale)
+                y1 = min(float(img.height), (box[3] + pad) * scale)
+                d = ImageDraw.Draw(img)
+                d.rectangle([x0, y0, x1, y1], outline=(220, 38, 38), width=3)
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+
+    png = await asyncio.to_thread(_render)
+    if not png:
+        raise HTTPException(404, "页码越界")
+    return Response(png, media_type="image/png", headers={
+        "Cache-Control": "private, max-age=3600"})
 
 
 @ui_router.get("/documents/{doc_id}/content")
@@ -3439,6 +3594,7 @@ async def doc_parse_preview(request: Request, doc_id: str, page: int = 1,
               ("heading", "text", "table", "list", "image_ocr", "caption",
                "image_caption", "code") else "text",
               "text": text, "page": cm.page_num,
+              "page_end": getattr(cm, "page_end", None),
               "section_path": cm.section_path or "",
               "n": i, "chunk_id": cm.chunk_id, "word_count": len(text)}
         if cm.chunk_type == "table":
@@ -3499,11 +3655,86 @@ def _doc_error(doc) -> str:
             if msg:
                 parts.append(str(msg))
     if not parts and qr.get("summary"):
-        parts.append(str(qr["summary"]))
+        # 摘要按当前口径重算（老文档存的是旧文案，说不清"分档只统计检索块"）
+        parts.append(_quality_view(doc)["summary"] or str(qr["summary"]))
     return "；".join(parts)[:200]
 
 
-def _doc_view(doc, live_status: str | None = None) -> dict:
+def _fmt_local(ts) -> str | None:
+    """时间戳展示：库里存的是 **UTC**（Python `utcnow()`；MySQL 侧也用 UTC，见
+    `meta_mysql._build_engine` 的会话时区），界面上要显示**用户墙上的钟**。
+
+    历史缺陷：直接把 UTC 值切前 16 位显示，"上传时间"比用户实际时间早 8 小时
+    （实测 Codex 那篇：库里 11:07，用户是 19:07 上传的）。这里统一转本地时区。
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        return ts
+    if not hasattr(ts, "isoformat"):
+        return str(ts)
+    if ts.tzinfo is None:                 # 库里是 naive UTC
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _quality_view(doc) -> dict:
+    """质量报告里的结构化字段（详情页左栏分条显示，不再挤成一句话）
+
+    字段含义：
+      · `doc_type`：解析路径类型 —— text（有文字层）/ scanned（扫描件走 OCR）/
+        hybrid（混合）。**不是**文件类型（那个是 file_type: pdf/docx/xlsx…）。
+      · `ocr_pages`：**有几页没有文本层**（页面无可选中文字的那几页）；那几页的文字
+        是**版面引擎自己 OCR** 出来的，独立的 /ocr 服务只是兜底。它**不是**"调了几次
+        /ocr 端点"。详情页把这一项显示成「无文本层 N 页」。
+      · `buckets`：块质量分档。⚠ 只统计**检索块（子块）**，父块不计档 ——
+        用户问过"共 15 块为什么只有 2 块有质量信息"，就是这个原因（13 个是父块）。
+    """
+    qr = getattr(doc, "quality_report", None)
+    if not isinstance(qr, dict):
+        qr = {}
+    bins = {k: int(qr.get(k) or 0)
+            for k in ("high_quality", "medium_quality", "low_quality")}
+    total = int(getattr(doc, "chunk_count", 0) or 0)
+    scored = sum(bins.values())
+    doc_type = str(qr.get("doc_type") or "")
+    # 摘要**按当前口径重算**，而不是直接显示库里存的那行：
+    # 老文档存的是旧文案（"共 15 块（高质 1 / 中质 1 / 低质 0）；text 型，OCR 0 页"），
+    # 既说不清分档只统计检索块，又把解析类型/OCR 混在里面（用户要求拆成独立属性）。
+    # 重算只依赖已在库里的数字，不必为了换个说法把文档全部重解析。
+    summary = (quality_short_summary(
+        bins["high_quality"], bins["medium_quality"], bins["low_quality"])
+        if (scored or total) else str(qr.get("summary") or ""))
+    return {
+        "doc_type": doc_type,
+        "doc_type_label": doc_type_label(doc_type),
+        "ocr_pages": int(qr.get("used_ocr_pages") or 0),
+        "ocr_confidence": qr.get("ocr_avg_confidence"),
+        "document_score": qr.get("document_score"),
+        # 图区相关的计数（扫描页整页图 / 空白跳过 / 空值兜底等），详情页按需显示。
+        # 数字来自 quality_report.figure_stats（解析与收尾阶段写入），不是从 issue
+        # 文案里反解 —— 老文档没有这个字段时按空 dict 处理，页面自然降级。
+        "figure_stats": dict(qr.get("figure_stats") or {}),
+        "bins": bins,
+        "scored": scored,
+        "parents": max(total - scored, 0),
+        "summary": summary,
+        # 左栏「解析质量」那一行用它：`高235 / 中17 / 低4`。
+        # 为什么不直接用 summary：左栏只有 300px 宽，`高质 235 / 中质 17 / 低质 4`
+        # 会折行（用户实测）；完整说法留在列表悬停与库里那行（口径说明在行悬停里）。
+        "summary_compact": (quality_short_summary(
+            bins["high_quality"], bins["medium_quality"], bins["low_quality"],
+            compact=True) if (scored or total) else summary),
+        "issues": [{"code": str(i.get("code") or ""),
+                    "message": str(i.get("message") or i.get("code") or ""),
+                    "severity": str(i.get("severity") or ""),
+                    "page": i.get("page_num")}
+                   for i in (qr.get("issues") or []) if isinstance(i, dict)],
+    }
+
+
+def _doc_view(doc, live_status: str | None = None,
+              processed: dict | None = None) -> dict:
     """文档视图。
 
     `live_status`：**正在运行的任务**给出的实时状态。文档行（`documents.status`）
@@ -3511,26 +3742,69 @@ def _doc_view(doc, live_status: str | None = None) -> dict:
     中间那些 parsing/chunking/embedding/writing 全在 `ingest_tasks.status` 上。
     所以列表若只读文档行，用户看到的就是"一直排队中，直到某刻突然已完成"。
     这里允许调用方把任务状态盖上来（见 `_active_status_by_doc`）。
+
+    `processed`：最后一次处理（入库或重解析）的信息，由 `_last_processed_by_doc`
+    给出（`{"at": 本地时间串, "source": upload/reingest, "task_id": …}`）。
     """
     status = doc.status.value if hasattr(doc.status, "value") else str(doc.status)
     live = bool(live_status) and live_status != status
     deleted_at = getattr(doc, "deleted_at", None)
+    processed = processed or {}
     return {
         "doc_id": doc.doc_id, "filename": doc.filename,
         "collection": doc.collection, "file_type": doc.file_type,
         "status": live_status or status, "live": live, "file_size": doc.file_size,
         "page_count": doc.page_count, "chunk_count": doc.chunk_count,
         "version": doc.version, "error": _doc_error(doc),
-        "created_at": doc.created_at.isoformat() if doc.created_at else None,
-        "updated_at": doc.updated_at.isoformat() if getattr(doc, "updated_at", None) else None,
+        # 时间统一按本地时区显示（库里是 UTC）
+        "created_at": _fmt_local(doc.created_at),
+        "updated_at": _fmt_local(getattr(doc, "updated_at", None)),
         # 回收站列表按"删得最近的在上"排序与展示，故此字段要出到视图里
-        "deleted_at": (deleted_at.isoformat()
-                       if hasattr(deleted_at, "isoformat") else (deleted_at or None)),
+        "deleted_at": _fmt_local(deleted_at),
         "prev_status": getattr(doc, "prev_status", None),
+        # 「处理时间」= 最后一次入库/重解析**结束**的时间（取任务行的完成时间）
+        "processed_at": processed.get("at"),
+        "processed_source": processed.get("source") or "",
+        "processed_task": processed.get("task_id") or "",
+        "quality": _quality_view(doc),
         "allowed_roles": list(doc.allowed_roles or []),
         "created_by": doc.created_by, "storage_url": doc.storage_url,
         "quality_score": getattr(doc, "quality_score", None),
     }
+
+
+# 任务来源 → 界面上的中文说法（详情页「处理时间」后面跟的那几个字）
+_SOURCE_LABEL = {"upload": "上传入库", "reingest": "重解析",
+                 "server_path": "服务器路径导入", "retry": "重试",
+                 "ephemeral": "临时文档"}
+
+
+async def _last_processed_by_doc(c: ServiceContainer,
+                                 tenant_id: str) -> dict[str, dict]:
+    """`doc_id → 最后一次处理的信息`（任务行里取完成时间最晚的那条）
+
+    为什么不用 `documents.updated_at`：那是"这一行最后一次被写"的时间，
+    软删除/恢复/状态回写都会动它，不等于"最后一次处理文档"。任务行的
+    `completed_at` 才是真正的处理结束时间（重解析会新增一条任务行）。
+
+    ⚠ 取数走 `meta.last_task_by_doc`（SQL 按 doc 取最晚那条），**不是**在
+    `list_tasks(limit=200)` 的结果里挑：任务行超过 200 条以后，老文档的那条会掉出
+    窗口，页面上「处理时间」就变成 `—`（用户实测遇到：看着像"从没处理过"）。
+    """
+    try:
+        raw = await c.meta.last_task_by_doc(tenant_id)
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for doc_id, info in (raw or {}).items():
+        when = info.get("when")
+        if not doc_id or when is None:
+            continue
+        src = str(info.get("source_type") or "")
+        out[doc_id] = {"at": _fmt_local(when),
+                       "source": _SOURCE_LABEL.get(src, src),
+                       "task_id": info.get("task_id"), "_raw": when}
+    return out
 
 
 async def _find_doc(c: ServiceContainer, doc_id: str, user: UserContext):
@@ -3709,7 +3983,10 @@ async def _piece_data(page: str, piece: str, request: Request,
         if not doc:
             return {"doc": None}
         live = await _active_status_by_doc(c, user.tenant_id)
-        return {"doc": _doc_view(doc, live.get(doc.doc_id))}
+        processed = (await _last_processed_by_doc(c, doc.tenant_id)).get(doc.doc_id)
+        view = _doc_view(doc, live.get(doc.doc_id), processed)
+        view["type_counts"] = await _chunk_type_counts(c, doc.doc_id)
+        return {"doc": view}
 
     if page == "doc-detail" and piece == "chunks_container":
         doc_id = q.get("docId") or ""
@@ -3740,11 +4017,17 @@ async def _piece_data(page: str, piece: str, request: Request,
                 "chunk_type": cm.chunk_type if cm else "text",
                 "section_path": (cm.section_path if cm else "") or "",
                 "page": cm.page_num if cm else None,
+                "page_end": getattr(cm, "page_end", None) if cm else None,
                 "tokens": cm.token_count if cm else 0,
                 "quality_score": getattr(cm, "quality_score", None) if cm else None,
+                # 图块要给"看图 + 看页面位置"用：题注与图区框（PDF point）
+                "figure_label": getattr(cm, "figure_label", None) if cm else None,
+                "figure_caption": getattr(cm, "figure_caption", None) if cm else None,
+                "figure_bbox": getattr(cm, "figure_bbox", None) if cm else None,
                 "text": texts.get(cid, ""),
             })
         return {"items": items, "total": total, "page": page_no, "size": size,
+                "doc_id": doc_id,
                 "hasMore": page_no * size < total}
 
     if page == "doc-detail" and piece == "preview_pane":
@@ -3752,7 +4035,9 @@ async def _piece_data(page: str, piece: str, request: Request,
         doc = await _find_doc(c, doc_id, user)
         pv = await _parse_preview_data(c, doc_id) if doc else None
         live = await _active_status_by_doc(c, user.tenant_id) if doc else {}
-        return {"doc": _doc_view(doc, live.get(doc.doc_id)) if doc else None,
+        processed = ((await _last_processed_by_doc(c, doc.tenant_id)).get(doc.doc_id)
+                     if doc else None)
+        return {"doc": _doc_view(doc, live.get(doc.doc_id), processed) if doc else None,
                 "elements": (pv or {}).get("elements", []),
                 "outline": (pv or {}).get("outline", [])}
 
@@ -3815,6 +4100,8 @@ async def _parse_preview_data(c: ServiceContainer, doc_id: str) -> dict:
               ("heading", "text", "table", "list", "image_ocr", "caption",
                "image_caption", "code") else "text",
               "text": text, "page": cm.page_num,
+              # 结束页用于把页标记显示成"第 2–3 页"（跨页小节不再看着像分页标错）
+              "page_end": getattr(cm, "page_end", None),
               "section_path": cm.section_path or "",
               "n": i, "chunk_id": cm.chunk_id, "word_count": len(text)}
         if cm.chunk_type == "table":
@@ -3825,6 +4112,19 @@ async def _parse_preview_data(c: ServiceContainer, doc_id: str) -> dict:
                         for l in lines[1:] if not set(l) <= set("|-: ")]
                 el["raw_data"] = {"headers": headers, "rows": rows}
         elements.append(el)
+    # 页标记显示**区间**：展示单位是"父块 = 一整节"，一节常常跨页（实测 5 页的文档里
+    # 有 4 节跨页）。只显示起始页时，用户对照 PDF 会觉得"分页标错了"。
+    # 这里按"起始页相同的一组"求该组真正排到第几页 —— 一节从第 1 页开始、末尾排到
+    # 第 2 页，这一组就显示"第 1–2 页"。区间可能相邻组重叠，这是如实反映
+    # "小节跨页"，不是排版错误。
+    for i, el in enumerate(elements):
+        group_end = el.get("page_end") or el.get("page")
+        if el.get("page"):
+            for nxt in elements[i + 1:]:
+                if nxt.get("page") != el.get("page"):
+                    break
+                group_end = max(group_end or 0, nxt.get("page_end") or 0)
+        el["page_span_end"] = group_end
     return {"elements": elements, "outline": outline}
 
 

@@ -5924,6 +5924,18 @@ MinIO（原文件）→ MySQL（元数据，建立 chunk_id 与文档的关联�
 回收站文档不参与检索是**免费的**：元数据前置过滤只放 `status IN ('done','partial')`
 的文档，它们拿不到 `chunk_id` 白名单。
 
+**图区（看图 / 看在页面上的位置）** —— 实现口径见 `doc/data_path.md` §8.36：
+
+| 方法 | 路径（实现路径） | 说明 |
+|---|---|---|
+| GET | `/api/documents/{doc_id}/chunks/{chunk_id}/figure?dpi=150&pad=2` | 按块上存的 `figure_bbox` 从**原始 PDF 现裁**那张图（PNG；`Cache-Control: private, max-age=86400`）。图片字节不落盘，只落 4 个浮点数的框 |
+| GET | `/api/documents/{doc_id}/pages/{page_no}/image?dpi=100&highlight={chunk_id}` | 整页渲染；给了 `highlight`（或 `bbox=x0,y0,x1,y1`）就在**服务端**画红框标出图区 |
+
+红框之所以在服务端画：前端要画就得算"渲染尺寸 ÷ PDF point 尺寸"的比例，而预览图按
+dpi 渲染 —— 比例一旦不一致，框就偏移，而偏移在界面上"看着像是对的"。服务端渲染与画框
+共用同一张图、同一坐标系，框不可能偏。非图块 / 无 `figure_bbox` 的存量块返回 404
+（前端不显示缩略图与入口，而不是留破图）。
+
 ### 22.10 配置系统 V2 新增字段（追加到 TenantConfig）
 
 ```yaml
@@ -6102,14 +6114,25 @@ class ChunkMeta(BaseModel):
     doc_id:          str
     tenant_id:       str
     collection:      str      = "default"
+    # 实现口径补充（详见 doc/data_path.md §3.12 / §8.29 / §8.32 / §8.36）：
+    #   seq        块在**文档内的构建序号**（父块先于其子块）—— 展示顺序靠它；
+    #              它同时进 chunk_id 的哈希，所以必须落库才拿得到顺序
+    #   page_end   块正文的**结束页**（page_num 是起始页）—— 一节常跨页
+    #   figure_bbox 图区在页面上的 **PDF point 框** [x0,y0,x1,y1] —— 图片字节不落库，
+    #              读侧凭它从原始 PDF 按需再裁（来源抽屉出图 / 预览页红框定位）
+    seq:             int      = 0
     chunk_type:      str      = "text"       # text/table/image_caption/code/formula
     is_parent:       bool     = False
     parent_chunk_id: str | None = None
     page_num:        int | None = None
+    page_end:        int | None = None
     section_path:    str | None = None
     quality_score:   float    = 1.0
     token_count:     int      = 0
     allowed_roles:   list[str] = Field(default_factory=list)
+    figure_label:    str | None = None        # "图28"
+    figure_caption:  str | None = None        # "系统整体架构示意图"
+    figure_bbox:     list[float] | None = None  # 图区框（PDF point，MySQL 里存 JSON 文本）
     created_at:      datetime = Field(default_factory=datetime.utcnow)
 
 class TableData(BaseModel):
@@ -8184,8 +8207,10 @@ class SourceReference(BaseModel):
     section:         str | None = None       # section_path 的最后一级
     section_path:    str | None = None       # 完整路径 "第3章/3.1节/3.1.2"
     page_num:        int | None = None
+    page_end:        int | None = None       # 命中块跨页时显示"第 3–4 页"
     figure_label:    str | None = None       # V2.1 新增："图28"
     figure_caption:  str | None = None       # V2.1 新增："系统整体架构示意图"
+    figure_bbox:     list[float] | None = None  # 图区 PDF point 框（前端据此高亮/取图）
     storage_url:     str | None = None
     chunk_type:      str        = "text"     # text/table/image_caption/code
 

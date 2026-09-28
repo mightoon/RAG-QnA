@@ -20,6 +20,7 @@ import asyncio
 import re
 from pathlib import Path
 
+from rag.adapters.doc_parse import clamp_box_to_page
 from rag.models import (ContentType, ParsedDocument, ParsedElement)
 from rag.observability.logging import flush_parse_noise, get_logger
 
@@ -120,6 +121,24 @@ class BaseParser(DocParserAdapter):
 # PDF
 # ═══════════════════════════════════════════════════════════
 
+def _figure_scope(box, page_w: float, page_h: float) -> str:
+    """图区的**粒度**：`page` = 占了整页（≥85% 面积），`region` = 页面里的一块
+
+    为什么要标出来：扫描件整页就是一张位图，引擎与 pdfplumber 都只会给出"整页"这一个
+    区域 —— 于是这条 `image_caption` 描述的是**整页**（含正文），而不是某张插图。
+    描述本身仍有价值（照片页上的内容 OCR 抽不到），但粒度必须如实：入库时给正文加
+    「（整页图）」前缀，检索与引用里就没人会把它当成"某一张图"。
+    实测这篇 116 页文档里正好 10 处（8 个扫描页 + p6/p7 两张整页照片页）。
+    """
+    try:
+        x0, y0, x1, y1 = [float(v) for v in box[:4]]
+    except (TypeError, ValueError, IndexError):
+        return "region"
+    area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    page = max(1.0, float(page_w) * float(page_h))
+    return "page" if area / page >= 0.85 else "region"
+
+
 @AdapterRegistry.register_parser("pdf")
 class PDFParser(BaseParser):
 
@@ -154,6 +173,9 @@ class PDFParser(BaseParser):
                                 for pg in layout_pages))
         pages = list(ocr_pages or [])
         page_types: list[str] = []
+        # 内嵌图抽取的两个计数（见下面的夹框逻辑）：都要进质量报告，不能静默
+        clamped_images = 0
+        skipped_images = 0
         with pdfplumber.open(file_path) as pdf:
             doc.page_count = len(pdf.pages)
             for page_idx, page in enumerate(pdf.pages):
@@ -220,9 +242,24 @@ class PDFParser(BaseParser):
                                       "row_count": len(table) - 1}))
 
                 for img in (page.images or []):
+                    # 框先**夹到页内**再裁：PDF 内嵌图对象的框常比 MediaBox 大
+                    # 0.05~1.3pt（导出工具的出血位），pdfplumber 的 page.crop() 遇到
+                    # 这种框直接抛 ValueError，原实现 `except: continue` 把它静默跳过
+                    # —— 实测麦肯锡那篇 26 个内嵌图对象里 18 个走了这条路（含 10 个
+                    # 整页扫描图），"图没了"在库里只表现为"这页没有 image_caption"。
+                    box = clamp_box_to_page(
+                        [img["x0"], img["top"], img["x1"], img["bottom"]],
+                        float(page.width), float(page.height))
+                    if not box:
+                        skipped_images += 1
+                        continue
+                    if (abs(box[0] - img["x0"]) > 0.01
+                            or abs(box[1] - img["top"]) > 0.01
+                            or abs(box[2] - img["x1"]) > 0.01
+                            or abs(box[3] - img["bottom"]) > 0.01):
+                        clamped_images += 1
                     try:
-                        cropped = page.crop((img["x0"], img["top"],
-                                             img["x1"], img["bottom"]))
+                        cropped = page.crop((box[0], box[1], box[2], box[3]))
                         im = cropped.to_image(resolution=150)
                         import io
                         buf = io.BytesIO()
@@ -230,10 +267,17 @@ class PDFParser(BaseParser):
                         doc.elements.append(ParsedElement(
                             content_type=ContentType.IMAGE, text="",
                             page_num=page_idx + 1,
-                            bbox=[img["x0"], img["top"], img["x1"], img["bottom"]],
+                            bbox=list(box),
+                            # figure_bbox = **PDF point** 框：落库后读侧可以按需
+                            # 从原始 PDF 再裁（来源抽屉出图 / 预览页高亮区域），
+                            # 于是不需要把图片字节另存一份（见 data_path §3.13）
                             raw_data={"image_bytes": buf.getvalue(),
+                                      "figure_bbox": list(box),
+                                      "figure_scope": _figure_scope(
+                                          box, page.width, page.height),
                                       "page_num": page_idx + 1}))
                     except Exception:
+                        skipped_images += 1
                         continue
         # 文档级类型：全文字 / 全扫描 / 混合（供质量报告与运维判断走了哪条路）
         doc.metadata["page_types"] = page_types
@@ -251,14 +295,35 @@ class PDFParser(BaseParser):
         # ⑤ 引擎 figure 区域的**图字节补齐**（在去重之后做：与嵌入图配对上的那些
         #    已经有 pdfplumber 的图字节，剩下的才是"引擎看到了、PDF 图像对象里
         #    找不到"的区域 —— 扫描件里的图正是这一类）。
-        filled, failed = self._fill_layout_region_bytes(
-            file_path, doc.elements, layout_pages)
-        doc.metadata["figure_region_cropped"] = filled
-        doc.metadata["figure_region_crop_failed"] = failed
-        if failed:
+        stats = self._fill_layout_region_bytes(file_path, doc.elements, layout_pages)
+        doc.metadata["figure_region_cropped"] = stats["filled"]
+        doc.metadata["figure_region_crop_failed"] = stats["failed"]
+        # 换算失败后退回"整页渲染"的处数：这些图仍然有语义描述，但**粒度是整页**
+        doc.metadata["figure_page_fallback"] = stats["page_fallback"]
+        # 引擎转过栅格（doc_preprocessor_res.angle ≠ 0）并按逆变换救回来的处数
+        doc.metadata["figure_angle_corrected"] = stats["angle_fixed"]
+        # 粒度是"整页"的图区数（扫描页/整页照片页）：引用与检索里会标成「（整页图）」
+        # = 引擎框裁出来的（stats 里已计）+ pdfplumber 内嵌图那条路（`layout_region`
+        #   为假、但带图字节的那些）
+        embedded_page_scope = sum(
+            1 for e in doc.elements
+            if e.content_type == ContentType.IMAGE
+            and (e.raw_data or {}).get("figure_scope") == "page"
+            and (e.raw_data or {}).get("image_bytes")
+            and not (e.raw_data or {}).get("layout_region"))
+        doc.metadata["figure_page_scope"] = stats["page_scope"] + embedded_page_scope
+        doc.metadata["image_bbox_clamped"] = clamped_images
+        doc.metadata["image_bbox_skipped"] = skipped_images
+        if stats["failed"]:
             log.warning("layout_figure_crop_incomplete",
-                        doc_id=doc_id, filled=filled, failed=failed,
+                        doc_id=doc_id, filled=stats["filled"],
+                        failed=stats["failed"],
+                        page_fallback=stats["page_fallback"],
                         note="缺图字节的 figure 区域不会进 VLM 描述")
+        if clamped_images or skipped_images:
+            log.info("image_bbox_adjusted", doc_id=doc_id,
+                     clamped=clamped_images, skipped=skipped_images,
+                     note="内嵌图对象框超出页面（出血位）：夹到页内后裁剪")
         # pdfplumber/pdfminer 在这一趟里会对"字体描述符不规范"的页面逐条告警
         # （实测 96 页文档 7688 条），日志里真正要看的都被淹掉。这里把攒下的
         # 计数汇总成一条（过滤装在 observability/logging 里），既不刷屏也不丢信息。
@@ -267,22 +332,33 @@ class PDFParser(BaseParser):
 
     @staticmethod
     def _fill_layout_region_bytes(file_path: str, elements: list,
-                                  layout_pages: list[dict] | None) -> tuple[int, int]:
-        """给"引擎给了区域、但没有图字节"的 IMAGE 元素按框裁图 → (成功, 失败)
+                                  layout_pages: list[dict] | None) -> dict:
+        """给"引擎给了区域、但没有图字节"的 IMAGE 元素按框裁图 → 计数表
 
         为什么需要这一步：引擎的 figure 区域与 pdfplumber 的嵌入图先按顺序配对，
         配对上的用 pdfplumber 的字节（能真裁图）；**配不上的剩下的**（典型是扫描件
         —— 整页是一张位图，pdfplumber 看不到其中的"照片"对象）只有框、没有字节，
         VLM 拿不到输入 → 图上内容永远不可检索，而质量报告里看不出任何异常。
 
-        坐标换算只认适配层的 `to_page_points`（引擎自报栅格尺寸 ÷ PDF 页尺寸 + 落页
-        校验）；换算不出来就**不裁**，把那部分计进 `failed` 让上层可见 —— 宁可少
-        描述一张图，也不要把页眉/整页当图交给 VLM（那会产出一段看起来正常的错误描述）。
+        坐标换算只认适配层的 `to_page_points`（引擎自报栅格尺寸 ÷ PDF 页尺寸 +
+        **按 doc_preprocessor_res.angle 逆变换** + 落页校验）。
+
+        换算不出来时**退回整页渲染**（`page_fallback`）：这是"最坏也给一个语义入口"
+        的选择 —— 麦肯锡那篇 p10/p56 整页照片页，引擎把栅格转了 90°/270°、坐标校验
+        必然拒绝，结果是这两页**连一个 image_caption 块都没有**、图上内容彻底搜不到；
+        宁可描述得粗（整页），也不要让一张图在索引里不存在。计数进 metadata 让
+        "这处描述是整页兜底"可查，不是悄悄降级。
+
+        返回 {"filled", "failed", "page_fallback", "angle_fixed"}：
+        `failed` 只在**连整页兜底都失败**时增加（正常应为 0）。
         """
-        from rag.adapters.doc_parse import crop_page_region
+        from rag.adapters.doc_parse import (crop_page_region,
+                                            engine_frame_angle)
         from rag.adapters.layout import layout_adapter
+        out = {"filled": 0, "failed": 0, "page_fallback": 0, "angle_fixed": 0,
+               "page_scope": 0}
         if not layout_pages:
-            return 0, 0
+            return out
         by_page: dict[int, list] = {}
         for el in elements:
             if el.content_type != ContentType.IMAGE:
@@ -292,8 +368,7 @@ class PDFParser(BaseParser):
                 continue
             by_page.setdefault(el.page_num or 0, []).append(el)
         if not by_page:
-            return 0, 0
-        filled = failed = 0
+            return out
         import pdfplumber
         try:
             with pdfplumber.open(file_path) as pdf:
@@ -301,28 +376,45 @@ class PDFParser(BaseParser):
                     idx = page_num - 1
                     if not (0 <= idx < len(pdf.pages)
                             and idx < len(layout_pages)):
-                        failed += len(els)
+                        out["failed"] += len(els)
                         continue
                     page = pdf.pages[idx]
+                    angle = engine_frame_angle(layout_pages[idx])
                     for el in els:
                         box = layout_adapter().to_page_points(layout_pages[idx],
                                                               el.bbox or [],
                                                               float(page.width),
                                                               float(page.height))
-                        data = crop_page_region(page, box) if box else None
+                        box_src = "layout_bbox"
+                        if not box:
+                            # 兜底：换算不出来（残留的角度/坐标异常）就渲染**整页**，
+                            # 让这张图至少有一个语义入口（粒度粗 > 完全搜不到）
+                            box = [0.0, 0.0, float(page.width), float(page.height)]
+                            box_src = "page_fallback"
+                            out["page_fallback"] += 1
+                        data = crop_page_region(page, box)
                         if not data:
-                            failed += 1
+                            out["failed"] += 1
                             continue
                         el.raw_data["image_bytes"] = data
                         el.bbox = box          # 换成 PDF point：与嵌入图同一口径
-                        el.metadata = {**(el.metadata or {}),
-                                       "figure_crop": "layout_bbox"}
-                        filled += 1
+                        # 落库用：读侧凭它从原始 PDF 按需再裁（抽屉出图/预览高亮）
+                        el.raw_data["figure_bbox"] = list(box)
+                        el.raw_data["figure_scope"] = _figure_scope(
+                            box, page.width, page.height)
+                        meta = {**(el.metadata or {}), "figure_crop": box_src}
+                        if box_src == "layout_bbox" and angle:
+                            meta["figure_angle"] = angle      # 引擎转过栅格、已逆变换
+                            out["angle_fixed"] += 1
+                        el.metadata = meta
+                        out["filled"] += 1
+                        if el.raw_data["figure_scope"] == "page":
+                            out["page_scope"] += 1
         except Exception as e:                              # noqa: BLE001
             log.warning("layout_figure_crop_failed",
                         error=f"{type(e).__name__}: {e}"[:200])
-            return filled, failed + sum(len(v) for v in by_page.values())
-        return filled, failed
+            out["failed"] += sum(len(v) for v in by_page.values())
+        return out
 
     @staticmethod
     def _dedupe_image_elements(elements: list) -> list:
@@ -341,7 +433,6 @@ class PDFParser(BaseParser):
         引擎侧带 caption/文字，合并时两边的信息都留，只留一个元素。
         数量不等时多出来的保持独立（宁可多一个块，也不要把两张不同的图合成一张）。
         """
-        out: list = []
         # 按页收集：引擎侧（无 bytes）与本地侧（有 bytes）各自的 IMAGE 元素
         by_page: dict[int, list] = {}
         for el in elements:

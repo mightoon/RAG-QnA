@@ -16,7 +16,8 @@ import random
 import re
 from datetime import datetime
 
-from rag.models import (ChunkMeta, IngestStatus, QualityIssue)
+from rag.models import (ChunkMeta, IngestStatus, QualityIssue,
+                        quality_short_summary)
 from rag.observability.logging import get_logger
 from rag.pipeline.base import PipelineStep, StepRegistry
 from rag.pipeline.context import IngestContext
@@ -619,6 +620,33 @@ class VerifyStep(PipelineStep):
 class FinalizeStep(PipelineStep):
     """收尾：质量报告汇总 + 文档状态落库（done / partial）"""
 
+    @staticmethod
+    def build_summary(q, total_chunks: int, parent_chunks: int,
+                      warnings: list | None = None) -> str:
+        """质量报告摘要（口径与展示层共用 `rag.models.quality_short_summary`）
+
+        文案已按用户要求收成一句「检索块质量：高质 X / 中质 Y / 低质 Z」：
+        总块数与父子拆分在详情页左栏「分块数」那一行，不在这里重复。
+        """
+        failed_stores = sum(1 for i in (q.issues or [])
+                            if i.code.endswith('_write_failed'))
+        return quality_short_summary(
+            q.high_quality, q.medium_quality, q.low_quality,
+            total_chunks, parent_chunks, q.doc_type, q.used_ocr_pages,
+            failed_stores, len(warnings or []))
+
+    @staticmethod
+    def parse_info(q) -> str:
+        """解析路径信息（`text/scanned/hybrid` 型、OCR 页数）
+
+        用户要求把它从质量摘要里**独立出来**（详情页左栏各有自己的一行：
+        「解析类型」「OCR」），所以摘要里不再重复；但任务进度行仍需要它 ——
+        那一行是排查"这份文档走了哪条解析路径"时唯一的现场记录。
+        """
+        if not q.doc_type:
+            return ""
+        return f"{q.doc_type} 型，OCR {q.used_ocr_pages} 页"
+
     async def execute(self, ctx: IngestContext) -> None:
         s = ctx.services
         q = ctx.quality
@@ -648,14 +676,18 @@ class FinalizeStep(PipelineStep):
         # 质量备注走 issues（进质量报告），状态仍如实为 DONE。
         write_failed = any(i.code.endswith("_write_failed") for i in q.issues)
         status = IngestStatus.PARTIAL if write_failed else IngestStatus.DONE
-        q.summary = (f"共 {len(ctx.chunks)} 块（高质 {q.high_quality} / "
-                     f"中质 {q.medium_quality} / 低质 {q.low_quality}）"
-                     + (f"；{q.doc_type} 型，OCR {q.used_ocr_pages} 页"
-                        if q.doc_type else "")
-                     + (f"；写入失败库 {sum(1 for i in q.issues if i.code.endswith('_write_failed'))}"
-                        if write_failed else "")
-                     + (f"；质量备注 {len(ctx.warnings)} 条"
-                        if ctx.warnings else ""))
+        # 图区统计补两项**只有入库后期才知道**的数字（详情页「图表」那一行要显示）：
+        #   · 空白跳过：VLM 步骤算出来的（解析阶段还不知道）
+        #   · 实际入库的图块/表块数：以真落库的块为准（比解析阶段的计数更可信）
+        fs = dict(getattr(q, "figure_stats", None) or {})
+        fs["blank_skipped"] = int((ctx.meta or {}).get("vlm_blank_skipped") or 0)
+        fs["image_caption_chunks"] = sum(
+            1 for c in ctx.chunks if c.chunk_type == "image_caption")
+        fs["table_chunks"] = sum(1 for c in ctx.chunks if c.chunk_type == "table")
+        q.figure_stats = fs
+        q.summary = FinalizeStep.build_summary(
+            q, len(ctx.chunks),
+            sum(1 for c in ctx.chunks if c.is_parent), ctx.warnings)
 
         report = q.model_dump(mode="json")
         # 解析/嵌入口径指纹：随质量报告一起落库，供**下次同文件重传**时判断
@@ -676,4 +708,7 @@ class FinalizeStep(PipelineStep):
             "doc_type": q.doc_type, "used_ocr_pages": q.used_ocr_pages}
         ctx.task.status = status
         await s.meta.save_task(ctx.task)
-        await ctx.report(status.value, 1.0, q.summary)
+        # 任务进度行保留解析路径信息（摘要里已按用户要求拆出去，这里补上）
+        info = FinalizeStep.parse_info(q)
+        await ctx.report(status.value, 1.0,
+                         f"{q.summary}；{info}" if info else q.summary)

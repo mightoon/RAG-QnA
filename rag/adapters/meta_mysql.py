@@ -51,13 +51,24 @@ def _build_engine(config: MetaStoreConfig):
     每次调用都返回**全新引擎**：探测一律真实建连，不复用任何缓存连接，
     这样"测试连接"反映的永远是此刻服务端的真实状态（服务端刚修好、或刚宕机，
     点一下就能立刻看出来，而不是拿到一条早就建好的空闲连接）—— 见 TS-014。
+
+    ⚠ 连接上把会话时区钉成 **UTC**（`SET time_zone='+00:00'`）：
+    库里有两套时钟在写同一张表 —— Python 侧写的是 `datetime.utcnow()`（UTC），
+    而 SQL 里的 `NOW()` / `CURRENT_TIMESTAMP` / `ON UPDATE CURRENT_TIMESTAMP`
+    用的是**服务端本地时区**（实测这台是 UTC+8）。后果是 documents 表里
+    `created_at`（Python，UTC）与 `updated_at`（MySQL，本地）**差 8 小时**，
+    界面上"上传时间"比用户墙上的钟早 8 小时，回收站的"删除时间"却是本地时间。
+    会话时区改成 UTC 后，两边就是同一个时钟；展示层再统一转成本地时间
+    （`rag/web/routes.py` 的 `_fmt_local`）。存量行里由 MySQL 写的老值仍是本地口径
+    （只有 updated_at / deleted_at 受影响，且删除时间列在新数据上才准确）。
     """
     dsn = (f"mysql+aiomysql://{config.user}:{config.password}"
            f"@{config.host}:{config.port}/{config.database}"
            f"?charset={config.charset}")
     return create_async_engine(
         dsn, pool_size=POOL_SIZE, pool_pre_ping=True,
-        connect_args={"connect_timeout": CONNECT_TIMEOUT_SEC})
+        connect_args={"connect_timeout": CONNECT_TIMEOUT_SEC,
+                      "init_command": "SET time_zone = '+00:00'"})
 
 
 def _driver_errno(exc: Exception) -> int | None:
@@ -158,12 +169,14 @@ DDL_STATEMENTS = [
       is_parent        TINYINT(1)   DEFAULT 0,
       parent_chunk_id  VARCHAR(64),
       page_num         INT,
+      page_end         INT,
       section_path     TEXT,
       quality_score    FLOAT        DEFAULT 1.0,
       token_count      INT          DEFAULT 0,
       allowed_roles    JSON,
       figure_label     VARCHAR(64),
       figure_caption   TEXT,
+      figure_bbox      VARCHAR(128),
       text             MEDIUMTEXT,
       created_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_doc_id      (doc_id),
@@ -307,6 +320,11 @@ class MySQLMetaStore(MetaStoreAdapter):
                 # 块在文档内的构建序号（详情页按它展示；老数据为 NULL，
                 # 由 ORDER BY 的兜底按页码排，见 list_chunk_ids）
                 "ALTER TABLE chunks_meta ADD COLUMN seq INT NULL",
+                # 块正文的结束页（详情页显示"第 2–3 页"；老数据为 NULL）
+                "ALTER TABLE chunks_meta ADD COLUMN page_end INT NULL",
+                # 图区在页面上的 PDF point 框（读侧按需再裁图 / 预览高亮；
+                # 老数据为 NULL → 前端不显示缩略图与高亮，功能自然降级）
+                "ALTER TABLE chunks_meta ADD COLUMN figure_bbox VARCHAR(128) NULL",
             ):
                 try:
                     await conn.execute(text(mig))
@@ -510,6 +528,11 @@ class MySQLMetaStore(MetaStoreAdapter):
                     d = c.model_dump(mode="json")
                     d["allowed_roles"] = json.dumps(d.get("allowed_roles") or [])
                     d["is_parent"] = 1 if d.get("is_parent") else 0
+                    # figure_bbox 存成紧凑 JSON 文本（列是 VARCHAR）：读侧 json.loads。
+                    # None 保持 None（老文档/非图块），前端不显示缩略图。
+                    bb = d.get("figure_bbox")
+                    d["figure_bbox"] = (json.dumps([round(float(v), 2) for v in bb])
+                                        if bb else None)
                     if texts.get(c.chunk_id):
                         d["text"] = texts[c.chunk_id]
                     else:
@@ -518,21 +541,24 @@ class MySQLMetaStore(MetaStoreAdapter):
                 await s.execute(text("""
                     INSERT INTO chunks_meta
                       (chunk_id, doc_id, tenant_id, collection, seq, chunk_type,
-                       is_parent, parent_chunk_id, page_num, section_path,
+                       is_parent, parent_chunk_id, page_num, page_end, section_path,
                        quality_score, token_count, allowed_roles,
-                       figure_label, figure_caption, created_at)
+                       figure_label, figure_caption, figure_bbox, created_at)
                     VALUES
                       (:chunk_id, :doc_id, :tenant_id, :collection, :seq, :chunk_type,
-                       :is_parent, :parent_chunk_id, :page_num, :section_path,
+                       :is_parent, :parent_chunk_id, :page_num, :page_end, :section_path,
                        :quality_score, :token_count, :allowed_roles,
-                       :figure_label, :figure_caption, :created_at)
+                       :figure_label, :figure_caption, :figure_bbox, :created_at)
                     ON DUPLICATE KEY UPDATE
                       seq=VALUES(seq),
+                      page_num=VALUES(page_num),
+                      page_end=VALUES(page_end),
                       quality_score=VALUES(quality_score),
                       token_count=VALUES(token_count),
                       section_path=VALUES(section_path),
                       figure_label=VALUES(figure_label),
-                      figure_caption=VALUES(figure_caption)
+                      figure_caption=VALUES(figure_caption),
+                      figure_bbox=VALUES(figure_bbox)
                 """), values)
                 # 正文单独写入（避免插入参数过大）
                 text_vals = [{"cid": c.chunk_id, "txt": texts[c.chunk_id]}
@@ -666,6 +692,59 @@ class MySQLMetaStore(MetaStoreAdapter):
                 f"WHERE {' AND '.join(chunk_conds)} LIMIT 50000"), params3)
             return [row[0] for row in rows3]
 
+    async def last_task_by_doc(self, tenant_id: str) -> dict[str, dict]:
+        """`doc_id → 最后一次处理它的任务`（按 `COALESCE(completed_at, created_at)` 取最晚）
+
+        用途：详情页/列表的「处理时间」。为什么不在内存里挑：原实现取
+        `list_tasks(limit=200)` 再按 doc 分组 —— 任务行超过 200 条以后，**老文档的
+        "处理时间"会凭空变空**（它那条任务已经不在最近 200 条里），而界面显示成 `—`
+        看着像"从没处理过这篇文档"。SQL 直接按 doc 取最晚那条，与任务总数无关
+        （走 `idx_doc_id`）。
+
+        `completed_at` 为空（还在跑/历史行）时退回 `created_at`，不留空。
+        """
+        await self._ensure_tables()
+        out: dict[str, dict] = {}
+        async with self._session() as s:
+            rows = await s.execute(text("""
+                SELECT t.doc_id, t.task_id, t.status, t.source_type,
+                       t.completed_at, t.created_at
+                FROM ingest_tasks t
+                JOIN (
+                    SELECT doc_id, MAX(COALESCE(completed_at, created_at)) AS mx
+                    FROM ingest_tasks WHERE tenant_id=:t GROUP BY doc_id
+                ) m ON m.doc_id = t.doc_id
+                   AND COALESCE(t.completed_at, t.created_at) = m.mx
+                WHERE t.tenant_id=:t
+            """), {"t": tenant_id})
+            for r in rows.mappings():
+                d = dict(r)
+                when = d.get("completed_at") or d.get("created_at")
+                out[str(d.get("doc_id") or "")] = {
+                    "task_id": d.get("task_id"),
+                    "status": d.get("status"),
+                    "source_type": d.get("source_type"),
+                    "when": when,
+                }
+        return out
+
+    async def count_chunks_by_type(self, doc_id: str) -> dict[str, int]:
+        """该文档的块类型计数 `{chunk_type: n}`（详情页左栏「图表」那一行用）
+
+        一次 `GROUP BY chunk_type`（`idx_doc_id` 覆盖），比把整篇的块元数据全捞回来
+        再在 Python 里数省得多 —— 一篇 300+ 块的文档，这里只回 3~4 行。
+        父块的 `chunk_type` 是 `parent`，与检索块天然分开（前端要的是"图/表各多少"）。
+        """
+        await self._ensure_tables()
+        out: dict[str, int] = {}
+        async with self._session() as s:
+            rows = await s.execute(text(
+                "SELECT chunk_type, COUNT(*) AS n FROM chunks_meta "
+                "WHERE doc_id=:d GROUP BY chunk_type"), {"d": doc_id})
+            for ctype, n in rows:
+                out[str(ctype or "text")] = int(n or 0)
+        return out
+
     async def list_chunk_ids(self, doc_id: str) -> list[str]:
         """该文档的块 id，**按文档内顺序**返回（详情页的「分块」「内容预览」用它分页）
 
@@ -699,6 +778,13 @@ class MySQLMetaStore(MetaStoreAdapter):
                     if isinstance(d.get("allowed_roles"), str):
                         d["allowed_roles"] = json.loads(d["allowed_roles"])
                     d["is_parent"] = bool(d.get("is_parent"))
+                    # figure_bbox 在库里是 JSON 文本（见 upsert_chunks）；解析失败
+                    # 当"没有框"处理（前端只是不显示缩略图/高亮，不该让整批元数据挂掉）
+                    if isinstance(d.get("figure_bbox"), str):
+                        try:
+                            d["figure_bbox"] = json.loads(d["figure_bbox"])
+                        except (json.JSONDecodeError, TypeError):
+                            d["figure_bbox"] = None
                     out.append(ChunkMeta(**d))
         return out
 

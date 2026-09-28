@@ -16,12 +16,31 @@
       <span class="chunk-index">#{{ c.n }}</span>
       <span class="badge badge-info">{{ c.chunk_type }}</span>
       <span class="chunk-loc">
-        {% if c.page %}P{{ c.page }}{% endif %}
+        {% if c.page %}P{{ c.page }}{% if c.page_end and c.page_end > c.page %}–{{ c.page_end }}{% endif %}{% endif %}
         {% if c.section_path %} · {{ c.section_path }}{% endif %}
       </span>
       <span class="chunk-qscore">{{ c.tokens }} tok{% if c.quality_score is not none %} · q{{ '%.2f' | format(c.quality_score) }}{% endif %}</span>
     </div>
     <div class="chunk-text">{{ c.text }}</div>
+    {% if c.chunk_type == 'image_caption' and c.figure_bbox and c.chunk_id %}
+    {# 图块：显示"这张图"本身 + 一键看它在页面上的位置。
+       图片字节不落库，前端只拿 chunk_id 去 /figure 现裁、拿页码去 /pages 看红框位置，
+       所以老块（入库时没存坐标）这里不显示，不会留破图占位。 #}
+    {% set did = d.doc_id if d.doc_id is defined else '' %}
+    <div class="chunk-figure">
+      <img class="chunk-figure-thumb" loading="lazy" alt="图区"
+           src="/api/documents/{{ did }}/chunks/{{ c.chunk_id }}/figure?dpi=130"
+           data-figure-doc="{{ did }}" data-figure-chunk="{{ c.chunk_id }}"
+           data-figure-page="{{ c.page or '' }}"
+           data-figure-label="{{ c.figure_label or '' }}"
+           data-figure-caption="{{ c.figure_caption or '' }}">
+      <button class="btn btn-secondary btn-xs js-figure-open" type="button"
+              data-figure-doc="{{ did }}" data-figure-chunk="{{ c.chunk_id }}"
+              data-figure-page="{{ c.page or '' }}"
+              data-figure-label="{{ c.figure_label or '' }}"
+              data-figure-caption="{{ c.figure_caption or '' }}">看页面位置</button>
+    </div>
+    {% endif %}
     {% if c.text and c.text | length > 220 %}
     <button class="chunk-expand-btn" type="button">展开</button>
     {% endif %}

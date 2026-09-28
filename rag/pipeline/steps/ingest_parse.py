@@ -14,11 +14,12 @@
 from __future__ import annotations
 
 import base64
+import io
 import re
 from pathlib import Path
 
 from rag.adapters.doc_parse import (DocParseBadInput, DocParseEndpointMissing,
-                                    DocParseUnavailable,
+                                    DocParseTransient, DocParseUnavailable,
                                     doc_parse_capability_for, make_client)
 from rag.models import (ContentType, ParsedElement, QualityIssue, TableData)
 from rag.observability.logging import get_logger
@@ -31,6 +32,73 @@ log = get_logger("rag.steps.parse")
 # 其余类型（md/txt/csv/html/docx/xlsx/pptx）由解析器直接读文件，**不能**送去 OCR ——
 # 详见 ParseStep.execute 里的说明（实测 .md 会让整篇文档卡在重试里）。
 _OCR_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def _path_safe(title: str) -> str:
+    """标题进入 section_path 之前，把 ASCII 斜杠换成全角斜杠
+
+    section_path 用 **ASCII "/"** 当层级分隔符（`"第3章/3.1节/3.1.2"`），
+    而真实标题里就会带斜杠 —— 中文研报标题尤其常见：
+
+      · 日期："三、9/22晨间最新催化：联盟扩张阶段开启"（实测踩到的就是它）
+      · 并列："输入/输出"、"A/B 测试"
+
+    这类标题拼进路径后，**所有按 "/" 取叶子的消费点都会劈错**：
+
+      · 详情页大纲：段数被多算一级 → "三、…"显示成"二、…"下面的子项，
+        叶子标题只剩"22晨间最新催化：…"（用户报的就是这个观感）；
+      · 引用与检索提示里的 section（`models.py` / `query_generate.py` 同样取叶子）
+        → 引用里显示的章节名被截断。
+
+    在**源头**换掉这一个是唯一一处改动就能全修的办法：路径从此无歧义，
+    而且中文语境里全角斜杠本来就更自然（显示上几乎看不出差别）。
+    ⚠ 存量文档的路径是旧口径（标题里的斜杠是原样的），要等重解析才会变正确。
+    """
+    return _norm_title(title).replace("/", "／")
+
+
+def _norm_title(title: str) -> str:
+    """标题归一：折叠空白（比较/查表都用它，避免"换行 vs 空格"导致查不到）"""
+    return " ".join(str(title or "").split())
+
+
+# 编号型标题："5.1 …" / "3.2.1 …"（全角点也认）。分段只用 1~2 位数字：
+# 这样 "2026.9 版本说明" 这种年份开头的标题不会被误判成二级。
+_NUM_DOTTED = re.compile(r"^(\d{1,2}(?:[.．]\d{1,2}){1,3})(?=[^\d]|$)")
+# 同一主号至少出现这么多次，才认为这篇文档真的在用编号分层。
+# 护栏的必要性：研报里常被版面模型误判成"标题"的**数据标签**（"6.32亿人"）
+# 也长得像编号，孤零零一个不该把层级带偏。
+_MIN_SAME_MAJOR = 2
+
+
+def _numbering_levels(titles: list[str]) -> dict[str, int]:
+    """按标题自身的编号推断层级：{"5.1新增…": 2, "3.2.1 边界": 3, …}
+
+    背景：版面服务的区块**只有 bbox/label/content 三个字段**，压根不给层级
+    （实测），PDF 也常常没有书签 —— 于是所有标题都被当成 1 级，
+    "一、" 与 "5.1" 并列，大纲看不出父子关系。字号也分不开（实测同篇文档里
+    「五、」30.5px 与「1.1」29.9px 只差 0.6px）。
+
+    编号是标题自己携带的结构证据（不是猜字号），规则确定：
+      · 以 `N.M[.K]` 开头 → 层级 = 点数 + 1（`5.1` → 2、`3.2.1` → 3）；
+      · 主号（第一个数字）在这篇文档里**至少出现两次**才算数（见上面的护栏）；
+      · 其余标题不推断，沿用解析器给的层级。
+    调用方只用它**加深**层级（`num > level` 时才采用），不会把已有层级改浅。
+    """
+    cands: dict[str, tuple[int, str]] = {}
+    majors: dict[str, int] = {}
+    for t in titles:
+        s = _norm_title(t)
+        m = _NUM_DOTTED.match(s)
+        if not m:
+            continue
+        num = m.group(1).replace("．", ".")
+        lvl = min(1 + num.count("."), OutlineStep.MAX_DEPTH)
+        major = num.split(".")[0]
+        cands[s] = (lvl, major)
+        majors[major] = majors.get(major, 0) + 1
+    return {t: lvl for t, (lvl, major) in cands.items()
+            if majors.get(major, 0) >= _MIN_SAME_MAJOR}
 
 
 @StepRegistry.register("detect_format")
@@ -183,10 +251,21 @@ class RegionEnhanceStep(PipelineStep):
         if not layout_pages:
             return                      # 没走版面引擎：区域信息不存在，无从裁起
 
-        table_els = [e for e in ctx.parsed.elements
-                     if e.content_type == ContentType.TABLE and
-                     not (e.raw_data or {}).get("rows") and
-                     not (e.raw_data or {}).get("table_html")]
+        table_els = []
+        for e in ctx.parsed.elements:
+            if e.content_type != ContentType.TABLE:
+                continue
+            rd = e.raw_data or {}
+            if rd.get("rows"):
+                continue                     # 已经结构化了（pdfplumber / Excel 分支）
+            html = str(rd.get("table_html") or "")
+            if html and _html_table_to_rows(html)[1]:
+                continue                     # 引擎的 HTML 能用 → 不必再打一次服务
+            # 走到这里有两类：引擎**只给框没给内容**（html 为空），或**给了 HTML
+            # 但解析不出行列**（跨行跨列很乱、只有一层标签…）。后者以前不会进这里，
+            # 结果是"引擎的 HTML 解析不出来 = 这张表没有任何结构"，而表格识别能力
+            # 明明可用 —— 现在一并送过去，拿回来对比后再决定用哪份。
+            table_els.append(e)
         formula_els = [e for e in ctx.parsed.elements
                        if (e.raw_data or {}).get("formula_region") and
                        not (e.text or "").strip()]
@@ -217,16 +296,29 @@ class RegionEnhanceStep(PipelineStep):
             return
 
         done = {k: 0 for k, _ in plan}
+        kept = {k: 0 for k, _ in plan}
         failed = {k: 0 for k, _ in plan}
+        skipped = {k: 0 for k, _ in plan}
         import pdfplumber
         try:
             with pdfplumber.open(ctx.file_path) as pdf:
                 for internal, els in plan:
                     for el in els:
-                        ok = await self._one(ctx, s, pdf, layout_pages, el,
-                                             internal)
-                        if ok:
+                        # ⚠ 逐个区域**复查门禁**：同一次解析里，前面的区域失败会给该
+                        # 能力开静默期，后面的区域就该直接跳过 —— 否则一篇有很多公式的
+                        # 文档会为每个区域白打一次连接尝试 + 退避（实测 ≈3s/区域），
+                        # 而所有区域的结论必然相同。规划阶段查一次是不够的。
+                        if ready is not None and ready(internal):
+                            skipped[internal] += 1
+                            continue
+                        # 三态：True=用了服务结果 / None=服务给了但**保留引擎结果**
+                        # （不是失败）/ False=真失败
+                        res = await self._one(ctx, s, pdf, layout_pages, el,
+                                              internal)
+                        if res is True:
                             done[internal] += 1
+                        elif res is None:
+                            kept[internal] += 1
                         else:
                             failed[internal] += 1
         except Exception as e:                              # noqa: BLE001
@@ -236,20 +328,45 @@ class RegionEnhanceStep(PipelineStep):
                             "内容以引擎文字为准")
             return
 
-        summary = " / ".join(f"{self._CN[k]} {done[k]} 处"
-                             for k in done if done[k])
+        summary = " / ".join(
+            f"{self._CN[k]} {done[k]} 处" + (f"（另有 {kept[k]} 处保留引擎结果）"
+                                            if kept.get(k) else "")
+            for k in done if done[k] or kept.get(k))
         if summary:
             await ctx.report("chunking", 0.25, f"区域识别完成：{summary}")
+        # 瞬时失败（服务 5xx/连不上）按类汇总成**一条**告警：一个公式多、服务又挂了的
+        # 文档逐区域告警会刷出几十条重复内容，反而看不清
+        transient = ctx.meta.get("region_transient") or {}
+        for kind, reason in transient.items():
+            more = (f"；静默期内另有 {skipped[kind]} 处直接跳过"
+                    if skipped.get(kind) else "")
+            ctx.add_warning(f"{self._CN.get(kind, kind)}区域识别暂时失败："
+                            f"{reason[:140]}（服务恢复后重解析即可，"
+                            f"未记为能力不可用）{more}")
+        # 静默期是**上一次**（或上一篇文档）开的：这里的跳过没有对应的"本次失败"，
+        # 单独说一句，免得用户以为区域识别压根没跑
+        for kind, n in skipped.items():
+            if n and kind not in transient:
+                ctx.quality.issues.append(QualityIssue(
+                    stage="parse", severity="info",
+                    code=f"doc_parse_{kind}_cooldown_skipped",
+                    message=f"{self._CN.get(kind, kind)}区域 {n} 处未做识别："
+                            "该服务刚被判定为暂时不可用（静默期内不再重试，"
+                            "到期自动恢复）", action="degrade"))
         lost = " / ".join(f"{self._CN[k]} {v} 处"
-                          for k, v in failed.items() if v)
+                          for k, v in failed.items() if v and k not in transient)
         if lost:
             # 失败也要说清楚"丢的是什么"，不能只说"部分失败"
             ctx.add_warning(f"区域识别未完成：{lost}"
                             "（该区域内容以引擎文字为准，可能缺结构或公式符号）")
 
     async def _one(self, ctx: IngestContext, s, pdf, layout_pages,
-                   el: ParsedElement, internal: str) -> bool:
-        """单个区域：裁图 → 识别 → 写回元素（失败返回 False，不抛）"""
+                   el: ParsedElement, internal: str) -> bool | None:
+        """单个区域：裁图 → 识别 → 写回元素
+
+        返回三态：True=采用服务结果；**None=保刻意留引擎结果**（服务给了，但引擎那份
+        更完整 —— 这不该算失败）；False=真失败（裁不出图/服务没给内容/调用出错）。
+        """
         from rag.adapters.doc_parse import crop_page_region
         from rag.adapters.layout import layout_adapter
         idx = (el.page_num or 0) - 1
@@ -272,6 +389,13 @@ class RegionEnhanceStep(PipelineStep):
         img = crop_page_region(page, box, resolution=200)
         if not img:
             return False
+
+        def _ok(cap_name: str) -> None:
+            """一次成功调用：让容器清掉该能力的静默期（服务恢复后立刻恢复正常）"""
+            fn = getattr(s, "note_doc_parse_ok", None)
+            if fn is not None and cap_name:
+                fn(cap_name)
+
         try:
             cap = doc_parse_capability_for(s.config, internal)
             client = make_client(s.config, cap)
@@ -280,24 +404,54 @@ class RegionEnhanceStep(PipelineStep):
                 html = str(res.get("table_html") or "")
                 if not html:
                     return False
+                # 服务给的结构**不一定要**：只有当它比引擎原有那份更能解析出行列时
+                # 才替换。理由：引擎的 HTML 与页面文字是同一套阅读顺序，服务那份
+                # 是重新识别出来的；能用就用引擎的（少一次"同一张表两套说法"）。
+                new_rows = _html_table_to_rows(html)[1]
+                old_html = str(rd.get("table_html") or "")
+                old_rows = _html_table_to_rows(old_html)[1] if old_html else []
+                _ok(cap)                    # 调用成功 → 清掉静默期/degraded
+                if old_rows and len(old_rows) >= len(new_rows):
+                    # 引擎那份更好：保留它，同时把服务结果留档备查（不算失败）
+                    rd.setdefault("table_html_service", html)
+                    return None
                 rd["table_html"] = html
-                headers, rows = _html_table_to_rows(html)
-                if rows:
+                if res.get("cells"):
+                    rd["table_cells"] = res["cells"]
+                if new_rows:
+                    headers, rows = _html_table_to_rows(html)
                     rd["headers"], rd["rows"] = headers, rows
-                    el.metadata = {**(el.metadata or {}),
-                                   "table_source": "table-recognition"}
+                el.metadata = {**(el.metadata or {}),
+                               "table_source": "table-recognition"}
                 return True
             res = await client.recognize_formula(img)
             text = str(res.get("text") or "").strip()
             if not text:
                 return False
+            _ok(cap)
             el.text = text
             el.metadata = {**(el.metadata or {}),
                            "formula_source": "formula-recognition"}
             return True
+        except DocParseEndpointMissing as e:
+            # 端点不存在/能力配错：重试不会自愈，记结论让后续文档不再打这个端点
+            note = getattr(s, "note_doc_parse_failure", None)
+            if note is not None:
+                note(doc_parse_capability_for(s.config, internal), str(e))
+            return False
+        except DocParseTransient as e:
+            # 5xx/超时：**本次**失败而已。绝不能记成"能力不可用" —— 实测公式识别
+            # 服务 18083 就是这样：/health 200、推理连续 500，若把它缓存成不可用，
+            # 服务恢复后本进程也永远不会再试（用户看到的还是绿的）。
+            # 原因攒进 ctx.meta，由 execute 汇总成一条告警 + 记进 degraded。
+            log.warning("region_recognize_transient", doc_id=ctx.doc.doc_id,
+                        kind=internal, error=str(e)[:200])
+            ctx.meta.setdefault("region_transient", {})[internal] = str(e)
+            note = getattr(s, "note_doc_parse_degraded", None)
+            if note is not None:
+                note(doc_parse_capability_for(s.config, internal), str(e))
+            return False
         except DocParseUnavailable as e:
-            # 端点不存在/服务挂了：记结论让后续文档不再打这个端点，本区域按
-            # "没识别出来"处理（已有 warning 汇总，不在这里抛）
             note = getattr(s, "note_doc_parse_failure", None)
             if note is not None:
                 note(doc_parse_capability_for(s.config, internal), str(e))
@@ -450,7 +604,6 @@ class OutlineStep(PipelineStep):
     为每个元素生成 section_path（"第3章/3.1节/3.1.2"）。
     """
     MAX_DEPTH = 4
-
     async def execute(self, ctx: IngestContext) -> None:
         if not ctx.parsed:
             return
@@ -469,15 +622,23 @@ class OutlineStep(PipelineStep):
                         f"标题与 PDF 书签匹配率低 "
                         f"({hit}/{len(toc_titles)})，大纲可能不完整")
         # 2) 标题层级栈 → section_path
+        #    层级来源优先级：**编号**（标题自带的"5.1"，只在解析器没给更深的层级时生效）
+        #    → 解析器给的 heading_level → 1 级。见 _numbering_levels 的说明。
+        num_levels = _numbering_levels(
+            [el.text for el in ctx.parsed.elements
+             if el.content_type == ContentType.TITLE])
         stack: list[tuple[int, str]] = []       # [(level, title)]
         for el in ctx.parsed.elements:
             level = None
             if el.content_type == ContentType.TITLE:
                 level = el.metadata.get("heading_level") or 1
+                num = num_levels.get(_norm_title(el.text))
+                if num and num > level:
+                    level = num                 # 编号只**加深**，不改浅
                 level = min(int(level), self.MAX_DEPTH)
                 while stack and stack[-1][0] >= level:
                     stack.pop()
-                stack.append((level, el.text.strip()[:64]))
+                stack.append((level, _path_safe(el.text)[:64]))
             el.metadata["section_path"] = "/".join(
                 t for _, t in stack)[:512] if stack else ""
             el.metadata["heading_level"] = level
@@ -542,6 +703,62 @@ class ReorderColumnsStep(PipelineStep):
 _VLM_PROMPT = ("用一句话描述这张图片的内容，"
                "如果是图表请说明图表类型和数据要点。")
 
+# VLM 描述里的**提示词/思考残留**：实测麦肯锡那篇的图题正文里出现
+#   `**视觉引擎已解析图片，内容描述如下：**`、`**最终答案：**`、`**一句话描述：**`、
+#   `**内容描述：**`、`**图片内容如下：**`
+# 它们是模型把"任务说明"或"思考小结"一起吐了出来。**必须清掉**：这段文字会作为
+# `image_caption` 块的正文进 MySQL/ES/Milvus，既污染检索（用户搜"图片"会命中一堆
+# "内容描述如下"），也让引用里出现莫名的加粗标题。
+_LEAD_LABEL_RE = re.compile(
+    r"^\s*(?:\*\*|__)?\s*(?:视觉引擎已解析图片[^：:*\n]{0,12}"
+    r"|最终答案|一句话(?:描述|总结)|图片?(?:内容)?描述|内容描述|图片内容如下"
+    r"|描述|答案|总结)\s*(?:如下)?\s*[:：]\s*(?:\*\*|__)?\s*")
+_BOLD_RE = re.compile(r"\*\*|__")
+
+
+def clean_vlm_caption(text: str) -> tuple[str, bool]:
+    """清掉 VLM 描述开头/正文里的提示词与思考残留 → (干净文本, 是否改过)
+
+    只做"去壳"，不做改写：**能删的只有那些一眼看就是壳的东西** ——
+      ① 开头的标签式前缀（`**最终答案：**`、`内容描述：`…），可能连着出现几层；
+      ② 正文里的 markdown 加粗标记（`**xx**` → `xx`）。
+    描述内容本身一个字都不动：宁可留着一点噪声，也不能把"图上写了什么"改掉。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "", False
+    out = raw
+    for _ in range(4):                      # 前缀可能叠好几层
+        stripped = _LEAD_LABEL_RE.sub("", out, count=1).strip()
+        if stripped == out:
+            break
+        out = stripped
+    out = _BOLD_RE.sub("", out).strip()
+    out = re.sub(r"^[\s:：\-—]+", "", out).strip()
+    return out, (out != raw)
+
+
+def figure_is_blank(image_bytes: bytes, *, size: int = 64, std_max: float = 3.0) -> bool:
+    """这张图是不是"近空白"（整块纯色/白底）→ 用来**跳过 VLM 调用**
+
+    实测依据（麦肯锡 116 页、77 张图）：引擎会在正文页上标出 0.2~0.4% 页面的小区域当
+    figure，裁出来**整块纯白**（64×64 灰度标准差 0.0，灰度范围 255~255）——
+    这样的区域有 **42 个**，占这张文档全部图元素的 55%。它们每一个都要花一次 VLM 调用，
+    换回一段「完全空白的白色图片…」进库，是纯噪声（用户实测就看到了这句）。
+    真正的图标准差都在 20 以上，阈值取 3 有 7 倍余量，不会误伤。
+    """
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(image_bytes)).convert("L")
+        px = list(im.resize((size, size)).getdata())
+    except Exception:                                        # noqa: BLE001
+        return False                       # 读不出来就当"不是空白"，照旧送 VLM
+    if not px:
+        return False
+    mean = sum(px) / len(px)
+    var = sum((v - mean) ** 2 for v in px) / len(px)
+    return (var ** 0.5) < std_max
+
 
 @StepRegistry.register("vlm_caption")
 class VLMCaptionStep(PipelineStep):
@@ -568,6 +785,25 @@ class VLMCaptionStep(PipelineStep):
                   e.raw_data.get("image_bytes")]
         if not images:
             return
+        # ① 近空白图直接跳过：纯白/纯色区域描述不出任何内容，只会把
+        #    「完全空白的白色图片…」这类噪声写进检索库（实测占本篇图元素的 55%）。
+        #    只在**没有别的文字**时才算"白送一次调用"：若该区域还有 OCR/引擎文字，
+        #    元素照旧出块，只是不再问 VLM。
+        blank = [e for e in images if figure_is_blank(e.raw_data["image_bytes"])]
+        if blank:
+            for e in blank:
+                e.metadata = {**(e.metadata or {}), "vlm_skipped": "blank_region"}
+            ctx.meta["vlm_blank_skipped"] = len(blank)
+            images = [e for e in images if e not in blank]
+            ctx.quality.issues.append(QualityIssue(
+                stage="parse", severity="info", code="vlm_blank_region_skipped",
+                message=f"{len(blank)} 处图区几乎是空白（纯色区域），未做图片理解"
+                        "：这些区域描述不出内容，只会往检索库里写一条噪声",
+                action="auto"))
+        if not images:
+            await ctx.report("chunking", 0.3,
+                             f"图片理解已跳过（{len(blank)} 张为空白区域）")
+            return
 
         # 门禁：没配 VLM 就不发请求（也避免把 mock 的假描述写进向量库）
         ready = getattr(ctx.services, "vlm_ready", None)
@@ -581,6 +817,7 @@ class VLMCaptionStep(PipelineStep):
         vlm = getattr(ctx.services, "vlm", None) or ctx.services.llm
         vlm_cfg = getattr(vlm, "config", None)
         sem = _Semaphore(getattr(vlm_cfg, "max_concurrency", 4) or 4)
+        cleaned_total: list[int] = []       # 清理过提示词残留的图数（见下方 issue）
 
         async def describe(el: ParsedElement) -> None:
             b64 = base64.b64encode(el.raw_data["image_bytes"]).decode()
@@ -601,7 +838,19 @@ class VLMCaptionStep(PipelineStep):
                         # 思考，150 这种小值会让它满额截断、content 为空 —— 图片描述
                         # 就白做了（内容空但文档照样入库，属于最难发现的那类静默失败）
                         max_tokens=getattr(vlm_cfg, "max_tokens", None) or 512)
-                el.raw_data["vlm_caption"] = (caption or "").strip()[:500]
+                # ② 去壳：提示词/思考残留（`**最终答案：**` 之类）不能进检索库。
+                #    清完为空说明模型只吐了壳 → 当"没描述出来"，如实记 warning。
+                cleaned, changed = clean_vlm_caption(caption or "")
+                if changed:
+                    cleaned_total.append(1)
+                if not cleaned:
+                    ctx.add_warning("图片描述为空（模型只回了提示词残留），"
+                                    "该图按无描述入库")
+                    return
+                el.raw_data["vlm_caption"] = cleaned[:500]
+                if changed:
+                    el.metadata = {**(el.metadata or {}),
+                                   "vlm_caption_cleaned": True}
             except Exception as e:
                 # 记 warning 而不是只写 debug：否则"图没被理解"与"图本来就没内容"
                 # 在质量报告里无法区分（原实现就是这个盲区）
@@ -615,6 +864,13 @@ class VLMCaptionStep(PipelineStep):
         done = sum(1 for e in images if e.raw_data.get("vlm_caption"))
         await ctx.report("chunking", 0.3,
                          f"图片描述完成：{done}/{len(images)}")
+        if cleaned_total:
+            # 让"模型不老实"这件事在质量报告里可见（换模型/换提示词后能立刻看到变化）
+            ctx.quality.issues.append(QualityIssue(
+                stage="parse", severity="info", code="vlm_caption_cleaned",
+                message=f"{len(cleaned_total)} 条图片描述清掉了提示词残留"
+                        "（如 `**最终答案：**`）后才入库",
+                action="auto"))
 
 
 @StepRegistry.register("table_extract")
@@ -699,7 +955,13 @@ def table_to_natural_text(headers: list[str], rows: list[list[str]],
 
 
 def _html_table_to_rows(html: str) -> tuple[list[str], list[list[str]]]:
-    """HTML 表格 → (headers, rows)；解析失败返回空（不抛，表格结构拿不到不该中断入库）"""
+    """HTML 表格 → (headers, rows)；解析失败返回空（不抛，表格结构拿不到不该中断入库）
+
+    **colspan 与 rowspan 都要展开**，否则后续列整体错位 —— 而错位是**静默**的：
+    行列都还在、行数也对，只是每一行的"列=值"对应关系错了。实测麦肯锡 p87 那张表
+    的第一格就是 `<td rowspan="19">医院…</td>`（跨 19 行），原实现只展开 colspan，
+    于是第 2 行起整体左移一列，"哪一年对应哪个数值"全错，而质量报告里看不出异常。
+    """
     if not html or "<t" not in html.lower():
         return [], []
     try:
@@ -707,19 +969,40 @@ def _html_table_to_rows(html: str) -> tuple[list[str], list[list[str]]]:
         soup = BeautifulSoup(html, "lxml")
         trs = soup.find_all("tr")
         grid: list[list[str]] = []
-        for tr in trs:
+        # 跨行占位：pending[(row_idx, col_idx)] = 文本（还在往下延伸的 rowspan）
+        pending: dict[tuple[int, int], str] = {}
+        for row_idx, tr in enumerate(trs):
             cells = tr.find_all(["td", "th"])
             if not cells:
                 continue
-            # colspan/rowspan 展开成对齐的行列（不展开会让后续列错位）
             row: list[str] = []
+            col = 0
+            # 先把上一行 rowspan 留下来的格子补上
+            while (row_idx, col) in pending:
+                row.append(pending.pop((row_idx, col)))
+                col += 1
             for cell in cells:
+                while (row_idx, col) in pending:      # 被跨行格挡住的位置
+                    row.append(pending.pop((row_idx, col)))
+                    col += 1
                 text = cell.get_text(" ", strip=True)
                 try:
-                    span = max(1, int(cell.get("colspan") or 1))
+                    cspan = max(1, int(cell.get("colspan") or 1))
                 except (TypeError, ValueError):
-                    span = 1
-                row.extend([text] + [""] * (span - 1))
+                    cspan = 1
+                try:
+                    rspan = max(1, int(cell.get("rowspan") or 1))
+                except (TypeError, ValueError):
+                    rspan = 1
+                for k in range(cspan):
+                    row.append(text if k == 0 else "")
+                    for r in range(1, rspan):        # 往下逐行占位
+                        pending[(row_idx + r, col + k)] = "" if k else text
+                col += cspan
+            # 收尾：本行右侧可能还有 pending（上一行的跨行格比本行单元格宽）
+            while (row_idx, col) in pending:
+                row.append(pending.pop((row_idx, col)))
+                col += 1
             grid.append(row)
         if len(grid) < 2:
             return [], []
@@ -757,15 +1040,57 @@ def _surface_doc_parse_notes(ctx: IngestContext, client, label: str) -> None:
 
 
 def _surface_figure_notes(ctx: IngestContext) -> None:
-    """图区裁图结果进质量报告（裁出来多少 / 裁不出来多少）"""
+    """图区裁图结果进质量报告（裁出来多少 / 兜底多少 / 裁不出来多少）
+
+    数字同时写进 `quality.figure_stats`（详情页的「图表」一行与图区说明要读它）——
+    只记 issue 的话，页面上想显示"整页图 N 张""空白跳过 M 处"就得去解析 issue 文案。
+    """
     md = ((ctx.parsed.metadata if ctx.parsed else None) or {})
     filled = int(md.get("figure_region_cropped") or 0)
     failed = int(md.get("figure_region_crop_failed") or 0)
+    fallback = int(md.get("figure_page_fallback") or 0)
+    angle_fixed = int(md.get("figure_angle_corrected") or 0)
+    clamped = int(md.get("image_bbox_clamped") or 0)
+    skipped_obj = int(md.get("image_bbox_skipped") or 0)
+    page_scope = int(md.get("figure_page_scope") or 0)
+    ctx.quality.figure_stats = {
+        "cropped": filled, "crop_failed": failed, "page_fallback": fallback,
+        "angle_corrected": angle_fixed, "bbox_clamped": clamped,
+        "bbox_skipped": skipped_obj, "page_scope": page_scope,
+    }
     if filled:
         ctx.quality.issues.append(QualityIssue(
             stage="parse", severity="info", code="figure_region_cropped",
             message=f"按版面区域裁出 {filled} 张图（引擎给了框、PDF 里没有对应"
-                    "图像对象，通常是扫描件）", action="auto"))
+                    "图像对象：矢量图、出血被夹过的位图、扫描整页图都算）",
+            action="auto"))
+    if angle_fixed:
+        # 引擎的文档方向分类把页面转正过：不说清楚的话，别人看到"某些页的框跟
+        # 别的页不同源"会以为是算错了（麦肯锡那篇 116 页里只有 2 页）
+        ctx.quality.issues.append(QualityIssue(
+            stage="parse", severity="info", code="figure_angle_corrected",
+            message=f"{angle_fixed} 处图区按引擎的旋转角（doc_preprocessor_res."
+                    "angle）逆变换后裁出（引擎检测前把栅格转正过，不逆变换就会"
+                    "超出页面而整张图丢失）", action="auto"))
+    if page_scope:
+        ctx.quality.issues.append(QualityIssue(
+            stage="parse", severity="info", code="figure_page_scope",
+            message=f"{page_scope} 处图区的粒度是**整页**（扫描页/整页照片页）：这些"
+                    "描述含整页内容，入库时已标成「（整页图）」，不是单张插图",
+            action="auto"))
+    if fallback:
+        # 说清楚后果：图有了语义描述，但**粒度是整页**（"哪张图"的定位精度下降）
+        ctx.add_warning(f"{fallback} 处图区坐标换算不可用，已退回整页渲染做图片理解"
+                        "（描述粒度是整页，不是那张图的实际范围）")
+    if clamped:
+        ctx.quality.issues.append(QualityIssue(
+            stage="parse", severity="info", code="image_bbox_clamped",
+            message=f"{clamped} 个内嵌图对象的框超出页面边界（PDF 导出常见的出血位），"
+                    "已夹到页内后抽取", action="auto"))
+    skipped = int(md.get("image_bbox_skipped") or 0)
+    if skipped:
+        ctx.add_warning(f"{skipped} 个内嵌图对象无法抽取（框退化到没有面积）"
+                        "：这些图不进图片理解")
     if failed:
         # 说清楚后果：这些图不会被 VLM 描述，即图上内容不可检索
         ctx.add_warning(f"{failed} 处图区未裁出（坐标不可换算或无对应图像），"

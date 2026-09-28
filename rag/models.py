@@ -180,12 +180,19 @@ class ChunkMeta(BaseModel):
     is_parent: bool = False
     parent_chunk_id: str | None = None
     page_num: int | None = None
+    # 块正文**结束**在哪一页（`page_num` 是起始页）。详情页的"第 N 页"标记只按起始页
+    # 显示时，跨页的小节看起来像"分页标错了"（实测一篇 5 页的文档里有 3 节跨页）。
+    # 有了它就能显示"第 2–3 页"。存量行为 NULL → 退回只显示起始页。
+    page_end: int | None = None
     section_path: str | None = None         # "第3章/3.1节/3.1.2"
     quality_score: float = 1.0
     token_count: int = 0
     allowed_roles: list[str] = Field(default_factory=list)
     figure_label: str | None = None         # 图/表标题编号，如"图28"
     figure_caption: str | None = None       # 图/表题注文本
+    # 图区 PDF point 框（见 RetrievedChunk.figure_bbox）：入库时由解析器算好，
+    # 读侧不再重新解析版式就能定位"这张图在页面的哪块"
+    figure_bbox: list[float] | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     @field_validator("seq", mode="before")
@@ -358,14 +365,22 @@ class QualityReport(BaseModel):
     high_quality: int = 0
     medium_quality: int = 0
     low_quality: int = 0
+    # 图区计数（详情页"图表"那一行与图区说明用它）。放成一个 dict 而不是逐个字段：
+    # 这些数字是**解析过程的统计量**（裁出多少、整页多少、空白跳过多少…），
+    # 口径还会随引擎变化增加新键；老文档没有这个字段时按空 dict 处理，页面自然降级。
+    # 由 `ingest_parse._surface_figure_notes` 与 `FinalizeStep` 填充。
+    figure_stats: dict = Field(default_factory=dict)
     ocr_avg_confidence: float | None = None
     char_density: float | None = None
     blank_page_ratio: float | None = None
     document_score: float = 1.0             # 文档级质量系数（ChunkStep降权）
     garbled_ratio: float | None = None
-    # 这份文档实际走了哪条解析路径（text / scanned / mixed）与用了几页 OCR。
+    # 这份文档实际走了哪条解析路径（text / scanned / mixed）。
     # 判据是「页面有没有文本层」，不是字符密度 —— 见 doc_parser.PDFParser._parse_sync。
     doc_type: str = ""
+    # **有几页没有文本层**（不是"调了几次 /ocr"）：那几页的文字是**版面引擎自己**
+    # OCR 识别出来的（`/layout-parsing` 产线自带 OCR），独立的 `/ocr` 服务只是兜底。
+    # 详情页里这一项显示成「无文本层 N 页」，悬停说明也照这个口径写。
     used_ocr_pages: int = 0
     summary: str = ""
 
@@ -449,6 +464,59 @@ class QueryPlan(BaseModel):
 # 检索侧
 # ═══════════════════════════════════════════════════════════
 
+def quality_short_summary(high: int, medium: int, low: int,
+                          total_chunks: int = 0, parent_chunks: int = 0,
+                          doc_type: str = "", ocr_pages: int = 0,
+                          failed_stores: int = 0, warnings: int = 0,
+                          *, compact: bool = False) -> str:
+    """质量报告那行摘要：`检索块质量：高质 264 / 中质 17 / 低质 0`
+
+    口径（不变）：分档**只统计检索块**（进向量库的检索单元），父块（整节聚合体）
+    不计档 —— 见 `ingest_write.FinalizeStep` 里的循环。
+
+    文案（用户要求，2026-09-28 两次调整）：
+      · 去掉前缀「共 N 块 = 检索块 N + 父块 M」：总块数/父子拆分在详情页左栏的
+        「分块数」那一行已经有了，摘要里再来一遍是重复；
+      · 去掉后缀「（父块不计档）」：这句改成悬停说明，不再占正文；
+      · `compact=True` → `高235 / 中17 / 低4`：详情页左栏只有 300px 宽，
+        全称写不进一行（用户实测换行）；带冒号的完整说法留给列表悬停与库里那行。
+
+    ⚠ 签名**保持老顺序不变**（`total_chunks`/`parent_chunks`/`doc_type`/`ocr_pages`
+    现在不参与拼接）。为什么不把参数删掉：老调用点是按位置传的，删/换顺序会让
+    `15, 13` 这类实参落到 `failed_stores/warnings` 上，于是摘要里冒出
+    "写入失败库 15；质量备注 13 条" 这种**看不出来源**的假数据。留着位置但不用，
+    老调用点即使没改也只会得到新文案，不会得到垃圾。
+
+    放在 models 里是为了入库时与展示时用同一份口径：老文档库里存的是旧文案，
+    详情页按这里重算，不需要为了换个说法把文档全部重解析。
+    """
+    body = (f"高{high} / 中{medium} / 低{low}" if compact
+            else f"高质 {high} / 中质 {medium} / 低质 {low}")
+    head = "" if compact else "检索块质量："
+    return (f"{head}{body}"
+            + (f"；写入失败库 {failed_stores}" if failed_stores else "")
+            + (f"；质量备注 {warnings} 条" if warnings else ""))
+
+
+def doc_type_label(doc_type: str) -> str:
+    """解析路径类型的中文说法（库里的取值见 doc_parser：text / scanned / mixed）"""
+    return {"text": "文本型", "scanned": "扫描型",
+            "mixed": "混合型", "hybrid": "混合型"}.get(str(doc_type or ""), str(doc_type or ""))
+
+
+def page_label(page_num: int | None, page_end: int | None = None) -> str:
+    """页码展示串：`第3页` / 跨页时 `第3–4页`（拿不到起始页就空串）
+
+    一处实现、三处使用（提示词里的来源定位、`SourceReference.display_location`、
+    前端来源抽屉），避免"有的地方给单页、有的地方给区间"这种不一致。
+    """
+    if not page_num:
+        return ""
+    if page_end and page_end > page_num:
+        return f"第{page_num}–{page_end}页"
+    return f"第{page_num}页"
+
+
 class RetrievedChunk(BaseModel):
     chunk_id: str
     doc_id: str
@@ -459,8 +527,16 @@ class RetrievedChunk(BaseModel):
     title: str | None = None
     section_path: str | None = None
     page_num: int | None = None
+    # 命中块的**结束页**（检索单元跨页时要如实说"第 3–4 页"）：
+    # 它只落在 MySQL 里（ES/Milvus 的映射没有这一列，给向量库加字段必须重建集合），
+    # 所以在检索链路的"回取元数据"一步从 MySQL 补齐，见 query_retrieve._fill_parent_content。
+    page_end: int | None = None
     figure_label: str | None = None
     figure_caption: str | None = None
+    # 图区在页面上的 **PDF point 框** [x0,y0,x1,y1]（只落在 MySQL，同 page_end 的理由）。
+    # 图片字节**不落库**（MinIO 里只有原始 PDF），读侧凭这个框按需从原始 PDF 再裁
+    # —— 于是抽屉能出图、预览页能高亮区域，存储也不用为每张图多存一份 PNG。
+    figure_bbox: list[float] | None = None
     chunk_type: str = "text"
     collection: str | None = None
     is_ephemeral: bool = False
@@ -480,15 +556,24 @@ class SourceReference(BaseModel):
     section: str | None = None              # section_path 的最后一级
     section_path: str | None = None         # 完整路径 "第3章/3.1节/3.1.2"
     page_num: int | None = None
+    page_end: int | None = None             # 命中块跨页时显示"第 3–4 页"
     figure_label: str | None = None         # V2.1："图28"
     figure_caption: str | None = None       # V2.1："系统整体架构示意图"
+    # 图区在页面上的 PDF point 框：前端据此在预览页上高亮，并直接向后端要"这张图"
+    # （后端按框从原始 PDF 现裁，见 routes 的 figure 端点）
+    figure_bbox: list[float] | None = None
     storage_url: str | None = None
     preview_url: str | None = None          # 原文预览 URL（presigned）
     chunk_type: str = "text"                # text/table/image_caption/code
 
     @property
+    def page_label(self) -> str:
+        """页码展示串：`第3页` / 跨页时 `第3–4页`（见模块级 `page_label()`）"""
+        return page_label(self.page_num, self.page_end)
+
+    @property
     def display_location(self) -> str:
-        """UI 展示位置串。优先级：figure_label > figure_caption > section > page_num"""
+        """展示位置串。优先级：figure_label > figure_caption > section > 页码"""
         parts: list[str] = []
         if self.figure_label:
             parts.append(self.figure_label)
@@ -496,8 +581,8 @@ class SourceReference(BaseModel):
             parts.append(f"图：{self.figure_caption[:20]}")
         if self.section_path:
             parts.append(self.section_path.split("/")[-1])
-        if self.page_num:
-            parts.append(f"第{self.page_num}页")
+        if self.page_label:
+            parts.append(self.page_label)
         return " · ".join(parts) if parts else ""
 
 

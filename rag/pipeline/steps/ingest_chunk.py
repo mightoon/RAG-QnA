@@ -25,6 +25,25 @@ _FIGURE_PATTERN = re.compile(
     r"^(图|Figure|Fig\.?)\s*[\d\-\.]+\s*[:：\s]?\s*(.*)", re.I)
 
 
+def _bbox4(raw) -> list[float] | None:
+    """图区框归一成 [x0,y0,x1,y1]（四位数字，否则 None）
+
+    解析器给的是 PDF point（浮点），也可能带字符串（某些引擎返回 str）。这里只做
+    "够不够四个数、能不能转 float"的检查：**框不对就当成没有框**，让读侧退回
+    "不显示缩略图"，而不是拿一个半截的框去裁页面（会裁出错误区域）。
+    """
+    try:
+        vals = [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != 4:
+        return None
+    x0, y0, x1, y1 = vals
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    return vals
+
+
 class FigureLabelExtractor:
     """V2.1 图题溯源：为 IMAGE 元素匹配最近的 '图N' 标签文本"""
 
@@ -157,7 +176,8 @@ class ChunkStep(PipelineStep):
             return round(max(0.05, min(1.0, q)), 3)
 
         def emit(text: str, chunk_type: str, el: ParsedElement,
-                 is_parent: bool = False, parent_id: str | None = None) -> str:
+                 is_parent: bool = False, parent_id: str | None = None,
+                 end_el: ParsedElement | None = None) -> str:
             nonlocal seq
             text = text.strip()
             if not text:
@@ -180,10 +200,16 @@ class ChunkStep(PipelineStep):
                 seq=seq,
                 chunk_type=chunk_type, is_parent=is_parent,
                 parent_chunk_id=parent_id, page_num=el.page_num,
+                # 结束页：正文末尾所在的元素（跨页小节因此能显示"第 2–3 页"）。
+                # 取不到就退回起始页，不留空 —— 空值在展示层等于"不知道"。
+                page_end=((end_el or el).page_num or el.page_num),
                 section_path=el.metadata.get("section_path") or None,
                 quality_score=_quality(text),
                 figure_label=el.raw_data.get("figure_label") or None,
                 figure_caption=el.raw_data.get("figure_caption") or None,
+                # 图区 PDF point 框：随块落 MySQL，读侧凭它从原始 PDF 按需再裁
+                # （来源抽屉出缩略图 / 详情页预览高亮），不必另存图片字节
+                figure_bbox=_bbox4(el.raw_data.get("figure_bbox")),
                 token_count=ctx.services.llm.count_tokens(text),
                 allowed_roles=list(ctx.doc.allowed_roles)))
             seq += 1
@@ -259,16 +285,21 @@ class ChunkStep(PipelineStep):
                 #   min_tokens 是**子块**的粒度门槛（父块已经覆盖了正文，子块可以粗）；
                 #   父块代表"这一节的正文"，丢了就是内容缺失 —— 宁可多一个短块。
                 el0 = _el_at(ranges, p_start, section_buf[0])
+                # 结束页：父块末尾那个元素所在的页（不这么做时，跨页小节只能显示起始页，
+                # 用户在详情页上会以为"分页标错了"，见 models.ChunkMeta.page_end）
+                el_last = _el_at(ranges, p_start + max(len(part) - 1, 0), el0)
                 pid = emit(part, ChunkType.PARENT.value, el0,
-                           is_parent=True)
+                           is_parent=True, end_el=el_last)
                 # 子块滑窗
                 for child, c_start in self._split_child(
                         part, child_max, ctx.services.llm.count_tokens):
                     if ctx.services.llm.count_tokens(child) >= min_tokens:
                         # 子块自己的起始偏移 = 父块内偏移 + 父块在节内的偏移
                         cel = _el_at(ranges, p_start + c_start, el0)
+                        cel_end = _el_at(
+                            ranges, p_start + c_start + max(len(child) - 1, 0), cel)
                         emit(child, ChunkType.TEXT.value, cel,
-                             parent_id=pid)
+                             parent_id=pid, end_el=cel_end)
             section_buf = []
 
         for el in ctx.parsed.elements:
@@ -286,8 +317,17 @@ class ChunkStep(PipelineStep):
                     caption_parts.append(el.raw_data["figure_label"])
                 if el.raw_data.get("figure_caption"):
                     caption_parts.append(el.raw_data["figure_caption"])
+                # 整页粒度（扫描页/整页照片页）如实标出来：这条描述说的是**整页**，
+                # 不是某张插图。不加这个标记的话，检索命中时用户会以为系统找到了
+                # "那张图"，而描述里其实含整页正文（实测扫描页就是这种情况）。
+                scope_page = el.raw_data.get("figure_scope") == "page"
                 if el.raw_data.get("vlm_caption"):
-                    caption_parts.append(f"图片描述：{el.raw_data['vlm_caption']}")
+                    vlm = el.raw_data["vlm_caption"]
+                    caption_parts.append(
+                        f"图片描述：{'（整页图）' if scope_page else ''}{vlm}")
+                elif scope_page:
+                    # 空白跳过 VLM 的整页区域：至少说明粒度，别让它看着像一张插图
+                    caption_parts.append("图片描述：（整页图，未做图片理解）")
                 if el.text:
                     caption_parts.append(f"图片文字：{el.text}")
                 if caption_parts:
