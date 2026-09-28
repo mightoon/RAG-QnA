@@ -773,6 +773,29 @@ class ObservabilityConfig(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
+# 外观
+# ═══════════════════════════════════════════════════════════
+
+class AppearanceConfig(BaseModel):
+    """界面外观偏好（全局）：浅色 / 深色
+
+    纯表现层配置 —— 没有任务运行期服务依赖它。保存后由前端立即切换
+    （配置页「系统 → 外观」，选择即生效），并随页面渲染直出到 html 的
+    data-theme（见 web/routes.py 的 _base_ctx 与 base.jinja2），因此它
+    不属于容器热重建的范围（见 api/runtime.py 的 _NO_REBUILD_SECTIONS）。
+    """
+    theme: str = "light"                     # light | dark
+
+    @field_validator("theme")
+    @classmethod
+    def _normalize_theme(cls, v: str) -> str:
+        """非法取值一律回落 light：手改 YAML 或旧客户端发来不认识的字符串时，
+        页面至少能正常渲染，而不是落进一个没有样式定义的主题名里。"""
+        name = str(v or "").strip().lower()
+        return name if name in ("light", "dark") else "light"
+
+
+# ═══════════════════════════════════════════════════════════
 # 权限与提示词
 # ═══════════════════════════════════════════════════════════
 
@@ -832,6 +855,8 @@ class AppConfig(BaseModel):
     consistency_check: ConsistencyCheckConfig = Field(default_factory=ConsistencyCheckConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    # 外观（全局主题）：纯表现层，配置页「系统」页可切换，选择即生效
+    appearance: AppearanceConfig = Field(default_factory=AppearanceConfig)
 
     permissions: list[RolePermission] = Field(default_factory=list)
     prompts: PromptConfig = Field(default_factory=PromptConfig)

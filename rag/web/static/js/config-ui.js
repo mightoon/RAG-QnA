@@ -1782,12 +1782,97 @@
     return box;
   }
 
+  /* ── 外观（全局主题）：radio 单选，选择即生效 + 立即落盘，无需重启 ── */
+  const APPEARANCE_THEMES = [
+    { value: 'light', title: '浅色', hint: '明亮清爽，适合日间使用' },
+    { value: 'dark', title: '深色', hint: '低亮度护眼，适合夜间使用' },
+  ];
+
+  // 服务端下发的当前主题（配置载荷里的 appearance 段）
+  function currentTheme() {
+    const c = ConfigData.state.config;
+    return (c && c.appearance && c.appearance.theme) || 'light';
+  }
+
+  // 立即把当前页面切过去：颜色变量都挂在 html[data-theme] 上，切换零延迟
+  function setDocTheme(theme) {
+    if (theme === 'dark')
+      document.documentElement.setAttribute('data-theme', 'dark');
+    else
+      document.documentElement.removeAttribute('data-theme');
+  }
+
+  // 选择即生效：先切当前页面与内存中的配置（零延迟），再异步落盘；
+  // 落盘失败时把界面、内存、radio 一并退回原主题，并如实报错
+  async function applyTheme(theme) {
+    const prev = currentTheme();
+    if (theme === prev) return;
+    setDocTheme(theme);
+    const c = ConfigData.state.config;
+    if (c) c.appearance = { theme: theme };
+    try {
+      await ConfigData.saveModule({ appearance: { theme: theme } },
+                                  ['appearance']);
+      showToast('主题已切换为「' + (theme === 'dark' ? '深色' : '浅色') +
+                '」，对所有用户生效', 'success', 2500);
+    } catch (e) {
+      setDocTheme(prev);
+      if (c) c.appearance = { theme: prev };
+      document.querySelectorAll('.theme-choice').forEach(lc => {
+        const inp = lc.querySelector('input');
+        lc.classList.toggle('selected', !!inp && inp.value === prev);
+        if (inp) inp.checked = inp.value === prev;
+      });
+      showToast('主题保存失败：' + (e && e.message ? e.message : e), 'error');
+    }
+  }
+
+  function renderAppearanceCard() {
+    const box = el('div', 'card');
+    const body = el('div', 'card-body');
+    body.appendChild(el('div', 'doc-title-main', '外观'));
+    body.appendChild(el('p', 'page-subtitle',
+      '界面主题，选择后立即生效并写入配置文件（全局对所有用户生效，无需重启服务）。'));
+    const group = el('div', 'theme-choices');
+    group.setAttribute('role', 'radiogroup');
+    group.setAttribute('aria-label', '界面主题');
+    APPEARANCE_THEMES.forEach(opt => {
+      const selected = currentTheme() === opt.value;
+      const label = el('label', 'theme-choice' + (selected ? ' selected' : ''));
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = 'appearance-theme';
+      input.value = opt.value;
+      input.checked = selected;
+      const preview = el('span', 'theme-preview theme-preview-' + opt.value);
+      preview.setAttribute('aria-hidden', 'true');
+      const text = el('span', 'theme-choice-text');
+      text.appendChild(el('span', 'theme-choice-title', opt.title));
+      text.appendChild(el('span', 'theme-choice-desc', opt.hint));
+      input.addEventListener('change', () => {
+        if (!input.checked) return;
+        group.querySelectorAll('.theme-choice').forEach(lc =>
+          lc.classList.toggle('selected',
+                              lc.querySelector('input') === input));
+        applyTheme(opt.value);
+      });
+      label.appendChild(input);
+      label.appendChild(preview);
+      label.appendChild(text);
+      group.appendChild(label);
+    });
+    body.appendChild(group);
+    box.appendChild(body);
+    return box;
+  }
+
   /* ── 系统面板 ── */
   function renderSystemPanel() {
     const c = ConfigData.state.config;
     const meta = window.__RUNTIME_META__ || {};
     const flags = (c && c.defaultsFlags) || {};
     const wrap = el('div');
+    wrap.appendChild(renderAppearanceCard());
     const box = el('div', 'card');
     const body = el('div', 'card-body');
     body.appendChild(el('div', 'doc-title-main', '系统信息'));

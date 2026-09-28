@@ -1,5 +1,7 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+{# theme 由服务端按全局外观配置下发（见 routes._base_ctx），深色外观首屏
+   直出、不闪白；外观段在配置页「系统」页可切换，选择即生效 #}
+<html lang="zh-CN" data-theme="{{ theme | default('light', true) }}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -26,47 +28,64 @@
       <div class="topo-brand">IQA</div>
       <div class="topo-icons">
         <a href="/chat" data-page="chat" role="menuitem"
-           class="topo-icon icon-chat {% if page == 'chat' %}active{% endif %}"
-           data-tip="智能问答&#10;RAG 多路检索 · 流式生成"
+           class="topo-icon {% if page == 'chat' %}active{% endif %}"
            aria-label="智能问答" {% if page == 'chat' %}aria-current="page"{% endif %}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
           </svg>
+          <span class="tip" role="tooltip">
+            <span class="tip-title">智能问答</span>
+            <span class="tip-desc">RAG 多路检索 · 流式生成</span>
+          </span>
         </a>
         <a href="/knowledge" data-page="knowledge" role="menuitem"
-           class="topo-icon icon-knowledge {% if page == 'knowledge' %}active{% endif %}"
-           data-tip="知识库管理&#10;多格式文档 · 批量导入 · 质量巡检"
+           class="topo-icon {% if page == 'knowledge' %}active{% endif %}"
            aria-label="知识库管理" {% if page == 'knowledge' %}aria-current="page"{% endif %}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
           </svg>
+          <span class="tip" role="tooltip">
+            <span class="tip-title">知识库管理</span>
+            <span class="tip-desc">多格式文档 · 批量导入 · 质量巡检</span>
+          </span>
         </a>
         {% if current_user.isAdmin %}
         {# 顺序：监控在上、配置在下 —— 与原来的"配置在上"互换（齿轮与心跳线对调） #}
         <a href="/monitor" data-page="monitor" role="menuitem"
-           class="topo-icon icon-monitor {% if page == 'monitor' %}active{% endif %}"
-           data-tip="运行监控&#10;支撑服务健康 · 检索路就绪度 · 入库队列"
+           class="topo-icon {% if page == 'monitor' %}active{% endif %}"
            aria-label="运行监控" {% if page == 'monitor' %}aria-current="page"{% endif %}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
           </svg>
+          <span class="tip" role="tooltip">
+            <span class="tip-title">运行监控</span>
+            <span class="tip-desc">支撑服务健康 · 检索路就绪度 · 入库队列</span>
+          </span>
         </a>
         <a href="/config" data-page="config" role="menuitem"
-           class="topo-icon icon-config {% if page == 'config' %}active{% endif %}"
-           data-tip="配置管理&#10;自描述可视化配置 · 权限映射 · 连接健康"
+           class="topo-icon {% if page == 'config' %}active{% endif %}"
            aria-label="配置" {% if page == 'config' %}aria-current="page"{% endif %}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
             <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
           </svg>
+          <span class="tip" role="tooltip">
+            <span class="tip-title">配置管理</span>
+            <span class="tip-desc">自描述可视化配置 · 权限映射 · 连接健康</span>
+          </span>
         </a>
         {% endif %}
       </div>
       <div class="topo-spacer"></div>
-      <div class="topo-user {% if current_user.isAdmin %}admin{% endif %}"
-           id="topo-user" role="button" tabindex="0"
-           title="{{ current_user.name }}{% if current_user.isAdmin %}（管理员）{% endif %}&#10;角色：{{ current_user.roles | join(', ') if current_user.roles else '—' }}&#10;点击退出登录"
-           data-tip="退出登录">
-        {{ current_user.name[:1].upper() }}
+      {# 用户按钮：与上方导航图标同一容器语言（44px 圆角块、悬浮微亮底、卡片气泡），
+         内部放一枚与品牌徽标同源的渐变圆徽；管理员用右上角警示色状态点表达 #}
+      <div class="topo-user" id="topo-user" role="button" tabindex="0"
+           aria-label="账户：{{ current_user.name }}">
+        <span class="topo-user-avatar">{{ current_user.name[:1].upper() }}</span>
+        {% if current_user.isAdmin %}<span class="topo-user-badge" aria-hidden="true"></span>{% endif %}
+        <span class="tip" role="tooltip">
+          <span class="tip-title">{{ current_user.name }}{% if current_user.isAdmin %} · 管理员{% endif %}</span>
+          <span class="tip-desc">角色：{{ current_user.roles | join(', ') if current_user.roles else '—' }} · 点击退出登录</span>
+        </span>
       </div>
     </nav>
     <main class="main-content">

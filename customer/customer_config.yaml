@@ -8,7 +8,7 @@ auth:
 llm:
   adapter: openai_compatible
   base_url: https://api.deepseek.com
-  api_key: enc:v1:gAAAAABquibdlb2I4H_DaRCxtGgqCPlT0vMqPiS5SkaRHOHf2xi2O2EcYpZpvHNdtLTX7WfWBIqOx3g49YHAiIlFiEIaPJkNKBgSAFFR3a99k1LpGkfAci4dO84tr88MM_SDU-KdM9hR
+  api_key: enc:v1:gAAAAABqunldklQgx-Nv-4MnazoMtW0ofItstQoBSwO_GVBIbf1LJhzFf8sgJg_09UPGsoAvy0MA3CpApaUSUBUtZfOHbSiYNgxgoZaSeUKAG4zYcMjBvwI0jZHEDooEXAcWGF-PIeyi
   model: deepseek-flash
   rewrite_model: ''
   temperature: 0.5
@@ -20,7 +20,7 @@ llm:
   - id: current
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABquibd0PWgX_zqvkWiLw5Pc16IUMjxmT-1EJd7FHAw-c4oU_otThWy7gN9WKGjRbXaTZ_fIq45eIZM05bGG7iHejk5R4aRJbpBLai0StHX7O4YPT5iBx-PxP_Ah7pMj3ojn5K8
+    api_key: enc:v1:gAAAAABqunldxc4VanILY8RYW-EJpEwPvQew4KkZuZxFEsjmz13bIdCCcU9tRdL7FckTgpKOaPNPK9_StX1AomzNT6Nv4N7njVg72tK_datK6-x5DKK6JLNxfWQJBhwHhuPryxMhwAwW
     model_ids:
     - deepseek-flash
     model: deepseek-flash
@@ -33,7 +33,7 @@ llm:
   - id: ef4d181f
     display_name: int-deepseek01
     base_url: https://api.deepseek.com
-    api_key: enc:v1:gAAAAABquibd1nNvkUKELVngzJkncOHmoQ5Jf1VPDjU_HIOftg5PomTToJZQI5ixBKAM10gKnlX1CkjLMard8TZ3RXiuWYXf49QXmzn-so80os7nmh79QbC4N1coroKtZzsqZcbt9Kp-
+    api_key: enc:v1:gAAAAABqunldeXE_dFiBBf-0Vd6d7LKg16oy_TecdM-2MYz09HQCYVphv3cdn20wRst47wUduuhdIHp5EAqDiFurTNfdKy0ujI7TWgEk1gomB44Zzlzg6AwYb-eIHv5Lbssa1WgSg_aW
     model_ids:
     - deepseek-v4-pro
     model: deepseek-v4-pro
@@ -83,7 +83,7 @@ meta:
 redis:
   host: 192.168.100.239
   port: 6379
-  password: enc:v1:gAAAAABquibdibVWdYezT-OwRsdWBM1mbE-v_UCv8rX3pjfLoasHmxSdbfC1WPVLWGnMRhJnRugNENjApjPxQ-eyGENwrMqJLg==
+  password: enc:v1:gAAAAABqunld6ynglJboI2MHL-foDClA_sjSiq8uM0fBIiGZ7aAtPjcRlVVy0BoyNc-3M5kaNnb4VSUBxPeHT7J9wh8qTFAJBw==
   db: 0
   session_ttl_hours: 48
   prefix: 'rag:'
@@ -92,7 +92,7 @@ storage:
   enabled: true
   endpoint: 192.168.100.239:9000
   access_key: admin
-  secret_key: enc:v1:gAAAAABquibdB_gIa6Tzs6BLWuNfOgT1w4vSuAJPrIziomzAlLXr0OHfm7zssKJ2ULFHoKyJe7Pjt9k30H3v1nDdJWA_rlOTVA==
+  secret_key: enc:v1:gAAAAABqunldFQWwkqu6YEgqepcRLGB5qQLVcTOa-Tx_9nEiX-UmOaHffjqySPnUAom1wDOEY63DipLDGQhTVJSbyEXrTlpZxw==
   bucket: rag-docs
   secure: false
   local_root: ./data/files
@@ -107,7 +107,7 @@ knowledge_graph:
 business_data:
   adapter: sqlalchemy
   enabled: false
-  dsn: enc:v1:gAAAAABquibd_rUbLVkzKCq5GRxwhWLeeBVb5Ge-D4J_yMSItQRqIGm_eXAAmU1kvxY4QSzz0bUmQKpCpIdoFaHyY13lIP_MJfJ76YLkD4V7xWATjWK8TWL9x-ijCVYjkawUcxanBCXyzUfgwxHab5XFk29mhIIAgA==
+  dsn: enc:v1:gAAAAABqunld0dyC4AOValnvrAn4UN0Bj86wnKiNqA_uB29YqgB5KR86RYyojXwwReAOIztN1bsLkYTOfwfFpXz9darFLwHo355zmcz5vt_HQlcwN-_diJKwVhECTM9ZpApIq_j2HChLklvwcGaZuAeQx0tkz0TRLw==
   schema_file: customer/business_schema.yaml
   allowed_tables: []
   max_rows: 100
@@ -303,3 +303,5 @@ doc_parse:
   model: ''
   capability: ocr
   max_pages_per_request: 10
+appearance:
+  theme: light

@@ -98,9 +98,6 @@
     const question = (input.value || '').trim();
     if (!question || state.sending) return;
     state.sending = true;
-    const btn = qs('#btn-send');
-    btn.classList.add('sending');
-    btn.textContent = '生成中…';
     input.value = '';
     autoGrow(input);
 
@@ -145,14 +142,10 @@
       onEnd() {
         ChatUI.hideTyping();
         state.sending = false;
-        btn.classList.remove('sending');
-        btn.textContent = '发送';
         if (shell && shell.block.classList.contains('streaming')) shell.finalize();
       },
     });
     state.sending = false;
-    btn.classList.remove('sending');
-    btn.textContent = '发送';
   }
 
   function autoGrow(el) {
@@ -218,7 +211,6 @@
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
     input.addEventListener('input', () => autoGrow(input));
-    qs('#btn-send').addEventListener('click', send);
     qs('#chat-error-close').addEventListener('click', () => qs('#chat-error').classList.add('hidden'));
     qsa('.hint-chip').forEach(c => c.addEventListener('click', () => {
       input.value = c.textContent;

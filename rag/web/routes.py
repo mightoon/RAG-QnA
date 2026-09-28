@@ -770,6 +770,8 @@ def _normalize_config(c: ServiceContainer) -> dict:
         },
         "system": {"version": cfg.version, "roleCount": len(cfg.permissions),
                    "degraded": degraded},
+        # 外观：配置页「系统」页的主题单选读这里（当前生效值）
+        "appearance": {"theme": cfg.appearance.theme},
     }
 
 
@@ -888,6 +890,13 @@ def _yaml_update_from_payload(payload: dict, enabled_paths: list[str]) -> dict:
         if sect:
             update[key] = sect
 
+    # 外观（全局主题）：本段只有 theme 一个字段，取值按白名单收口
+    appr = payload.get("appearance")
+    if isinstance(appr, dict) and "theme" in appr:
+        theme = str(appr.get("theme") or "").strip().lower()
+        update["appearance"] = {
+            "theme": theme if theme in ("light", "dark") else "light"}
+
     return update
 
 
@@ -913,7 +922,17 @@ def _conn_label(endpoint: str) -> str:
 # ───────────────────────── 页面路由 ─────────────────────────
 
 def _base_ctx(request: Request, user: UserContext, page: str) -> dict:
-    return {"request": request, "page": page, "current_user": _user_view(user)}
+    """所有页面共用的上下文。
+
+    额外带上全局外观主题：渲染进 html[data-theme]，首屏直接按已保存的主题
+    出样式，避免"先闪一下浅色、再被脚本切成深色"。容器不可用时回落浅色。
+    """
+    try:
+        theme = _container(request).config.appearance.theme
+    except Exception:
+        theme = "light"
+    return {"request": request, "page": page, "current_user": _user_view(user),
+            "theme": theme}
 
 
 @pages_router.get("/", response_class=HTMLResponse)
@@ -923,7 +942,12 @@ async def index():
 
 @pages_router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    return templates.TemplateResponse("login.jinja2", {"request": request})
+    try:
+        theme = _container(request).config.appearance.theme
+    except Exception:
+        theme = "light"                      # 登录页在任何情况下都要能渲染
+    return templates.TemplateResponse("login.jinja2",
+                                      {"request": request, "theme": theme})
 
 
 @pages_router.get("/chat", response_class=HTMLResponse)

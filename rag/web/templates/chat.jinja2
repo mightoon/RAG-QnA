@@ -31,16 +31,19 @@
     </div>
 
     <div class="chat-scroll" id="chat-scroll">
-      <div class="chat-empty" id="chat-empty">
-        <h2>向知识库提问</h2>
-        <p>支持多路检索与来源追溯</p>
-        <div class="welcome-hints">
-          <span class="hint-chip">总结一下平台的核心功能</span>
-          <span class="hint-chip">最近上传的文档讲了什么？</span>
+      {# 居中内容列：输出消息与下方输入区同一根轴线，左右留出呼吸空白 #}
+      <div class="chat-column">
+        <div class="chat-empty" id="chat-empty">
+          <h2>向知识库提问</h2>
+          <p>支持多路检索与来源追溯</p>
+          <div class="welcome-hints">
+            <span class="hint-chip">总结一下平台的核心功能</span>
+            <span class="hint-chip">最近上传的文档讲了什么？</span>
+          </div>
         </div>
-      </div>
-      <div data-piece="messages" id="messages-container" style="display:contents">
-        {% include "partials/chat/messages.jinja2" %}
+        <div data-piece="messages" id="messages-container" style="display:contents">
+          {% include "partials/chat/messages.jinja2" %}
+        </div>
       </div>
     </div>
 
@@ -54,10 +57,17 @@
         {% include "partials/chat/ephemeral_docs.jinja2" %}
       </div>
       <div class="input-row">
-        <button class="attach-btn" id="btn-attach" title="上传临时文档（仅本会话有效）">📎</button>
-        <textarea id="chat-input" placeholder="输入问题，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
-        <div class="input-actions">
-          <button class="btn btn-primary send-btn" id="btn-send">发送</button>
+        <div class="input-box" id="chat-input-box">
+          <button class="attach-btn" id="btn-attach" type="button" aria-label="上传临时文件">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+            <span class="attach-tip" role="tooltip">上传临时文件
+              <span class="attach-tip-desc">仅本会话有效</span>
+            </span>
+          </button>
+          <textarea id="chat-input" placeholder="输入问题，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
         </div>
       </div>
     </div>

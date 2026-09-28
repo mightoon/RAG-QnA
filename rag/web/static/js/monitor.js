@@ -478,43 +478,68 @@
     return { card: card, body: body };
   }
 
+  /* ── 任务状态 tab：宽卡 + 就绪环 / 水位轨 / 迷你瓦片 / 开关状态行 ── */
+
+  // 就绪环：conic-gradient 画弧、内盘挖空显示 live/enabled。
+  // 全配绿 / 有损琥珀 / 半数以下红 / 未启用灰 —— 与全站状态语义色一致。
+  function rdyRing(live, total) {
+    var pct = total ? Math.round(live / total * 100) : 0;
+    var tone = !total ? 'idle' : (pct === 100 ? 'ok' : (pct >= 50 ? 'warn' : 'error'));
+    var ring = el('div', 'rdy-ring ' + tone);
+    ring.style.setProperty('--p', pct);
+    var mid = el('div', 'rdy-ring-mid');
+    mid.appendChild(el('b', null, live + ' / ' + total));
+    mid.appendChild(el('span', null, '实时在线'));
+    ring.appendChild(mid);
+    return ring;
+  }
+
+  function rdyPathChip(p, lost) {
+    var chip = el('span', 'rdy-chip ' + (lost ? 'lost' : 'ok'));
+    chip.appendChild(el('span', 'rdy-chip-dot'));
+    chip.appendChild(document.createTextNode(p.description || p.name));
+    // 不可用路的原因落在 tooltip，扫一眼能看、想知道为什么时悬停即得
+    chip.title = p.name + (lost
+      ? ('：' + (p.reason || '已启用但后端不可用，本次问答不会走这条路'))
+      : '');
+    return chip;
+  }
+
   function renderRetrieval(r) {
     var paths = r.enabled || [], live = r.live || [], lost = r.lost || [];
     var node = kvCard('检索路就绪度',
-      badge(live.length + ' / ' + paths.length,
-        lost.length ? 'badge-warning' : 'badge-success'),
+      badge(!paths.length ? '未启用'
+          : (lost.length ? lost.length + ' 路不可用' : '全部在线'),
+        !paths.length ? 'badge-default'
+          : (lost.length ? 'badge-warning' : 'badge-success')),
       []);
+    node.card.classList.add('rdy-wide');
     var body = node.body;
 
-    var grid = el('div', 'monitor-kv');
-    var box = el('div');
-    box.style.gridColumn = '1 / -1';
-    box.appendChild(el('div', 'monitor-kv-label', '实时可用（配置启用 ∩ 适配器在线）'));
-    var wrap = el('div', 'monitor-paths');
-    wrap.style.marginTop = '6px';
-    if (!live.length) {
-      wrap.appendChild(el('span', 'monitor-kv-value', '无可用检索路'));
-    }
-    live.forEach(function (p) {
-      var b = badge(p.description || p.name, 'badge-primary');
-      b.title = p.name;
-      wrap.appendChild(b);
-    });
-    box.appendChild(wrap);
-    grid.appendChild(box);
-    body.appendChild(grid);
+    var hero = el('div', 'rdy-hero');
+    hero.appendChild(rdyRing(live.length, paths.length));
+    var side = el('div', 'rdy-hero-side');
+    side.appendChild(el('div', 'rdy-hero-caption',
+      !paths.length ? '尚未启用任何检索路'
+        : (lost.length
+          ? live.length + ' 条实时可用 · ' + lost.length + ' 条启用后未上线'
+          : live.length + ' 条检索路全部实时可用')));
+    var chips = el('div', 'rdy-paths');
+    live.forEach(function (p) { chips.appendChild(rdyPathChip(p, false)); });
+    lost.forEach(function (p) { chips.appendChild(rdyPathChip(p, true)); });
+    side.appendChild(chips);
+    hero.appendChild(side);
+    body.appendChild(hero);
 
+    // reason 只在"服务行全绿、路却是关的"时才有（见 routes._lost_path_reason）：
+    // 那正是用户最看不懂的一种，必须落在版面上 —— 芯片 tooltip 悬浮才可见，
+    // 不能替代常驻文字。服务行红着的不重复给原因（那一行有自己的 message）。
     if (lost.length) {
-      var list = el('div', 'monitor-lost-list');
+      var list = el('div', 'rdy-lost-list');
       lost.forEach(function (p) {
-        // reason 只在"服务行全绿、路却是关的"时才有（见 routes._lost_path_reason）：
-        // 那正是用户最看不懂的一种，必须说清为什么 —— 否则只会以为系统在无缘
-        // 无故少查一路。服务行红着的不重复给原因（那一行有自己的 message）。
-        var why = p.reason
-          ? '：' + p.reason
-          : '：已启用但后端不可用，本次问答不会走这条路';
+        var why = p.reason || '已启用但后端不可用，本次问答不会走这条路';
         list.appendChild(el('div', null,
-          '⚠ ' + (p.description || p.name) + '（' + p.name + '）' + why));
+          '⚠ ' + (p.description || p.name) + '（' + p.name + '）：' + why));
       });
       body.appendChild(list);
     }
@@ -524,44 +549,88 @@
   function renderIngest(r) {
     var ing = r.ingest || {}, wf = r.workflows || {};
     var names = wf.ingestNames || [];
+    var queued = ing.queuedTasks || 0;
+    var limit = (typeof ing.queueDepthLimit === 'number' && ing.queueDepthLimit > 0)
+      ? ing.queueDepthLimit : 0;
+    var pct = limit ? Math.min(100, Math.round(queued / limit * 100)) : 0;
+    var tone = ing.queueFull ? 'error' : (limit && pct >= 70 ? 'warn' : 'ok');
+
     var node = kvCard('入库队列与工作流',
-      badge((ing.queuedTasks || 0) + ' 排队' + (ing.queueFull ? ' · 已满' : ''),
-        ing.queueFull ? 'badge-error' : 'badge-info'), [
-        { label: '排队任务', value: String(ing.queuedTasks || 0) },
-        { label: '队列上限', value: fmtLimit(ing.queueDepthLimit) },
-        { label: '入库并发', value: String(ing.concurrency || 0) },
-        { label: '重试上限', value: String(ing.maxRetries || 0) },
-        { label: '入库后验证抽样', value: String(ing.verifySampleSize || 0) + ' 条' },
-        { label: '入库工作流', value: names.length + ' 条', title: names.join('、') },
-        { label: '查询工作流步骤', value: String((wf.querySteps || []).length) + ' 步',
-          title: (wf.querySteps || []).join(' → ') },
-      ]);
+      badge(queued + ' 排队' + (ing.queueFull ? ' · 已满' : ''),
+        ing.queueFull ? 'badge-error' : 'badge-info'), []);
+    var body = node.body;
+
+    // 水位 hero：大数字在左、上限在右，进度轨接近满载时换色
+    var head = el('div', 'rdy-queue-head');
+    var big = el('div', 'rdy-big');
+    big.appendChild(el('b', null, String(queued)));
+    big.appendChild(el('span', null, '排队任务 · 并发 ' + (ing.concurrency || 0)));
+    head.appendChild(big);
+    head.appendChild(el('span', 'rdy-queue-limit', '上限 ' + fmtLimit(ing.queueDepthLimit)));
+    body.appendChild(head);
+
+    var water = el('div', 'rdy-water ' + tone);
+    var fill = el('div', 'rdy-water-fill');
+    // 有任务时至少给一段可见起点，否则 "3/200" 会窄得像没渲染出来
+    fill.style.width = Math.max(pct, queued ? 6 : 0) + '%';
+    water.appendChild(fill);
+    body.appendChild(water);
+
+    var tiles = el('div', 'rdy-tiles');
+    [['重试上限', String(ing.maxRetries || 0), null],
+     ['入库后验证抽样', String(ing.verifySampleSize || 0) + ' 条', null],
+     ['入库工作流', names.length + ' 条', names.join('、')],
+     ['查询工作流步骤', String((wf.querySteps || []).length) + ' 步',
+       (wf.querySteps || []).join(' → ')]
+    ].forEach(function (it) {
+      var t = el('div', 'rdy-tile');
+      t.appendChild(el('span', null, it[0]));
+      var v = el('b', null, it[1]);
+      if (it[2]) v.title = it[2];
+      t.appendChild(v);
+      tiles.appendChild(t);
+    });
+    body.appendChild(tiles);
+
     if (names.length) {
-      var hint = el('div', 'form-hint', '工作流：' + names.join('、'));
-      hint.style.marginTop = '10px';
-      node.body.appendChild(hint);
+      body.appendChild(el('div', 'rdy-queue-hint', '工作流：' + names.join('、')));
     }
     return node.card;
   }
 
+  // 开关状态行：绿 = 开启生效中，灰 = 关闭，蓝 = 纯信息展示（无开关语义）
+  function rdyOp(label, value, on, title) {
+    var row = el('div', 'rdy-op');
+    row.appendChild(el('span', 'rdy-op-dot ' + (on === null ? 'info' : (on ? 'ok' : 'off'))));
+    row.appendChild(el('span', 'rdy-op-label', label));
+    var val = el('span', 'rdy-op-value', value);
+    if (title) val.title = title;
+    row.appendChild(val);
+    return row;
+  }
+
   function renderOps(r) {
     var cc = r.consistencyCheck || {}, rr = r.rerank || {}, ob = r.observability || {};
-    return kvCard('后台任务与可观测性',
-      badge(cc.enabled ? '一致性巡检已开启' : '一致性巡检已关闭',
-        cc.enabled ? 'badge-success' : 'badge-default'), [
-        { label: '一致性巡检间隔', value: cc.enabled ? cc.intervalHours + ' 小时' : '—' },
-        { label: '巡检抽样 / 告警阈值',
-          value: cc.sampleDocs + ' 篇 / ' + cc.alertThreshold + ' 处' },
-        { label: '重排（Rerank）',
-          value: rr.enabled ? '已开启' : '未开启' },
-        { label: '重排模型 / 设备',
-          value: rr.enabled ? ((rr.model || '—') + ' · ' + (rr.device || '—')) : '—' },
-        { label: '日志级别', value: ob.logLevel || '—' },
-        { label: '指标与推送',
-          value: (ob.metricsEnabled ? '指标已开启' : '指标已关闭') +
-                 (ob.pushgateway ? ' · ' + ob.pushgateway : ' · 不推送') },
-        { label: '链路追踪', value: ob.tracingEnabled ? '已开启' : '未开启' },
-      ]).card;
+    var node = kvCard('后台任务与可观测性',
+      badge(cc.enabled ? '巡检已开启' : '巡检已关闭',
+        cc.enabled ? 'badge-success' : 'badge-default'), []);
+    var list = el('div', 'rdy-ops');
+    list.appendChild(rdyOp('一致性巡检',
+      cc.enabled
+        ? '每 ' + cc.intervalHours + ' 小时 · ' + cc.sampleDocs + ' 篇 / 阈值 ' + cc.alertThreshold + ' 处'
+        : '已关闭', !!cc.enabled));
+    list.appendChild(rdyOp('重排（Rerank）',
+      rr.enabled ? ('已开启' + (rr.model ? ' · ' + rr.model : '')) : '未开启',
+      !!rr.enabled, rr.device ? '设备 ' + rr.device : ''));
+    list.appendChild(rdyOp('日志级别', ob.logLevel || '—', null));
+    list.appendChild(rdyOp('指标与推送',
+      (ob.metricsEnabled ? '指标已开启' : '指标已关闭') +
+        (ob.pushgateway ? ' · ' + ob.pushgateway : ' · 不推送'),
+      !!ob.metricsEnabled));
+    list.appendChild(rdyOp('链路追踪', ob.tracingEnabled ? '已开启' : '未开启',
+      !!ob.tracingEnabled));
+    node.body.appendChild(list);
+    return node.card;
   }
 
   // 容器 degraded 的键 → 页面显示名。不映射的键原样显示（后端新加的记录
@@ -602,7 +671,7 @@
 
   function renderReadiness(data) {
     var r = data.readiness || {};
-    var wrap = el('div', 'monitor-groups');
+    var wrap = el('div', 'monitor-groups monitor-groups-task');
     // 注意层级：检索路在 readiness.retrieval 下，而入库/后台项在 readiness 直属
     wrap.appendChild(renderRetrieval(r.retrieval || {}));
     wrap.appendChild(renderIngest(r));

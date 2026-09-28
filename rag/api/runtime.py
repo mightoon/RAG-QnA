@@ -27,6 +27,10 @@ log = get_logger("rag.runtime")
 # 保存其中之一不必牵动别的服务
 _SCOPED_SECTIONS = frozenset(SECTION_ADAPTERS) | {"redis"}
 
+# 纯表现层配置段：没有任何运行期服务依赖它们（外观只影响页面渲染）。
+# 这类配置保存后只需写盘 + 同步内存，整容器热重建既无意义也不该发生
+_NO_REBUILD_SECTIONS = frozenset({"appearance"})
+
 
 async def _recovery_loop(container: ServiceContainer) -> None:
     """后台自愈：周期性重连「配置启用但此刻失联」的段
@@ -120,6 +124,16 @@ async def apply_config_update(app, update: dict,
     却弹出向量库降级"这种看起来像动了别的服务的提示。
     """
     old: ServiceContainer = app.state.container
+    # 纯表现层配置（外观/主题）：无运行期服务可重建，写盘后同步内存即可 —
+    # 整容器热重建在这里既无意义、也会白白抖动各服务的连接与后台任务
+    if update and set(update) <= _NO_REBUILD_SECTIONS:
+        path = cfg_path or _resolve_config_path(old)
+        new_config = load_config(path)
+        for sect in update:
+            setattr(old.config, sect, getattr(new_config, sect))
+        scope = "+".join(sorted(update))
+        log.info("config_applied", scope=scope, degraded={})
+        return {"scope": scope, "degraded": {}}
     keys = [k for k in update if k in _SCOPED_SECTIONS]
     single = keys[0] if len(keys) == 1 and len(keys) == len(update) else None
     if single is None or old.config.noconnection:
