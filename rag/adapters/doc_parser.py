@@ -259,11 +259,14 @@ class PDFParser(BaseParser):
                             or abs(box[3] - img["bottom"]) > 0.01):
                         clamped_images += 1
                     try:
-                        cropped = page.crop((box[0], box[1], box[2], box[3]))
-                        im = cropped.to_image(resolution=150)
-                        import io
-                        buf = io.BytesIO()
-                        im.original.save(buf, format="PNG")
+                        # 走 crop_page_region（而不是在这里自己 crop+to_image）：
+                        # 它内部有**出血位夹框**与 **PDFium 串行锁**两件事，自己写一份
+                        # 就会漏掉 —— 少锁的后果是并发渲染时整片图偶发失败（见 TS-033）。
+                        from rag.adapters.doc_parse import crop_page_region
+                        png = crop_page_region(page, box, resolution=150)
+                        if not png:
+                            skipped_images += 1
+                            continue
                         doc.elements.append(ParsedElement(
                             content_type=ContentType.IMAGE, text="",
                             page_num=page_idx + 1,
@@ -271,7 +274,7 @@ class PDFParser(BaseParser):
                             # figure_bbox = **PDF point** 框：落库后读侧可以按需
                             # 从原始 PDF 再裁（来源抽屉出图 / 预览页高亮区域），
                             # 于是不需要把图片字节另存一份（见 data_path §3.13）
-                            raw_data={"image_bytes": buf.getvalue(),
+                            raw_data={"image_bytes": png,
                                       "figure_bbox": list(box),
                                       "figure_scope": _figure_scope(
                                           box, page.width, page.height),

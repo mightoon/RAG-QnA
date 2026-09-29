@@ -92,6 +92,9 @@
 
   /* ── 分块 ── */
   function bindChunks(root) {
+    // 分块里的「图区」缩略图：挂一次失败诊断（裂图 → 一句能照着处置的说明）。
+    // 片段是**动态注入**的，所以每次重新绑定都要重新挂（见 TS-032）。
+    if (window.FigureView && window.FigureView.attach) window.FigureView.attach(root || document);
     qsa('.js-chunk-page', root).forEach(btn => {
       btn.addEventListener('click', () => {
         chunks.page = parseInt(btn.dataset.page, 10) || 1;

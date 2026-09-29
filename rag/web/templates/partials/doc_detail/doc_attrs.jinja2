@@ -43,14 +43,15 @@
   </li>
   {# 图表：以**库里实际的块**为准（image_caption / table 块）—— 问"这份文档到底有多少
      图/表"时，答案应当是现在能检索到多少个；整页图/空白跳过/未裁出等解析期计数
-     跟在后面（有才显示），它们解释"为什么图块数是这个数"。 #}
-  <li title="入库的图块 / 表块数量（image_caption / table 块）。括号里是解析期的图区计数：整页=粒度是整页（扫描页/整页照片页）、空白跳过=纯色区域没做图片理解、未裁出=坐标不可用既不进图片理解">
+     跟在**第二行、右对齐**（`.attr-note`），因为它只是解释"为什么图块数是这个数"，
+     与主数字挤在一行会把这一行撑到换行、数字反而看不清。 #}
+  <li title="入库的图块 / 表块数量（image_caption / table 块）。第二行是解析期的图区计数：整页=粒度是整页（扫描页/整页照片页）、空白跳过=纯色区域没做图片理解、未裁出=坐标不可用既不进图片理解">
     <span class="attr-key">图表</span>
     <span class="attr-val plain">
       {%- if tc -%}
-      图 {{ tc.image_caption or 0 }} / 表 {{ tc.table or 0 }}
+      <span class="attr-val-main">图 {{ tc.image_caption or 0 }} / 表 {{ tc.table or 0 }}</span>
       {%- if fs and (fs.page_scope or fs.blank_skipped or fs.crop_failed) -%}
-      <span class="text-tertiary" style="font-size:var(--fs-xs)">（整页 {{ fs.page_scope or 0 }}{% if fs.blank_skipped %}、空白跳过 {{ fs.blank_skipped }}{% endif %}{% if fs.crop_failed %}、未裁出 {{ fs.crop_failed }}{% endif %}）</span>
+      <span class="attr-note">（整页 {{ fs.page_scope or 0 }}{% if fs.blank_skipped %}、空白跳过 {{ fs.blank_skipped }}{% endif %}{% if fs.crop_failed %}、未裁出 {{ fs.crop_failed }}{% endif %}）</span>
       {%- endif -%}
       {%- else -%}—{%- endif -%}</span>
   </li>

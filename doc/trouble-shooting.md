@@ -3060,6 +3060,204 @@ p10 照片真实内容：穿深色西装的男士边走边看手机
 
 ---
 
+## TS-032 分块里的「图区」全是裂图：`<img>` 带不了 Bearer 头，而 `/api` 只认头
+
+### 现象
+
+用户实测：文档详情页「分块」里每个图块都显示成**裂图 + alt 文本"图区"**，
+点旁边的「看页面位置」，弹窗报「取不到图区：该块入库时还没有存图区坐标
+（重新解析该文档后即可显示）」。但同一份数据用脚本（带 `Authorization: Bearer`）
+请求 `/api/documents/{doc}/chunks/{chunk}/figure` 是 **200 + 正常 PNG**，
+库里那 48 个图块也**全都有** `figure_bbox`。
+
+### 根因
+
+**浏览器自己发起的请求带不了自定义请求头**：
+
+| 发起方 | 能带什么 | 结果 |
+|---|---|---|
+| JS `fetch`（`API.*`） | `Authorization: Bearer …` | 200 ✓ |
+| `<img src="/api/…">`、`<a download>`、新窗口打开 | 只有 **Cookie**（`rag_token`，登录时 `API.setToken` 写的） | **401** ✗ |
+
+而 `/api` 的依赖 `rag.api.deps.get_current_user` **只读 `Authorization` 头**，
+没有 Cookie 回退（页面路由 `rag.web.routes._page_user` 是一直认 Cookie 的，两套口径不一致）。
+于是所有"图片/直链"类请求一律 401 → 裂图。
+
+**第二个缺陷在前端**：`figure-view.js` 把 `img` 的 `error` 事件**一律**解释成
+"该块没有图区坐标" —— 401（认证）、404（块已换/无坐标）、5xx 全都说成同一句，
+用户按提示去重解析也修不好。
+
+### 修法
+
+1. **`get_current_user` 增加 Cookie 回退，但只给只读方法**（GET/HEAD）：
+   浏览器对 `<img>` 只会带 Cookie，这是唯一可行的通道；而 Cookie 会随**跨站**请求
+   自动携带，写操作若也认它就等于把 CSRF 面摊到所有 `/api` 上 —— 所以 POST/DELETE/PUT
+   仍然只认 Bearer 头。页面路由一直认 Cookie，这样两套口径也对齐了。
+2. **前端按真实状态码给处置办法**（`figure-view.js` 的 `explainImageFailure`）：
+   `error` 事件本身不带状态码，所以失败时再 `fetch` 一次该 URL 看 HTTP 状态与
+   detail，然后：401/403 → "浏览器图片请求带不了 Bearer 头，服务端要认 Cookie
+   ——升级/重启后刷新"；404+「图区坐标」→ 重解析该文档；404+「块不存在」→ 刷新页面；
+   5xx/网络 → 带上状态码。并把**裂图换成这句说明**（不留 alt 破图）。
+3. 分块片段是动态注入的，所以 `doc-detail.js` 在每次重新绑定分块时都调一次
+   `FigureView.attach(root)`；来源抽屉同理。
+
+### 验证
+
+`tmp_selftest/t_figure_cookie_auth.py`（进程内 ASGI，**按浏览器方式只带 Cookie**）：
+两个端点 200 + PNG 魔数 ✓；同一时刻"只带 Cookie 的 POST"仍 401（CSRF 面没扩大）、
+带 Bearer 头则通过 ✓；404 的两种 detail 可区分 ✓；完全未登录 401 ✓。
+`tmp_selftest/t_figure_view.mjs`：模拟 401/404×2/500 四种失败，断言提示文案各自到位，
+且裂图被替换成说明节点 ✓。
+
+### 遗留（本次未做）
+
+`<a href="/api/…" download>`、预览类直链同样受益于第 1 条（GET 认 Cookie），
+但页面里目前没有这类链接（下载走 `API.download` 带头的 fetch）；若以后新增，
+记得它们是"无头请求"，只能走 Cookie 这条通道。
+
+---
+
+## TS-033 分块里的图又裂了：PDFium 不是线程安全的（并发 12 张缩略图就崩）
+
+### 现象
+
+用户重启后反馈：分块里的图仍然加载不出来，日志里一条
+
+```
+16:28:01 [warning] crop_page_region_failed
+        error='MalformedPDFException: Failed to load document (PDFium: Data format error).'
+```
+
+以及 `GET /api/documents/…/pages/10/image` 的 **500**（Traceback 落在
+`routes.doc_page_image._render` 的 `page.to_image()` 上），最后一行
+`…/chunks/…/figure?dpi=170 HTTP/1.1" 404`。
+
+### 根因
+
+`pdfplumber` 的 `to_image()` 后端是 **PDFium**，而 **PDFium 不是线程安全的**。
+触发条件极其日常：详情页「分块」一屏 **12 张缩略图**，浏览器**同时**发 12 个请求，
+每个都在 `asyncio.to_thread` 里各自 `pdfplumber.open()` + `page.to_image()`。
+
+实测复现（`tmp_selftest/t_pdfium_concurrency.py`，同一份 11.5MB / 116 页 PDF，
+**每进程只跑一种模式**，否则被污染的全局态会污染下一轮）：
+
+| 模式 | 失败 | 用时 |
+|---|---|---|
+| 顺序渲染 12 次（无线程） | **0/12** | 2.1s |
+| 并发 12 线程 **+ 一把全局锁** | **0/12** | 2.1s |
+| 并发 12 线程（不加锁） | **7~12/12** | — |
+
+两种失败长这样：`MalformedPDFException: Failed to load document (PDFium: Data format
+error)`、`PdfiumError: Failed to load page`。
+
+**而且会"留后遗症"**：一旦并发崩过，同一进程里**后续渲染也持续失败**
+（PDFium 全局态被搞坏）—— 这就是为什么用户重启之后仍然一片裂图：第一次并发就把它
+弄坏了，之后连单个请求也渲不出来。
+
+第二个缺陷：`doc_page_image` 的渲染没有兜异常，`MalformedPDFException` 直接冒到 ASGI
+→ **500 堆栈**（本该是"这次没渲出来，稍后重试"）。`doc_chunk_figure` 因为走的是
+`crop_page_region`（自带 try/except）所以表现为 404 + 一条 warning。
+
+### 修法
+
+1. **`rag/adapters/pdf_render.py`（新）**：进程内**唯一的一把 PDFium 锁**
+   （`PDFIUM_LOCK`，可重入）+ 统一的渲染入口（整页/画红框、按框裁剪）+ 失败重试一次
+   + 失败抛 `RenderError`（带原始原因）。
+2. **所有 PDF 位图渲染都从这把锁走**：
+   - `doc_parse.crop_page_region` 内部持锁（覆盖入库解析、区域补内容、按框裁图）；
+   - `doc_parser` 抽内嵌图不再自己 `crop+to_image`，改成调用 `crop_page_region`
+     （顺带白拿了出血位夹框）；
+   - Web 侧走 `rag/web/figure_render.py`。
+3. **`rag/web/figure_render.py`（新）**：按 doc 缓存 PDF 字节（TTL 300s、最多 4 篇，
+   避免一屏 12 张各拉一次 11.5MB）+ 缓存渲染结果 PNG（TTL 600s、64 条）
+   + 把 `RenderError` 转成端点的 **503 + 原因**（前端提示"稍后重试"而不是"没有坐标"）。
+4. 端点只在渲染那一步失败时回 503；`404` 仍然只表示"这块真的没有图区坐标/块不存在"。
+
+### 验证
+
+`tmp_selftest/t_figure_concurrent.py`（真端点、并发）：
+
+```
+① 并发 12 张缩略图：状态码 [200 ×12]，全部 PNG ✓
+② 并发 4 张整页图 + 红框：全部 200 ✓
+③ 第二遍（命中 PNG 缓存）：全部 200，0.04s ✓
+④ 非 PDF 字节 → RenderError（端点据此回 503，不再是 500 堆栈）✓
+```
+
+冷/热对照（`tmp_selftest/t_figure_timing.py`）：冷缓存 12 张 **2.95s**
+（含一次 11.5MB 下载 + 12 次串行渲染），热缓存 **0.04s**。
+
+入库链路未受影响：`t_q1q2_parse.py` 复跑结果不变（`figure_region_cropped 59`、
+`crop_failed 0`、p10/p56 仍有图与 `figure_bbox`）。
+
+### 经验（写进规矩）
+
+**凡是"一屏多张图"的功能，渲染必须串行 + 缓存。** PDFium 这类 C 库的线程安全性不写在
+Python 签名里，靠读代码看不出来 —— 只能靠"并发打一遍"的测试发现（这次就是并发测试
+抓到的，单请求测试永远全绿）。
+
+---
+
+## TS-034 少量缩略图显示成"白页"（HTTP 200 的白图）+ 真空白图区要区分对待
+
+### 现象
+
+用户复查 TS-033 的修复后反馈：大部分图正常了，但**少量图**（例如 p6、p11 的国旗）
+在分块里显示成**一张白页**；点旁边的「看页面位置」却能看到正确的完整图。
+
+### 实测（先量再改）
+
+对全篇 48 个图块按生产函数逐个裁，分三类：
+
+| 类别 | 数量 | 特征 |
+|---|---|---|
+| 有内容的图 | 36 | 灰度标准差 > 20 |
+| **真空白图区** | **12** | 标准差 **0.0**、灰度恒 255：引擎把正文页上 0.2~0.4% 的**纯色小区域**标成了 figure（VLM 那步本来就跳过了它们） |
+| 渲染失败给白图 | — | 同一页"整页渲染"却有内容 —— 说明是**这一次渲染**坏了，不是数据 |
+
+p6（整页扫描图，1075×1521、非白像素 96.6%）与 p11 的国旗（41×27、非白 72%~100%）
+**离线裁出来都是有内容的** —— 也就是说用户看到的那张白图是**当时那次渲染**的产物
+（PDFium 在异常状态下会**不抛异常**而是给一张空白栅格，这与 TS-033 是同一根源），
+而它**被浏览器缓存住了**：
+
+```
+Cache-Control: private, max-age=86400     ← 24 小时
+```
+
+一次坏渲染 → 用户接下来一整天都看到白页，**哪怕服务端已经修好**。
+
+### 修法（三条，缺一不可）
+
+| 问题 | 修法 |
+|---|---|
+| 坏渲染给白图（不抛异常，静默） | `figure_render.figure_png` 裁出空白时**换路径复核**：用 `crop_via_page_png`（整页渲染后在像素空间裁 —— "看页面位置"走的就是它）再渲一次，有内容就用它（记 `figure_crop_blank_recovered` warning）；仍是空白 = 真的空白，如实返回 |
+| 白图被浏览器缓存 24h | 两个端点的 `Cache-Control` 改成 `private, max-age=300, must-revalidate`（服务端自己有 PNG 缓存，命中 0.04s，浏览器缓存短一点不影响体验）；**并给图区 URL 加缓存版本号 `&v=2`** —— 换一批新 URL，旧的坏缓存自然失效（`figure-view.js` 的 `FIG_CACHE_V`，渲染口径再改就 +1） |
+| 真空白图区显示成白图，看着像"图裂了" | ① 入库时给这类块写标记「图片描述：（空白图区，未做图片理解）」（`ingest_chunk`）；② 分块界面据此**不渲染 `<img>`**，改成一句说明；存量数据没有这个标记，用"正文里没有『图片描述：』"兜底判断（同样说明情况），两种情况都保留「看页面位置」 |
+
+### 验证
+
+`tmp_selftest/t_figure_blank_recovery.py`：
+
+```
+① 把"按框裁"打桩成永远返回白图 → figure_png 自动改用整页渲染裁切，拿回内容（std 27.7）✓
+② 真空白图区仍是空白（不伪造内容）✓
+③ 两个端点的 Cache-Control = private, max-age=300, must-revalidate ✓
+④ 模板对「空白图区」不渲染 <img>（改为说明文案）；图区 URL 带 &v=2 ✓
+```
+
+`tmp_selftest/t_panel_blank_note.py`：真文档分块片段里，说明块 4 个、缩略图 18 个 ——
+"没有描述的图块不再显示白图"在真实页面上生效。
+
+### 遗留
+
+- 真空白图区在新数据里带「空白图区」标记，**存量文档要重解析一次**才会带上；
+  在此之前界面用"没有图片描述"兜底判断（文案略笼统：可能空白、也可能描述那步失败）。
+- p6/p11 这类"当时那次渲染坏了"的图，**重启 + 硬刷新**后会重新渲染（URL 带 `v=2`，
+  旧缓存不再命中）；若还白，说明是 PDFium 层面的持续异常，看日志里有没有
+  `pdf_render_failed` / `figure_crop_blank_recovered`。
+
+---
+
 ## 附录
 
 ### 优化前后指标对比

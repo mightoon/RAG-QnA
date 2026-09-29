@@ -27,13 +27,39 @@
        图片字节不落库，前端只拿 chunk_id 去 /figure 现裁、拿页码去 /pages 看红框位置，
        所以老块（入库时没存坐标）这里不显示，不会留破图占位。 #}
     {% set did = d.doc_id if d.doc_id is defined else '' %}
+    {# 没有图片描述的图块**不显示图** —— 白图在界面上只会让人以为"图裂了"。
+       判据用两条，缺一不可：
+         · 新数据：块正文里有「空白图区」标记（ingest_chunk 写入，重解析后才有）；
+         · 存量数据：正文里根本没有「图片描述：」—— 说明这条图块没产出描述
+           （VLM 那步按空白跳过了，或那次调用失败），此时显示一张（可能全白的）
+           图没有意义，直接说明情况更诚实。
+       两种情况都保留「看页面位置」：页面上到底有没有东西，用户自己一看便知。 #}
+    {% set txt = c.text or '' %}
+    {% set is_blank = '空白图区' in txt %}
+    {% set no_desc = '图片描述：' not in txt %}
     <div class="chunk-figure">
+      {% if is_blank or no_desc %}
+      <div class="figure-unavailable">
+        {%- if is_blank -%}
+        该图区为空白（纯色区域），未做图片理解
+        {%- else -%}
+        该图区没有图片描述（区域为空白，或描述那一步没跑成）
+        {%- endif -%}
+        —— 可点右侧「看页面位置」在页面上确认。若整篇图都没有描述，
+        检查配置页的「图片理解（VLM）」是否可用。
+      </div>
+      {% else %}
+      {# data-figure-src 与 src 同值：图加载失败时前端据此去查**真实原因**
+         （401=浏览器图片请求带不了 Bearer 头、404=存量块没坐标/块已换…），
+         再把裂图换成一句能照着处置的说明（figure-view.js 的 explainImageFailure）。 #}
       <img class="chunk-figure-thumb" loading="lazy" alt="图区"
-           src="/api/documents/{{ did }}/chunks/{{ c.chunk_id }}/figure?dpi=130"
+           data-figure-src="/api/documents/{{ did }}/chunks/{{ c.chunk_id }}/figure?dpi=130&v=2"
+           src="/api/documents/{{ did }}/chunks/{{ c.chunk_id }}/figure?dpi=130&v=2"
            data-figure-doc="{{ did }}" data-figure-chunk="{{ c.chunk_id }}"
            data-figure-page="{{ c.page or '' }}"
            data-figure-label="{{ c.figure_label or '' }}"
            data-figure-caption="{{ c.figure_caption or '' }}">
+      {% endif %}
       <button class="btn btn-secondary btn-xs js-figure-open" type="button"
               data-figure-doc="{{ did }}" data-figure-chunk="{{ c.chunk_id }}"
               data-figure-page="{{ c.page or '' }}"

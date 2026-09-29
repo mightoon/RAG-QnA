@@ -436,18 +436,24 @@ def crop_page_region(page, bbox_pt, resolution: int = 150) -> bytes | None:
     与 doc_parser 抽内嵌图用的是同一套（pdfplumber `page.crop().to_image()`），
     于是"引擎框裁出来的图"与"嵌入图"在下游完全同构（同样交给 VLM 描述）。
     裁剪前先**夹到页内**：出血位框不该让整张图丢掉（见 `clamp_box_to_page`）。
+
+    ⚠ 全程持 `pdf_render.PDFIUM_LOCK`：`to_image()` 的后端是 PDFium，**它不是线程
+    安全的**。入库侧有 4 个 worker、Web 侧一屏 12 张缩略图并发渲染，不加锁实测
+    7~12/12 抛 `MalformedPDFException`，而且崩过之后同进程会持续失败（见 TS-033）。
     """
+    from rag.adapters.pdf_render import PDFIUM_LOCK
     try:
-        box = clamp_box_to_page(bbox_pt,
-                                float(getattr(page, "width", 0) or 0),
-                                float(getattr(page, "height", 0) or 0))
-        if not box:
-            return None
-        x0, y0, x1, y1 = box
-        im = page.crop((x0, y0, x1, y1)).to_image(resolution=resolution)
-        buf = io.BytesIO()
-        im.original.save(buf, format="PNG")
-        return buf.getvalue()
+        with PDFIUM_LOCK:
+            box = clamp_box_to_page(bbox_pt,
+                                    float(getattr(page, "width", 0) or 0),
+                                    float(getattr(page, "height", 0) or 0))
+            if not box:
+                return None
+            x0, y0, x1, y1 = box
+            im = page.crop((x0, y0, x1, y1)).to_image(resolution=resolution)
+            buf = io.BytesIO()
+            im.original.save(buf, format="PNG")
+            return buf.getvalue()
     except Exception as e:                                  # noqa: BLE001
         log.warning("crop_page_region_failed",
                     error=f"{type(e).__name__}: {e}"[:160])

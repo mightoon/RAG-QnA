@@ -321,13 +321,18 @@ class ChunkStep(PipelineStep):
                 # 不是某张插图。不加这个标记的话，检索命中时用户会以为系统找到了
                 # "那张图"，而描述里其实含整页正文（实测扫描页就是这种情况）。
                 scope_page = el.raw_data.get("figure_scope") == "page"
+                # 空白图区（VLM 那步跳过的纯色区域）也要标明：这条块只有引擎文字，
+                # 没有描述。**界面靠这个标记不显示一张白图**（白图会被当成"图裂了"），
+                # 检索侧也说得清"为什么这条图块没有图片描述"。
+                blank = el.raw_data.get("vlm_skipped") == "blank_region"
                 if el.raw_data.get("vlm_caption"):
                     vlm = el.raw_data["vlm_caption"]
                     caption_parts.append(
                         f"图片描述：{'（整页图）' if scope_page else ''}{vlm}")
                 elif scope_page:
-                    # 空白跳过 VLM 的整页区域：至少说明粒度，别让它看着像一张插图
                     caption_parts.append("图片描述：（整页图，未做图片理解）")
+                elif blank:
+                    caption_parts.append("图片描述：（空白图区，未做图片理解）")
                 if el.text:
                     caption_parts.append(f"图片文字：{el.text}")
                 if caption_parts:

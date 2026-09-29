@@ -464,6 +464,10 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
   background:var(--bg-base)}
 .figure-view-err{font-size:var(--fs-xs);color:var(--text-secondary);padding:10px;
   border:1px dashed var(--border);border-radius:var(--radius-sm)}
+/* 图取不到时替换掉裂图的那句说明（处置办法写在里面，见 figure-view.js explainImageFailure） */
+.figure-unavailable{font-size:var(--fs-xs);color:var(--text-secondary);line-height:1.6;
+  padding:8px 10px;border:1px dashed var(--border);border-radius:var(--radius-sm);
+  background:var(--bg-base);max-width:320px}
 .chunk-figure{margin-top:10px;display:flex;align-items:flex-start;gap:12px}
 .chunk-figure-thumb{max-width:220px;max-height:260px;border:1px solid var(--border);
   border-radius:var(--radius-sm);cursor:zoom-in;background:var(--bg-base)}
@@ -651,6 +655,11 @@ sup.cit{color:var(--primary);cursor:help;font-weight:var(--fw-semibold);padding:
 .doc-attrs li:last-child{border-bottom:none}
 .doc-attrs .attr-key{color:var(--text-tertiary);flex-shrink:0}
 .doc-attrs .attr-val{text-align:right;word-break:break-all;font-family:var(--font-mono);font-size:var(--fs-xs)}
+/* 值的第二行（解释性小字，如「图表」后面的整页/空白跳过计数）：
+   block 让它另起一行，text-align 从 .attr-val 继承 → 右对齐 */
+.doc-attrs .attr-note{display:block;text-align:right;margin-top:2px;
+  color:var(--text-tertiary);font-family:var(--font-sans);font-size:var(--fs-xs)}
+.doc-attrs .attr-val-main{display:block}
 .doc-attrs .attr-val.plain{font-family:var(--font-sans);font-size:var(--fs-sm)}
 .doc-roles{margin-top:4px}
 .doc-roles-list{display:flex;flex-wrap:wrap;gap:6px}

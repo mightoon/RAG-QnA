@@ -32,6 +32,7 @@
     const fig = isFigure && src.doc_id && src.chunk_id
       ? `<div class="source-item-figure">
            <img loading="lazy" alt="图区" style="max-width:100%;cursor:zoom-in"
+                data-figure-src="/api/documents/${encodeURIComponent(src.doc_id)}/chunks/${encodeURIComponent(src.chunk_id)}/figure?dpi=140"
                 src="/api/documents/${encodeURIComponent(src.doc_id)}/chunks/${encodeURIComponent(src.chunk_id)}/figure?dpi=140"
                 data-figure-doc="${esc(src.doc_id)}" data-figure-chunk="${esc(src.chunk_id)}"
                 data-figure-page="${src.page_num || ''}"
@@ -66,6 +67,8 @@
       </div>`;
     overlay.appendChild(drawer);
     document.body.appendChild(overlay);
+    // 抽屉里的图区图也走同一套失败诊断（401/404 各有一套处置，见 figure-view.js）
+    if (window.FigureView && window.FigureView.attach) window.FigureView.attach(drawer);
     const doClose = () => overlay.remove();
     overlay.addEventListener('click', e => { if (e.target === overlay) doClose(); });
     qs('.icon-btn', drawer).addEventListener('click', doClose);

@@ -41,6 +41,7 @@ from rag.container import (
 from rag.models import (ACTIVE_TASK_STATUSES, IngestStatus, UserContext,
                         doc_type_label, quality_short_summary)
 from rag.observability.logging import get_logger
+from rag.web import figure_render as fgr
 
 log = get_logger("rag.web")
 
@@ -1944,6 +1945,10 @@ async def doc_chunk_figure(doc_id: str, chunk_id: str, request: Request,
     会让图片存储翻倍（麦肯锡那篇 73 张图就多 73 个对象），而**框只有 4 个浮点数**
     —— 读的时候花几十毫秒现裁即可，还顺带支持"换个 dpi 再看清楚点"。
     这个端点同时服务两处 UI：来源抽屉的缩略图、详情页预览的高亮区域。
+
+    ⚠ 渲染走 `figure_render`（PDFium 串行 + PDF 字节/PNG 缓存）：详情页一屏 12 张
+    缩略图是**并发**请求，直接各自 `pdfplumber.open().to_image()` 实测 7~12/12 失败
+    （PDFium 非线程安全，见 TS-033）。
     """
     c = _container(request)
     try:
@@ -1961,35 +1966,28 @@ async def doc_chunk_figure(doc_id: str, chunk_id: str, request: Request,
         raise HTTPException(404, "文档不存在")
     if c.storage is None or not doc.storage_url:
         raise HTTPException(503, "存储适配器不可用")
-    try:
-        data = await c.storage.get(doc.storage_url)
-    except Exception as e:
-        raise HTTPException(404, f"无法读取文档: {e}")
     if not (doc.filename or "").lower().endswith(".pdf"):
         raise HTTPException(415, "只有 PDF 支持按图区裁剪")
+    try:
+        data = await fgr.load_pdf(c, doc)          # 带缓存：一屏 12 张不再拉 12 次
+    except Exception as e:
+        raise HTTPException(404, f"无法读取文档: {e}")
 
-    def _crop() -> bytes | None:
-        import io as _io
-
-        import pdfplumber
-
-        from rag.adapters.doc_parse import clamp_box_to_page, crop_page_region
-        page_no = cm.page_num or 1
-        with pdfplumber.open(_io.BytesIO(data)) as pdf:
-            if not (1 <= page_no <= len(pdf.pages)):
-                return None
-            page = pdf.pages[page_no - 1]
-            b = [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad]
-            b = clamp_box_to_page(b, float(page.width), float(page.height))
-            return crop_page_region(page, b, resolution=res) if b else None
-
-    res = min(max(int(dpi), 60), 300)
-    png = await asyncio.to_thread(_crop)          # pdfplumber 是同步 CPU 活
-    if not png:
-        raise HTTPException(404, "按该坐标裁不出内容（页码越界或框超出页面）")
-    # 图与块绑定，允许浏览器缓存（同一块的框不会变；重解析会换 chunk_id）
+    page_no = cm.page_num or 1
+    try:
+        png = await asyncio.to_thread(                 # PDFium 是同步 CPU 活
+            fgr.figure_png, doc_id, data, page_no, list(box), dpi=dpi)
+    except fgr.RenderError as e:
+        # 说清"是渲染这一步失败"，而不是 404 让前端以为"没有坐标/块不存在"。
+        # transient（PDFium 抖动等）→ 503 可重试；请求本身不对（页码越界/框退化）→ 404。
+        raise HTTPException(503 if e.transient else 404,
+                            f"图区渲染失败：{str(e)[:160]}"
+                            + ("（可稍后重试）" if e.transient else ""))
     return Response(png, media_type="image/png", headers={
-        "Cache-Control": "private, max-age=86400"})
+        # ⚠ 别给长 max-age：渲染**可能**失败（PDFium 状态异常时会给一张白图而不是抛错），
+        # 一旦这种响应被浏览器缓存 24h，用户就会"修好了也一直看到白页"（实测踩过，TS-034）。
+        # 服务端自己有 PNG 缓存（命中 0.04s），所以浏览器缓存短一点几乎不影响体验。
+        "Cache-Control": "private, max-age=300, must-revalidate"})
 
 
 @ui_router.get("/documents/{doc_id}/pages/{page_no}/image")
@@ -2032,38 +2030,21 @@ async def doc_page_image(doc_id: str, page_no: int, request: Request,
             raise HTTPException(400, "bbox 参数需要 4 个数")
 
     try:
-        data = await c.storage.get(doc.storage_url)
+        data = await fgr.load_pdf(c, doc)
     except Exception as e:
         raise HTTPException(404, f"无法读取文档: {e}")
 
-    def _render() -> bytes | None:
-        import io as _io
-
-        import pdfplumber
-        from PIL import ImageDraw
-
-        with pdfplumber.open(_io.BytesIO(data)) as pdf:
-            if not (1 <= page_no <= len(pdf.pages)):
-                return None
-            page = pdf.pages[page_no - 1]
-            img = page.to_image(resolution=min(max(int(dpi), 50), 200)).original
-            if box:
-                scale = img.width / float(page.width or 1)
-                x0 = max(0.0, (box[0] - pad) * scale)
-                y0 = max(0.0, (box[1] - pad) * scale)
-                x1 = min(float(img.width), (box[2] + pad) * scale)
-                y1 = min(float(img.height), (box[3] + pad) * scale)
-                d = ImageDraw.Draw(img)
-                d.rectangle([x0, y0, x1, y1], outline=(220, 38, 38), width=3)
-            buf = _io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-
-    png = await asyncio.to_thread(_render)
-    if not png:
-        raise HTTPException(404, "页码越界")
+    try:
+        png = await asyncio.to_thread(
+            fgr.page_png, doc_id, data, page_no, dpi=dpi, box=box, pad=pad)
+    except fgr.RenderError as e:
+        # 渲染失败要给 5xx（可重试），而不是 404（"没有这张图"）也不是 500 堆栈；
+        # 页码越界/框退化这类"请求本身不对"的按 404 回，别让用户以为过一会就好
+        raise HTTPException(503 if e.transient else 404,
+                            f"整页渲染失败：{str(e)[:160]}"
+                            + ("（可稍后重试）" if e.transient else ""))
     return Response(png, media_type="image/png", headers={
-        "Cache-Control": "private, max-age=3600"})
+        "Cache-Control": "private, max-age=300, must-revalidate"})
 
 
 @ui_router.get("/documents/{doc_id}/content")
